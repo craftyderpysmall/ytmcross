@@ -56,6 +56,9 @@ struct Shell {
     drawn: ([u32; 2], f32, usize),
     /// The window's content can't be trusted: redraw all of it.
     redraw_all: bool,
+    /// Held modifier keys (to spot a paste).
+    #[cfg(windows)]
+    modifiers: winit::keyboard::ModifiersState,
     /// `YTMCROSS_STATS=1`: frame time and share of pixels drawn, in the title.
     stats: Option<Stats>,
     first_frame: bool,
@@ -101,6 +104,8 @@ pub fn run(
         scene: Scene::default(),
         drawn: ([0, 0], 0.0, 0),
         redraw_all: true,
+        #[cfg(windows)]
+        modifiers: Default::default(),
     };
     event_loop.run_app(&mut shell)?;
     shell.app.on_exit();
@@ -127,6 +132,12 @@ impl Shell {
         let input = win.egui_winit.take_egui_input(&win.window);
         let app = &mut self.app;
         let out = self.ctx.run_ui(input, |ui| app.ui(ui));
+        #[cfg(windows)]
+        for command in &out.platform_output.commands {
+            if let egui::OutputCommand::CopyText(text) = command {
+                super::clipboard::set(text);
+            }
+        }
         win.egui_winit.handle_platform_output(&win.window, out.platform_output);
         let ppp = out.pixels_per_point;
         let t_ui = started.elapsed();
@@ -227,6 +238,16 @@ impl Shell {
     }
 }
 
+/// Ctrl+V, Shift+Insert or the Paste key, as egui-winit recognizes them.
+#[cfg(windows)]
+fn is_paste(key: &winit::event::KeyEvent, modifiers: winit::keyboard::ModifiersState) -> bool {
+    use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+    let v = matches!(&key.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("v"))
+        || key.physical_key == PhysicalKey::Code(KeyCode::KeyV);
+    let insert = key.logical_key == Key::Named(NamedKey::Insert) || key.physical_key == PhysicalKey::Code(KeyCode::Insert);
+    key.logical_key == Key::Named(NamedKey::Paste) || (modifiers.control_key() && v) || (modifiers.shift_key() && insert)
+}
+
 /// Clears a region before drawing it, as a full frame starts from black.
 fn clear(pixels: &mut [Pixels], w: u32, r: &Region) {
     for y in r.y0..r.y1 {
@@ -298,6 +319,15 @@ impl ApplicationHandler<Wake> for Shell {
             }
             event => {
                 let Some(win) = self.win.as_mut() else { return };
+                #[cfg(windows)]
+                match &event {
+                    WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+                    // egui-winit pastes from its own clipboard: fill it first.
+                    WindowEvent::KeyboardInput { event: key, .. } if key.state.is_pressed() && is_paste(key, self.modifiers) => {
+                        win.egui_winit.set_clipboard_text(super::clipboard::get().unwrap_or_default());
+                    }
+                    _ => {}
+                }
                 if win.egui_winit.on_window_event(&win.window, &event).repaint {
                     self.schedule(Instant::now());
                 }

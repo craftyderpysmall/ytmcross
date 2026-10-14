@@ -11,10 +11,13 @@ dirs = "7.0.0"
 # egui is drawn on the CPU instead of the GPU: the UI redraws rarely,
 # and not loading a GPU driver saves ~80 MB of RAM. No bundled egui fonts: we ship Inter.
 egui = { version = "0.34.3", default-features = false }
-egui-winit = { version = "0.34.3", default-features = false, features = ["clipboard", "wayland", "x11"] }
+egui-winit = { version = "0.34.3", default-features = false, features = ["wayland", "x11"] }
 egui_software_backend = { version = "0.0.3", default-features = false, features = ["std"] }
 winit = "0.30.13"
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+# Album art: JPEG, and PNG for a few icons.
+png = "0.18.1"
+zune-core = "0.5.3"
+zune-jpeg = "0.5.15"
 # No logger is installed: compile every dependency's log/tracing call out.
 log = { version = "0.4", features = ["max_level_off", "release_max_level_off"] }
 tracing = { version = "0.1", default-features = false, features = ["max_level_off", "release_max_level_off"] }
@@ -90,12 +93,14 @@ opt-level = "s"
 opt-level = "s"
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_DataExchange", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 # Windows presents frames itself (ui/present.rs).
 [target.'cfg(not(windows))'.dependencies]
 bytemuck = "1"
 softbuffer = "0.4.8"
+# Windows uses its own text clipboard (ui/clipboard.rs).
+egui-winit = { version = "0.34.3", default-features = false, features = ["clipboard"] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 symphonia = { version = "0.6.1", default-features = false, features = ["opt-simd-neon"] }

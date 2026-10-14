@@ -113,12 +113,73 @@ fn sized_url(url: &str, px: u32) -> String {
 
 fn fetch(agent: &ureq::Agent, url: &str, px: u32) -> Option<ColorImage> {
     let bytes = agent.get(url).call().ok()?.body_mut().read_to_vec().ok()?;
-    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (rgba, w, h) = decode(&bytes)?;
     // Video thumbnails are 16:9 with bars; crop the centre square.
-    let (w, h) = img.dimensions();
     let side = w.min(h);
-    let square = image::imageops::crop_imm(&img, (w - side) / 2, (h - side) / 2, side, side).to_image();
-    let px = px.clamp(16, 512);
-    let out = if side > px { image::imageops::thumbnail(&square, px, px) } else { square };
-    Some(ColorImage::from_rgba_unmultiplied([out.width() as usize, out.height() as usize], out.as_raw()))
+    let px = (px as usize).clamp(16, 512).min(side);
+    let out = shrink(&rgba, w, ((w - side) / 2, (h - side) / 2), side, px);
+    Some(ColorImage::from_rgba_unmultiplied([px, px], &out))
+}
+
+/// RGBA pixels and size of a JPEG (art and thumbnails) or PNG (icons).
+fn decode(bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+    if bytes.starts_with(b"\x89PNG") {
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        decoder.set_transformations(png::Transformations::normalize_to_color8());
+        let mut reader = decoder.read_info().ok()?;
+        let mut buf = vec![0; reader.output_buffer_size()?];
+        let info = reader.next_frame(&mut buf).ok()?;
+        buf.truncate(info.buffer_size());
+        let rgba = match info.color_type {
+            png::ColorType::Rgba => buf,
+            png::ColorType::Rgb => buf.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect(),
+            png::ColorType::GrayscaleAlpha => buf.as_chunks::<2>().0.iter().flat_map(|&[l, a]| [l, l, l, a]).collect(),
+            png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+            png::ColorType::Indexed => return None, // expanded by the transformations
+        };
+        return Some((rgba, info.width as usize, info.height as usize));
+    }
+    use zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
+    let options = DecoderOptions::default().set_strict_mode(false).jpeg_set_out_colorspace(ColorSpace::RGBA);
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(bytes), options);
+    let rgba = decoder.decode().ok()?;
+    let (w, h) = decoder.dimensions()?;
+    (rgba.len() == w * h * 4).then_some((rgba, w, h))
+}
+
+/// The `side` x `side` square at `at` of an RGBA image `width` pixels wide,
+/// shrunk to `px` x `px` (`px` <= `side`): each pixel the mean of its block.
+fn shrink(rgba: &[u8], width: usize, at: (usize, usize), side: usize, px: usize) -> Vec<u8> {
+    let span = |i: usize| (i * side / px, (i + 1) * side / px);
+    let mut out = Vec::with_capacity(px * px * 4);
+    for oy in 0..px {
+        let (y0, y1) = span(oy);
+        for ox in 0..px {
+            let (x0, x1) = span(ox);
+            let mut sum = [0u32; 4];
+            for y in at.1 + y0..at.1 + y1 {
+                let row = &rgba[(y * width + at.0 + x0) * 4..(y * width + at.0 + x1) * 4];
+                for p in row.as_chunks::<4>().0 {
+                    sum.iter_mut().zip(p).for_each(|(s, &c)| *s += u32::from(c));
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)) as u32;
+            out.extend(sum.map(|s| ((s + n / 2) / n) as u8));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shrink_averages_blocks_of_the_centre_square() {
+        // 4x2 image: the centre 2x2 square is columns 1..3.
+        let px = |v: u8| [v, v, v, 255];
+        let rgba: Vec<u8> = [0, 10, 30, 0, 0, 50, 70, 0].iter().flat_map(|&v| px(v)).collect();
+        assert_eq!(shrink(&rgba, 4, (1, 0), 2, 1), px(40).to_vec());
+        assert_eq!(shrink(&rgba, 4, (1, 0), 2, 2), [px(10), px(30), px(50), px(70)].concat());
+    }
 }
