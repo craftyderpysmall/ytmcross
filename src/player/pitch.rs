@@ -7,8 +7,9 @@
 //! the input, choosing each splice point where the waveform lines up with
 //! the previous piece, so there's no phasing or clicks.
 //!
-//! At 0 semitones it's bypassed entirely. Buffers are sized up front, so
-//! the callback never allocates while it runs.
+//! At 0 semitones it's bypassed entirely and holds no buffers; they are
+//! sized once, the first time pitch is used (~0.2 MB), so the callback
+//! never allocates while shifting.
 
 use std::collections::VecDeque;
 
@@ -49,12 +50,22 @@ impl PitchShifter {
             sequence,
             seek,
             overlap,
-            input: Vec::with_capacity((sequence + seek) * 2 * channels),
+            input: Vec::new(),
             skip_frac: 0.0,
-            mid: vec![0.0; overlap * channels],
-            stretched: Vec::with_capacity(sequence * 4 * channels),
+            mid: Vec::new(),
+            stretched: Vec::new(),
             read: 1.0,
             started: false,
+        }
+    }
+
+    /// Sizes the buffers, the first time they're needed.
+    fn allocate(&mut self) {
+        if self.mid.is_empty() {
+            let ch = self.channels;
+            self.input.reserve_exact((self.sequence + self.seek) * 2 * ch);
+            self.mid = vec![0.0; self.overlap * ch];
+            self.stretched.reserve_exact(self.sequence * 4 * ch);
         }
     }
 
@@ -74,6 +85,7 @@ impl PitchShifter {
     /// Fills `out` (interleaved) from `src`; returns how many samples were
     /// written (fewer when `src` runs dry).
     pub fn process(&mut self, src: &mut VecDeque<f32>, out: &mut [f32]) -> usize {
+        self.allocate();
         let ch = self.channels;
         let mut written = 0;
         while written + ch <= out.len() {

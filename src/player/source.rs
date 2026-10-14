@@ -110,11 +110,14 @@ fn fetch_range(agent: &ureq::Agent, url: &str, start: u64, end: u64) -> io::Resu
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(300 * u64::from(attempt)));
         }
-        let result = agent
-            .get(url)
-            .header("Range", format!("bytes={start}-{end}"))
-            .call()
-            .and_then(|mut r| r.body_mut().with_config().limit(end - start + 2).read_to_vec());
+        // Read into an exactly sized buffer: growing one would leave a
+        // 256 KiB chunk in a 512 KiB allocation.
+        let len = end - start + 1;
+        let result = agent.get(url).header("Range", format!("bytes={start}-{end}")).call().and_then(|mut r| {
+            let mut bytes = Vec::with_capacity(len as usize);
+            r.body_mut().with_config().limit(len + 1).reader().read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
         match result {
             Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
             Ok(_) => last = io::Error::other("empty response"),

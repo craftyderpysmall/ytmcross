@@ -19,6 +19,8 @@ use crate::config::EqualizerConfig;
 /// Seconds of decoded audio kept ahead of the speakers. Covers network
 /// hiccups between 256 KiB fetches without holding much memory (~700 KB).
 const BUFFER_SECS: usize = 2;
+/// Samples one push may add beyond the target (a long AAC packet, resampled).
+const PUSH_SLACK: usize = 8192;
 
 pub struct Shared {
     samples: Mutex<VecDeque<f32>>,
@@ -85,19 +87,29 @@ impl Output {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or("no audio output device")?;
         let wanted = cpal::StreamConfig { channels, sample_rate: rate, buffer_size: cpal::BufferSize::Default };
-        if let Ok(stream) = build(&device, &wanted, shared) {
-            return Ok(Output { stream, rate, channels, resample_from: None, resample_pos: 0.0, playing: false });
-        }
-        let native = device.default_output_config().map_err(|e| e.to_string())?.config();
-        let stream = build(&device, &native, shared)?;
-        Ok(Output {
-            stream,
-            rate: native.sample_rate,
-            channels: native.channels,
-            resample_from: Some(rate),
-            resample_pos: 0.0,
-            playing: false,
-        })
+        let output = match build(&device, &wanted, shared) {
+            Ok(stream) => Output { stream, rate, channels, resample_from: None, resample_pos: 0.0, playing: false },
+            Err(_) => {
+                let native = device.default_output_config().map_err(|e| e.to_string())?.config();
+                let stream = build(&device, &native, shared)?;
+                Output {
+                    stream,
+                    rate: native.sample_rate,
+                    channels: native.channels,
+                    resample_from: Some(rate),
+                    resample_pos: 0.0,
+                    playing: false,
+                }
+            }
+        };
+        // Sized once: left to grow, the queue would double past its target.
+        *shared.samples.lock().unwrap() = VecDeque::with_capacity(output.target() + PUSH_SLACK);
+        Ok(output)
+    }
+
+    /// Samples kept queued.
+    fn target(&self) -> usize {
+        self.rate as usize * self.channels as usize * BUFFER_SECS
     }
 
     pub fn matches(&self, rate: u32, channels: u16) -> bool {
@@ -128,7 +140,7 @@ impl Output {
 
     /// True if there's room for more decoded audio.
     pub fn wants_more(&self, shared: &Shared) -> bool {
-        shared.buffered() < self.rate as usize * self.channels as usize * BUFFER_SECS
+        shared.buffered() < self.target()
     }
 
     /// Queues interleaved samples (`src_channels` wide) for playback.
