@@ -329,6 +329,17 @@ fn hash_shape(h: &mut Fx, shape: &Shape) {
             rect(h, g.rect);
             rect(h, g.mesh_bounds);
             (g.num_vertices, g.num_indices).hash(h);
+            // A text selection is painted into the rows themselves: a
+            // rectangle appended after the glyphs, which are recolored under
+            // it (egui's text_selection). The rectangles pin it all down.
+            for row in &g.rows {
+                let v = &row.visuals;
+                v.mesh.vertices.len().hash(h);
+                for vertex in v.mesh.vertices.get(v.glyph_vertex_range.end..).unwrap_or_default() {
+                    point(h, vertex.pos);
+                    vertex.color.hash(h);
+                }
+            }
             t.underline.hash(h);
             t.fallback_color.hash(h);
             t.override_text_color.hash(h);
@@ -389,6 +400,24 @@ mod tests {
         let b = scene(vec![rect_shape(10.0, Color32::RED), rect_shape(500.0, Color32::GREEN)]);
         let Damage::Regions(r) = diff(&a, &b, 1000, 1000) else { panic!("expected regions") };
         assert_eq!(r, vec![Region { x0: 498, y0: 8, x1: 522, y1: 32 }]);
+    }
+
+    #[test]
+    fn a_text_selection_is_damage() {
+        use egui::epaint::TextShape;
+        let ctx = egui::Context::default();
+        let mut galley = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            galley = Some(ui.painter().layout_no_wrap("selected".into(), egui::FontId::default(), Color32::WHITE));
+        });
+        let galley = galley.unwrap();
+        let plain = Shape::Text(TextShape::new(pos2(10.0, 10.0), galley.clone(), Color32::WHITE));
+        let mut selected = galley;
+        let visuals = egui::Visuals::dark();
+        let range = egui::text_selection::CCursorRange::two(egui::text::CCursor::new(1), egui::text::CCursor::new(4));
+        egui::text_selection::visuals::paint_text_selection(&mut selected, &visuals, &range, None);
+        let shown = Shape::Text(TextShape::new(pos2(10.0, 10.0), selected, Color32::WHITE));
+        assert!(!matches!(diff(&scene(vec![plain]), &scene(vec![shown]), 1000, 1000), Damage::None));
     }
 
     #[test]

@@ -63,13 +63,16 @@ $env:RUSTUP_HOME = "$env:USERPROFILE\scoop\persist\rustup\.rustup"
 ## dev/ scripts
 
 - `startup.ps1` (size, first frame, idle memory), `memtest.ps1` (memory over use).
+- Linux: `startup.sh` (same, plus threads and idle CPU once settled; `X11=1` forces X11/XWayland), `memtest.sh` (same steps and coordinates as memtest.ps1, plus CPU while playing visible/minimized; needs `xdotool`, so it runs the app on X11). Memory from `/proc`: "private" = smaps_rollup Private_Clean + Private_Dirty (closest to Task Manager's private working set), "anon" = RssAnon. CPU in ms per second, not cycles. Helpers in `proc.sh`. Built with `cargo build --release` on Linux (needs the GTK/WebKitGTK and ALSA dev packages for wry/tao and cpal).
 - `launch.ps1` + `win.ps1 -Action shot|click|rclick|drag|move|type` to drive the window (client pixels, 1100x720).
 - `yt.ps1 <endpoint> '<json>' <out>` authenticated InnerTube probe; `rows.js`, `menus.js`, `jq.js` summarize responses; `pxdiff.py` pixel diffs.
 - `YTMCROSS_TRACE=1` writes timings to `trace.log` in the data dir.
 
 ## Baselines
 
-Main exe 10.41 MB, login exe 0.72 MB. Process creation to main ~30 ms (OS; a trivial exe is the same), main to first frame ~34 ms (~20 ms of it is winit window creation). Idle 3.5 MB private, 6 threads. memtest settles ~8.5 MB. Playing ~13 Mcycles/s visible, ~9.7 minimized; true idle ~0. Seek ~30 ms.
+Main exe 10.42 MB, login exe 0.72 MB. Process creation to main ~30 ms (OS; a trivial exe is the same), main to first frame ~34 ms (~20 ms of it is winit window creation). Idle 3.5 MB private, 6 threads. memtest settles ~8.5 MB. Playing ~13 Mcycles/s visible, ~9.7 minimized; true idle ~0. Seek ~30 ms. (Windows.)
+
+Linux: not measured yet (record `dev/startup.sh` and `dev/memtest.sh` results here, with the distro, desktop and backend).
 
 ## Data
 
