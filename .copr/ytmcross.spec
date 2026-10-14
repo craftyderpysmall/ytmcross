@@ -47,5 +47,8 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/ytmcross.desktop
 %{_datadir}/icons/hicolor/scalable/apps/ytmcross.svg
 
 %changelog
+* Wed Oct 14 2026 craftyderpysmall <craftyderpysmall@gmail.com> - 0.1.1-1
+- App icon
+
 * Wed Oct 14 2026 craftyderpysmall <craftyderpysmall@gmail.com> - 0.1.0-1
 - First package
