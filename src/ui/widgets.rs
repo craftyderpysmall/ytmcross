@@ -173,7 +173,7 @@ pub fn track_row(ui: &mut Ui, images: &Images, theme: &Theme, track: &Track, loo
         let t = ease(ui, resp.id.with("like-vis"), hovered || look.liked);
         if t > 0.0 {
             let over = ease(ui, resp.id.with("like-hover"), like.hovered());
-            let base = if look.liked { c.accent } else { c.text_dim.lerp_to_gamma(c.text, over) };
+            let base = if look.liked { c.text } else { c.text_dim.lerp_to_gamma(c.text, over) };
             thumbs_up(ui.painter(), btn.center(), 15.0, base.gamma_multiply(t), look.liked);
         }
         if like.hovered() {
