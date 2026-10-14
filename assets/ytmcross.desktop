@@ -4,6 +4,7 @@ Name=ytmcross
 GenericName=Music Player
 Comment=A minimal, fast, native YouTube Music client
 Exec=ytmcross
+Icon=ytmcross
 Terminal=false
 Categories=AudioVideo;Audio;Player;
 StartupWMClass=ytmcross

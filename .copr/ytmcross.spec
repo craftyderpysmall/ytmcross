@@ -34,6 +34,7 @@ cargo build --release --locked --offline
 install -Dm755 target/release/ytmcross %{buildroot}%{_bindir}/ytmcross
 install -Dm755 target/release/ytmcross-login %{buildroot}%{_bindir}/ytmcross-login
 install -Dm644 assets/ytmcross.desktop %{buildroot}%{_datadir}/applications/ytmcross.desktop
+install -Dm644 assets/ytmcross.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/ytmcross.svg
 
 %check
 desktop-file-validate %{buildroot}%{_datadir}/applications/ytmcross.desktop
@@ -43,6 +44,7 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/ytmcross.desktop
 %{_bindir}/ytmcross
 %{_bindir}/ytmcross-login
 %{_datadir}/applications/ytmcross.desktop
+%{_datadir}/icons/hicolor/scalable/apps/ytmcross.svg
 
 %changelog
 * Wed Oct 14 2026 craftyderpysmall <craftyderpysmall@gmail.com> - 0.1.0-1
