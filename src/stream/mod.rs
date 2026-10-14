@@ -4,14 +4,14 @@
 //! and unscramble the URL in-process (`solver.rs`).
 //!
 //! Getting ahead of the user:
-//! - rows on screen are resolved in the background and the first 64 KiB of
-//!   their audio is preloaded (`Hint::Visible`);
+//! - rows on screen are resolved in the background (`Hint::Visible`);
 //! - likely next plays (row under the mouse or being pressed, next in queue,
-//!   top search result) go first and get 128 KiB (`Hint::Likely`);
+//!   top search result) go first, and the first 128 KiB of their audio is
+//!   preloaded (`Hint::Likely`): a row is hovered before it's clicked;
 //! - a click never waits behind background work: it has its own thread.
 //!
 //! So playback usually starts without touching the network. URLs are valid
-//! for hours; they are cached in memory until they expire.
+//! for hours; they are cached in memory (a few hundred at most) until then.
 
 mod innertube;
 mod solver;
@@ -42,16 +42,8 @@ const PARALLEL: usize = 3;
 const MAX_REFRESH_FAILURES: u32 = 3;
 /// Preloaded start of a likely next play (~4 s of 256 kbps audio).
 const LIKELY_BYTES: u64 = 128 * 1024;
-/// Preloaded start of any row on screen (~2 s): enough to start instantly;
-/// the rest streams in over the already-warm connection (~40 ms).
-const HEAD_BYTES: u64 = 64 * 1024;
-
-/// A URL waiting to have its start preloaded.
-#[derive(PartialEq)]
-struct PreloadJob {
-    url: String,
-    bytes: u64,
-}
+/// Resolved URLs kept (~1 KB each); expired ones go first.
+const MAX_CACHED: usize = 256;
 
 pub enum Hint {
     /// On screen: resolve in the background.
@@ -76,7 +68,7 @@ struct State {
     /// preload and go first.
     likely: HashSet<String>,
     /// Resolved URLs waiting to have their start preloaded.
-    preload: VecDeque<PreloadJob>,
+    preload: VecDeque<String>,
     /// The worker threads exist only while there's work (see `start`).
     urgent_running: bool,
     background_running: bool,
@@ -161,7 +153,7 @@ impl Resolver {
     /// The player is about to stream `url` itself: a queued preload of it
     /// would only download the same bytes again.
     pub fn playing(&self, url: &str) {
-        self.shared.state.lock().unwrap().preload.retain(|j| j.url != url);
+        self.shared.state.lock().unwrap().preload.retain(|u| u != url);
     }
 
     pub fn hint(&self, id: &str, hint: Hint) {
@@ -173,9 +165,9 @@ impl Resolver {
         match s.cache.get(id) {
             Some(Entry::Ready { url, expires }) if fresh(*expires) => {
                 if likely && !player::is_preloaded(url) {
-                    let job = PreloadJob { url: url.clone(), bytes: LIKELY_BYTES };
-                    s.preload.retain(|j| j.url != job.url);
-                    s.preload.push_front(job);
+                    let url = url.clone();
+                    s.preload.retain(|u| *u != url);
+                    s.preload.push_front(url);
                     start(&self.shared, s);
                 }
                 return;
@@ -293,14 +285,14 @@ impl Shared {
 
     /// Downloads a URL's first chunk into the player's preload cache. A
     /// refusal (403) means our unscrambling is wrong: the solver is rebuilt.
-    fn preload(&self, url: &str, bytes: u64) -> bool {
+    fn preload(&self, url: &str) -> bool {
         if player::is_preloaded(url) {
             return true;
         }
         let t = Instant::now();
-        match player::preload_first_chunk(&self.agent, url, bytes) {
+        match player::preload_first_chunk(&self.agent, url, LIKELY_BYTES) {
             Ok(()) => {
-                trace!("preload: {} KiB in {:?}", bytes / 1024, t.elapsed());
+                trace!("preload: {} KiB in {:?}", LIKELY_BYTES / 1024, t.elapsed());
                 true
             }
             Err(e) => {
@@ -314,23 +306,30 @@ impl Shared {
         }
     }
 
-    /// Records a result and queues its audio start for preloading (likely
-    /// plays first and bigger), unless the caller already preloaded it.
+    /// Records a result and, for a likely play, queues its audio start for
+    /// preloading (unless the caller already preloaded it).
     fn finish(&self, id: &str, result: &Result<String, String>, queue_preload: bool) {
         let mut s = self.state.lock().unwrap();
         match result {
             Ok(url) => {
                 s.cache.insert(id.to_string(), Entry::Ready { url: url.clone(), expires: expiry(url) });
-                if queue_preload && !s.preload.iter().any(|j| &j.url == url) {
-                    if s.likely.contains(id) {
-                        s.preload.push_front(PreloadJob { url: url.clone(), bytes: LIKELY_BYTES });
-                    } else {
-                        s.preload.push_back(PreloadJob { url: url.clone(), bytes: HEAD_BYTES });
-                    }
+                if queue_preload && s.likely.contains(id) && !s.preload.contains(url) {
+                    s.preload.push_front(url.clone());
                 }
             }
             Err(_) => {
                 s.cache.insert(id.to_string(), Entry::Failed);
+            }
+        }
+        if s.cache.len() > MAX_CACHED {
+            // Expired URLs first, then any other finished lookup but this one.
+            s.cache.retain(|_, e| !matches!(e, Entry::Ready { expires, .. } if !fresh(*expires)));
+            let extra = s.cache.len().saturating_sub(MAX_CACHED);
+            let old: Vec<String> =
+                s.cache.iter().filter(|(k, e)| *k != id && matches!(e, Entry::Ready { .. })).map(|(k, _)| k.clone()).take(extra).collect();
+            for k in old {
+                s.cache.remove(&k);
+                s.likely.remove(&k);
             }
         }
     }
@@ -359,7 +358,7 @@ fn urgent_worker(shared: &Arc<Shared>) {
         // Verify the URL by preloading its start: the player needs those
         // bytes first anyway, so this costs nothing extra.
         if let Ok(url) = &result
-            && !shared.preload(url, LIKELY_BYTES)
+            && !shared.preload(url)
         {
             result = Err("stream refused".into());
             start(shared, shared.state.lock().unwrap()); // a refusal may need a new solver
@@ -373,7 +372,7 @@ fn urgent_worker(shared: &Arc<Shared>) {
 /// Everything ahead of the user: solver upkeep, batches, preloading.
 fn background_worker(shared: &Arc<Shared>) {
     enum Work {
-        Preload(PreloadJob),
+        Preload(String),
         Refresh,
         Batch(Vec<String>),
     }
@@ -404,7 +403,7 @@ fn background_worker(shared: &Arc<Shared>) {
         };
         match work {
             Work::Preload(job) => {
-                shared.preload(&job.url, job.bytes);
+                shared.preload(&job);
             }
             Work::Refresh => match shared.solver.refresh(true) {
                 Ok(()) => shared.refresh_failures.store(0, Ordering::Relaxed),

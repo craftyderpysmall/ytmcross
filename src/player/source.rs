@@ -17,8 +17,8 @@ use super::index::FragmentIndex;
 
 const CHUNK: u64 = 256 * 1024;
 const RETRIES: u32 = 3;
-/// Total bytes of preloaded track starts kept in memory.
-const PRELOAD_BUDGET: usize = 1280 * 1024;
+/// Total bytes of preloaded track starts kept in memory (4 likely plays).
+const PRELOAD_BUDGET: usize = 512 * 1024;
 /// How long opening a stream waits for a preload already in flight.
 const JOIN_WAIT: Duration = Duration::from_secs(2);
 
