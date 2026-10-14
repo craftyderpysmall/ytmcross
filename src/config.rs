@@ -238,10 +238,25 @@ pub fn write_defaults() {
     }
     for (name, text) in BUILTIN_THEMES {
         let path = paths::theme_file(name);
-        if !path.exists() {
+        // Missing, or an unedited copy of an older bundled version: (re)write.
+        // Edited files are never touched.
+        let stale = match std::fs::read_to_string(&path) {
+            Ok(old) => OLD_BUNDLED_THEMES.contains(&fnv1a(&old.replace('\r', ""))),
+            Err(_) => true,
+        };
+        if stale {
             let _ = std::fs::write(path, text);
         }
     }
+}
+
+/// Hashes of bundled theme files from earlier releases (see `fnv1a`).
+const OLD_BUNDLED_THEMES: &[u64] = &[
+    0xc02b1319b10c9ac1, // default, lavender accent
+];
+
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
 }
 
 #[cfg(test)]

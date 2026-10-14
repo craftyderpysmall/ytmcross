@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A minimal, fast, native YouTube Music client"
 license = "MIT"
+default-run = "ytmcross"
 
 [dependencies]
 bytemuck = "1"

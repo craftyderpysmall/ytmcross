@@ -155,12 +155,16 @@ pub fn track_row(ui: &mut Ui, images: &Images, theme: &Theme, track: &Track, loo
     let c = &theme.colors;
     // Right side: duration, then the like button left of it.
     let mut right = rect.right() - pad;
+    // Duration in a fixed-width, right-aligned column (reserved even when
+    // missing), so the like button lines up on every row whatever the
+    // digits: "4:48" is wider than "2:11".
+    let mut slot = line(ui, "00:00", small(theme), c.text_dim, 80.0).size().x;
     if let Some(d) = &track.duration {
         let g = line(ui, d, small(theme), c.text_dim, 80.0);
-        right -= g.size().x;
-        ui.painter().galley(pos2(right, rect.center().y - g.size().y / 2.0), g, c.text_dim);
-        right -= 12.0;
+        slot = slot.max(g.size().x);
+        ui.painter().galley(pos2(right - g.size().x, rect.center().y - g.size().y / 2.0), g, c.text_dim);
     }
+    right -= slot + 12.0;
     if look.can_like {
         let size = 26.0;
         let btn = Rect::from_center_size(pos2(right - size / 2.0, rect.center().y), Vec2::splat(size));

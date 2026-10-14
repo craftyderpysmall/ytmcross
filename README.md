@@ -29,6 +29,8 @@ cargo build --release
 ./target/release/ytmcross
 ```
 
+This builds two programs that belong in the same folder: `ytmcross` and the small `ytmcross-login`, which shows the sign-in window (on Windows, with `WebView2Loader.dll` beside it). Keeping the webview in its own program means the player itself never loads any browser code.
+
 The first launch opens the sign-in window. Sign out or in again from the **Account** menu. The **Equalizer** and **Pitch** menus apply instantly and are saved to `config.toml`.
 
 ## Files

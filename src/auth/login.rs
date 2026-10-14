@@ -1,4 +1,4 @@
-//! One-shot sign-in window (`ytmcross --login`).
+//! One-shot sign-in window (the `ytmcross-login` executable).
 //!
 //! Runs in its own process so the webview's event loop never meets egui's,
 //! and so every byte the browser engine allocated is returned to the OS the

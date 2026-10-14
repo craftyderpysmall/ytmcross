@@ -20,9 +20,6 @@ use theme::Theme;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     trace!("main: start");
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--login") {
-        auth::login::run();
-    }
     if let [_, flag, version] = args.as_slice()
         && flag == "--build-solver"
     {

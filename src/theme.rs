@@ -11,6 +11,10 @@ use std::sync::Arc;
 use crate::config::BUILTIN_THEMES;
 use crate::paths;
 
+// Inter, subset to every character it has but without the tables egui
+// never reads (GSUB/GPOS/GDEF, glyph names): renders pixel-identical, 40%
+// smaller. Made with:
+//   pyftsubset Inter-X.ttf --unicodes='*' --drop-tables+=GSUB,GPOS,GDEF --layout-features=''
 const INTER_REGULAR: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
 const INTER_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/Inter-SemiBold.ttf");
 
