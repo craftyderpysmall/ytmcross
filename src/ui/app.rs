@@ -180,7 +180,7 @@ pub struct App {
     requests: Pool<Request>,
     responses: Receiver<Response>,
     notifier: Notifier,
-    player: Option<Player>,
+    player: Player,
     resolver: Resolver,
     /// Track we're waiting on a stream URL for, and where to start it.
     pending_play: Option<(String, f64)>,
@@ -250,19 +250,13 @@ impl App {
         let (requests, responses, notifier) = worker::spawn(ctx.clone(), agent.clone());
         let images = Images::new(ctx, agent.clone());
 
-        let mut notice = config_error.or(loaded.error);
+        let notice = config_error.or(loaded.error);
         let player_notifier = notifier.clone();
         // Shares the agent (and its kept-alive connection to YouTube Music) with the API worker.
         let resolver = Resolver::new(notifier.clone(), agent.clone());
-        let player = match Player::spawn(&config.player, &config.equalizer, config.pitch.semitones, agent, move |e| {
+        let player = Player::new(&config.player, &config.equalizer, config.pitch.semitones, agent, move |e| {
             player_notifier.send(Response::Player(e))
-        }) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                notice = Some(format!("Couldn't start the audio engine ({e})."));
-                None
-            }
-        };
+        });
 
         let view = config.layout.sidebar_items.iter().find_map(|n| View::from_name(n)).unwrap_or(View::Library);
         if signed_in {
@@ -500,9 +494,7 @@ impl App {
     /// Applies equalizer settings at once; `save` also writes config.toml
     /// (done when a slider is released, not on every drag step).
     pub fn set_equalizer(&mut self, eq: EqualizerConfig, save: bool) {
-        if let Some(player) = &self.player {
-            player.set_equalizer(&eq);
-        }
+        self.player.set_equalizer(&eq);
         if save {
             self.requests.push(Request::SaveEqualizer(eq.clone()));
         }
@@ -511,9 +503,7 @@ impl App {
 
     /// Same as the equalizer: heard at once, saved on release.
     pub fn set_pitch(&mut self, semitones: i32, save: bool) {
-        if let Some(player) = &self.player {
-            player.set_pitch(semitones);
-        }
+        self.player.set_pitch(semitones);
         if save {
             self.requests.push(Request::SavePitch(semitones));
         }
@@ -735,22 +725,18 @@ impl App {
         self.resume_at = None;
         let duration = track.duration.as_deref().map_or(0.0, parse_clock);
         let id = track.video_id.clone();
-        let Some(player) = &self.player else {
-            self.notify("Playback unavailable: the audio engine isn't running.");
-            return;
-        };
         let ready = self.resolver.ready(&id);
         trace!("app: play {id} ({})", if ready.is_some() { "url ready" } else { "resolving" });
         match ready {
             Some(url) => {
                 self.resolver.playing(&url);
-                player.load(&url, at);
-                player.set_paused(false);
+                self.player.load(&url, at);
+                self.player.set_paused(false);
                 self.pending_play = None;
             }
             None => {
                 // Silence the previous track while the new one resolves.
-                player.stop();
+                self.player.stop();
                 self.pending_play = Some((id.clone(), at));
                 self.resolver.want(&id);
             }
@@ -888,12 +874,11 @@ impl App {
             self.start(at);
             return;
         }
-        let Some(player) = &self.player else { return };
         // Optimistic: flip immediately so the button reacts on click.
         let pos = self.playback.position();
         self.playback.paused = !self.playback.paused;
         self.playback.set_position(pos);
-        player.set_paused(self.playback.paused);
+        self.player.set_paused(self.playback.paused);
     }
 
     pub fn seek(&mut self, seconds: f64) {
@@ -902,17 +887,13 @@ impl App {
             self.playback.set_position(seconds);
             return;
         }
-        if let Some(player) = &self.player {
-            player.seek(seconds);
-            self.playback.set_position(seconds);
-        }
+        self.player.seek(seconds);
+        self.playback.set_position(seconds);
     }
 
     pub fn set_volume(&mut self, volume: f32) {
         self.playback.volume = volume;
-        if let Some(player) = &self.player {
-            player.set_volume((volume * 100.0).round() as f64);
-        }
+        self.player.set_volume((volume * 100.0).round() as f64);
     }
 
     // ---- messages ---------------------------------------------------------
@@ -1093,13 +1074,12 @@ impl App {
                 let Some((_, at)) = self.pending_play.take_if(|(id, _)| *id == video_id) else {
                     return; // a background prefetch; it's cached in the resolver
                 };
-                match (result, &self.player) {
-                    (Ok(url), Some(player)) => {
-                        player.load(&url, at);
-                        player.set_paused(false);
+                match result {
+                    Ok(url) => {
+                        self.player.load(&url, at);
+                        self.player.set_paused(false);
                     }
-                    (Ok(_), None) => {}
-                    (Err(e), _) => {
+                    Err(e) => {
                         self.notify(format!("Couldn't load track: {e}"));
                         self.next();
                     }

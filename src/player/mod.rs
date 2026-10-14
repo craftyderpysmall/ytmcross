@@ -16,8 +16,8 @@ mod output;
 mod pitch;
 mod source;
 
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
@@ -29,7 +29,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{Time, TimeBase};
 
 use crate::config::{EqualizerConfig, PlayerConfig};
-use crate::trace;
+use crate::{pool, trace};
 use index::FragmentIndex;
 use output::{Output, Shared};
 use source::HttpSource;
@@ -63,46 +63,62 @@ enum Command {
     Stop,
 }
 
+/// Told what the engine does (called on the engine's thread).
+type Notify = Arc<dyn Fn(PlayerEvent) + Send + Sync>;
+/// The way to the engine thread, while one runs.
+type Link = Arc<Mutex<Option<Sender<Command>>>>;
+
 pub struct Player {
-    commands: Sender<Command>,
     shared: Arc<Shared>,
+    agent: ureq::Agent,
+    notify: Notify,
+    /// The engine thread starts with the first command and exits once it
+    /// holds nothing (see `Engine::run`); commands are sent under this lock.
+    engine: Link,
 }
 
 impl Player {
     /// `agent` is shared with the resolver: preloads warm up the same
     /// connections the player then streams over.
-    pub fn spawn(
+    pub fn new(
         cfg: &PlayerConfig,
         eq: &EqualizerConfig,
         pitch: i32,
         agent: ureq::Agent,
-        notify: impl Fn(PlayerEvent) + Send + 'static,
-    ) -> std::io::Result<Player> {
+        notify: impl Fn(PlayerEvent) + Send + Sync + 'static,
+    ) -> Player {
         let shared = Shared::new(eq, pitch);
         shared.set_volume(cfg.volume.min(100) as f32 / 100.0);
-        let (tx, rx) = mpsc::channel();
-        let engine_shared = shared.clone();
-        std::thread::Builder::new()
-            .name("audio-engine".into())
-            .spawn(move || Engine::new(engine_shared, Box::new(notify), agent).run(rx))?;
-        Ok(Player { commands: tx, shared })
+        Player { shared, agent, notify: Arc::new(notify), engine: Link::default() }
+    }
+
+    fn send(&self, cmd: Command) {
+        let mut link = self.engine.lock().unwrap();
+        let tx = link.get_or_insert_with(|| {
+            let (tx, rx) = mpsc::channel();
+            let engine = Engine::new(self.shared.clone(), self.notify.clone(), self.agent.clone());
+            let link = self.engine.clone();
+            let _ = std::thread::Builder::new().name("audio-engine".into()).spawn(move || engine.run(rx, &link));
+            tx
+        });
+        let _ = tx.send(cmd);
     }
 
     /// Plays a direct stream URL (from the resolver) from `start` seconds.
     pub fn load(&self, url: &str, start: f64) {
-        let _ = self.commands.send(Command::Load(url.to_string(), start));
+        self.send(Command::Load(url.to_string(), start));
     }
 
     pub fn stop(&self) {
-        let _ = self.commands.send(Command::Stop);
+        self.send(Command::Stop);
     }
 
     pub fn set_paused(&self, paused: bool) {
-        let _ = self.commands.send(Command::Pause(paused));
+        self.send(Command::Pause(paused));
     }
 
     pub fn seek(&self, seconds: f64) {
-        let _ = self.commands.send(Command::Seek(seconds));
+        self.send(Command::Seek(seconds));
     }
 
     /// 0..=100, applied immediately in the audio callback.
@@ -141,7 +157,7 @@ struct Current {
 
 struct Engine {
     shared: Arc<Shared>,
-    notify: Box<dyn Fn(PlayerEvent) + Send>,
+    notify: Notify,
     agent: ureq::Agent,
     output: Option<Output>,
     current: Option<Current>,
@@ -150,11 +166,11 @@ struct Engine {
 }
 
 impl Engine {
-    fn new(shared: Arc<Shared>, notify: Box<dyn Fn(PlayerEvent) + Send>, agent: ureq::Agent) -> Engine {
+    fn new(shared: Arc<Shared>, notify: Notify, agent: ureq::Agent) -> Engine {
         Engine { shared, notify, agent, output: None, current: None, paused: false, scratch: Vec::new() }
     }
 
-    fn run(mut self, commands: Receiver<Command>) {
+    fn run(mut self, commands: Receiver<Command>, link: &Mutex<Option<Sender<Command>>>) {
         loop {
             let active = self.current.is_some() && !self.paused;
             let next = if active {
@@ -162,12 +178,27 @@ impl Engine {
             } else if self.output.is_some() {
                 commands.recv_timeout(RELEASE_AFTER)
             } else {
-                commands.recv().map_err(|_| RecvTimeoutError::Disconnected)
+                commands.recv_timeout(pool::IDLE)
             };
             match next {
                 Ok(cmd) => self.handle(cmd),
-                Err(RecvTimeoutError::Timeout) if !active => self.release(),
-                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Timeout) if active => {}
+                Err(RecvTimeoutError::Timeout) if self.output.is_some() => self.release(),
+                // Holding nothing: exit, unless a command slipped in (they're
+                // sent under the lock, so none can arrive after this check).
+                Err(RecvTimeoutError::Timeout) => {
+                    let mut link = link.lock().unwrap();
+                    match commands.try_recv() {
+                        Ok(cmd) => {
+                            drop(link);
+                            self.handle(cmd);
+                        }
+                        Err(_) => {
+                            *link = None;
+                            return;
+                        }
+                    }
+                }
                 Err(RecvTimeoutError::Disconnected) => return,
             }
             if self.current.is_some() && !self.paused {
