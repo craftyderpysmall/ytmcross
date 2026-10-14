@@ -11,7 +11,9 @@ top := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))..)
 outdir ?= $(top)/target/srpm
 
 srpm:
-	command -v cargo rpmbuild git >/dev/null || dnf -y install cargo rpm-build git-core
+	for tool in cargo rpmbuild git; do
+		command -v $$tool >/dev/null || { dnf -y install cargo rpm-build git-core; break; }
+	done
 	git() { command git -c safe.directory='*' -C '$(top)' "$$@"; }
 	version=$$(sed -n 's/^version = "\(.*\)"$$/\1/p' '$(top)/Cargo.toml' | head -n 1)
 	if git tag --points-at HEAD | grep -qx "v$$version"; then
