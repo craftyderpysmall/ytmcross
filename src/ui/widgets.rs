@@ -136,7 +136,7 @@ pub fn text_link(ui: &Ui, id: Id, pos: Pos2, galley: Arc<Galley>, color: Color32
 
 /// Track row: art, title (links to the album), "artist • album" (each a
 /// link), and on the right the like button and duration. The like button
-/// shows on hover, and always when the song is liked.
+/// shows on hover (filled when the song is liked).
 pub fn track_row(ui: &mut Ui, images: &Images, theme: &Theme, track: &Track, look: RowLook) -> (Response, RowClicks) {
     let sense = if look.draggable { Sense::click_and_drag() } else { Sense::click() };
     let (rect, mut resp) = row_frame(ui, theme, look.active, sense);
@@ -170,7 +170,7 @@ pub fn track_row(ui: &mut Ui, images: &Images, theme: &Theme, track: &Track, loo
         let btn = Rect::from_center_size(pos2(right - size / 2.0, rect.center().y), Vec2::splat(size));
         right -= size + 8.0;
         let like = ui.interact(btn, resp.id.with("like"), Sense::click());
-        let t = ease(ui, resp.id.with("like-vis"), hovered || look.liked);
+        let t = ease(ui, resp.id.with("like-vis"), hovered);
         if t > 0.0 {
             let over = ease(ui, resp.id.with("like-hover"), like.hovered());
             let base = if look.liked { c.text } else { c.text_dim.lerp_to_gamma(c.text, over) };

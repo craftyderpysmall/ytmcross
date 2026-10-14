@@ -1,15 +1,14 @@
 # ytmcross: notes for Claude
 
-Native Rust YouTube Music client (no Electron, no browser at runtime). Read this before working on it.
+Native Rust YouTube Music client (no Electron, no browser at runtime).
 
-## The user's priorities (apply to every task)
+## User priorities (every task)
 
-1. **Runtime performance first**: low RAM, near-zero idle CPU, fast startup, nothing running in the background.
-2. **Minimal and clean**: no feature creep; remove unused code; small, readable modules.
-3. **Disk size matters, but less** than RAM/CPU (trade disk for speed only when it's clearly worth it).
-4. Every request ends with: keep looking for startup/storage/CPU/RAM wins and clean up unused code. Measure before and after (scripts in `dev/`), and report numbers.
-5. When done: commit (no attribution or Co-Authored-By lines), and push to `origin` (github.com/craftyderpysmall/ytmcross, branch `master`) when the user asks.
-6. The user uses the **scarf-dark** theme (white `text`, blue `accent`). Accent buttons and filled icons use the theme's `text` color, never `background`/`accent` for labels.
+1. Runtime performance first: low RAM, zero idle CPU, fast startup, nothing in the background.
+2. Minimal and clean: no feature creep, remove unused code.
+3. Disk size matters, but less than RAM/CPU.
+4. After each request, keep looking for startup/storage/CPU/RAM wins and unused code. Measure before and after with `dev/` scripts and report numbers.
+5. When done: commit, and push to `origin master` (github.com/craftyderpysmall/ytmcross) when asked.
 
 ## Build (Windows, GNU toolchain via scoop)
 
@@ -21,64 +20,52 @@ $env:CARGO_HOME = "$env:USERPROFILE\scoop\persist\rustup\.cargo"
 $env:RUSTUP_HOME = "$env:USERPROFILE\scoop\persist\rustup\.rustup"
 ```
 
-- Toolchain override for this folder: `stable-x86_64-pc-windows-gnu`. Release build is ~2 min (fat LTO).
-- Checks: `cargo clippy --all-targets` (keep it at zero warnings), `cargo test` (22 tests).
-- Two binaries: `ytmcross` (the app) and `ytmcross-login` (`src/bin/`, the sign-in webview). The login exe needs `WebView2Loader.dll` next to it (copy from the webview2-com-sys `x64/` folder into `target/release` if missing). The main exe must never import it: check with `objdump -p target\release\ytmcross.exe | Select-String "DLL Name"`.
-- `build.rs` deflates `assets/ejs/*.js` into the binary; `flate2` is already in the tree via png/ureq.
+- Toolchain: `stable-x86_64-pc-windows-gnu` (folder override). Release build ~2 min (fat LTO).
+- Keep `cargo clippy --all-targets` at zero warnings; `cargo test` must pass.
+- Two binaries: `ytmcross` and `ytmcross-login` (`src/bin/`, the sign-in webview, needs `WebView2Loader.dll` beside it; copy from webview2-com-sys `x64/` if missing). The main exe must never import that DLL (`objdump -p target\release\ytmcross.exe | Select-String "DLL Name"`).
+- `build.rs` deflates `assets/ejs/*.js` into the binary.
 
-## Environment pitfalls
+## Pitfalls
 
-- Shell is Windows PowerShell 5.1. Many files have **CRLF** line endings: multi-line `.Replace()` in PowerShell silently fails on them. Prefer the Edit tool, or normalize with `.Replace("`r`n","`n")` first, and always verify the replacement happened.
-- `git commit -m` with double quotes in the message breaks argument passing: write the message to a file and use `git commit -F <file>`.
-- PS 5.1 `Invoke-WebRequest` drops a manual `Cookie` header: use `curl.exe` (see `dev/yt.ps1`).
-- `Set-Content` without `-Encoding` writes ANSI; use `[IO.File]::WriteAllText(path, text, (New-Object Text.UTF8Encoding $false))`.
+- PowerShell 5.1. Many files are CRLF: multi-line `.Replace()` silently fails. Prefer the Edit tool, or normalize CRLF first, and verify replacements happened.
+- Commit messages with quotes: write to a file and `git commit -F <file>`.
+- Write files as UTF-8 without BOM: `[IO.File]::WriteAllText(p, t, (New-Object Text.UTF8Encoding $false))`.
+- Editing a bundled theme (`assets/themes/*.toml`): add the previous version's hash (`node dev/fnv.js <file>`) to `OLD_BUNDLED_THEMES` in `config.rs`, so unedited user copies upgrade.
+- Theme colors: labels on accent buttons and filled icons use `text`, never `background`.
 
 ## Architecture (src/)
 
-- `main.rs`: `--build-solver <ver>` helper dispatch, first-run sign-in, then `ui::run`.
-- `ui/shell.rs`: winit loop, **CPU rendering** (egui_software_backend + softbuffer, `with_caching(false)`: measured faster and half the RAM). Draws only when something changed; nothing when hidden; frames paced to the refresh rate. Calls `App::on_exit` after the loop.
-- `ui/app.rs`: all state. Spotify-style `Queue` (current, `manual` queue plays first, then `context` = album/playlist/radio, radio appended when it runs out). Page history (`Page` enum, Back keeps loaded pages, max 16). `likes` map overrides like status from responses. Resume: `last-played` file (plain text, one field per line) restores the track paused; its stream is prefetched only when the pointer hovers play (`warm_resume`), since doing it at startup cost 1.3 MB idle. Fallback fonts installed on first need (`response_needs_fallback`, search query check).
-- `ui/views.rs`: views return an `Action`, applied afterwards (shared borrows while drawing). `track_list` is virtualized (`show_rows`); `rows` draws rows directly (artist page). Queue view maps rows via `QueueRow`. Views slide up while fading in (`VIEW_ENTER`).
-- `ui/widgets.rs`: custom-painted widgets. `track_row` has: art, title (not clickable), `byline` (Artist and Album are links, then "N plays"), like button (thumbs-up drawn from convex polygons; visible on hover, and always when liked) in a fixed column left of a fixed-width duration slot.
-- `ui/menus.rs`: Account/Equalizer/Pitch/Theme popups (`MENU_COUNT`), song and playlist context menus (Delete for owned playlists, "Remove from library" for saved ones; "Add to playlist" lists only owned ones), delete modal.
-- `ui/bar.rs`: now-playing bar; title plain, `Artist • Album` links.
-- `worker.rs`: the single API thread (`Request`/`Response`). Large variants are boxed (clippy).
-- `api/`: InnerTube WEB_REMIX client (`client.rs`), JSON parsing by searching for leaf renderers (`parse.rs`), models (`Track`, `Playlist` with `kind` Playlist/Album, `owned`, `save_id`; `Header`; `Artist`).
-- `stream/`: resolves video ids to stream URLs natively: `player` endpoint + unscrambling in QuickJS (`solver.rs`, bytecode cached in data dir; built by the `--build-solver` helper process with SWC, falling back to the embedded yt-dlp ejs scripts). Hints: Visible (64 KiB preload) / Likely (128 KiB). A 403 on preload invalidates and rebuilds the solver. **yt-dlp is not used anymore** (removed on purpose).
-- `player/`: symphonia (AAC/MP4) + cpal. `output.rs` callback applies volume, `pitch.rs` (WSOLA + Catmull-Rom resampler, bypassed at 0, reset via `generation` atomic), `eq.rs` (5-band biquads). `source.rs` HTTP range source + preload cache.
-- `theme.rs`: TOML themes merged over the built-in default; Inter fonts (subset, see the comment there); `system_fallbacks()` memory-maps OS fonts for CJK/Hangul/Indic/Thai/Arabic.
-- `config.rs`: `config.toml` with line-based edits (`set_section`, `set_top_level_key`). Bundled themes are upgraded in place only if their FNV-1a hash (CR stripped) is in `OLD_BUNDLED_THEMES`. **When editing a bundled theme file, add the previous version's hash** (`node dev/fnv.js <file>`).
+- `ui/shell.rs`: winit loop, CPU rendering (egui_software_backend + softbuffer, caching off). Draws only on change, nothing when hidden.
+- `ui/app.rs`: all state. Spotify-style `Queue` (current, user `manual` queue first, then `context`; radio appended at the end). Back history of pages. `likes` overrides like status. `last-played` restores the track paused; its stream is prefetched only when the pointer hovers play. System fallback fonts are installed on first need.
+- `ui/views.rs`: views return an `Action` applied afterwards; virtualized `track_list`; queue rows via `QueueRow`.
+- `ui/widgets.rs`: custom widgets. `track_row`: title (plain), `byline` (Artist and Album links, plays), like button (hover only, filled if liked) left of a fixed-width duration slot.
+- `ui/menus.rs`: Account/Equalizer/Pitch/Theme popups, context menus (Delete owned playlists, Remove saved ones), delete modal. `ui/bar.rs`: now-playing bar.
+- `worker.rs`: single API thread (`Request`/`Response`).
+- `api/`: InnerTube WEB_REMIX client, parser (searches leaf renderers), models (`Track`, `Playlist` with `kind`/`owned`/`save_id`, `Header`, `Artist`).
+- `stream/`: native stream resolving: `player` endpoint + unscrambling in QuickJS (`solver.rs`, bytecode cached, built by the `--build-solver` helper process). A 403 rebuilds the solver. yt-dlp is intentionally not used.
+- `player/`: symphonia + cpal. Callback applies volume, `pitch.rs` (WSOLA + resampler, bypassed at 0) and `eq.rs`.
+- `theme.rs`: themes, subset Inter fonts, memory-mapped system fallback fonts. `config.rs`: line-based `config.toml` edits.
 
-## YouTube Music API facts (verified with dev/yt.ps1 probes)
+## YouTube Music API facts
 
 - Search filters: songs `EgWKAQIIAWoMEA4QChADEAQQCRAF`, albums `EgWKAQIYAWoMEA4QChADEAQQCRAF`.
-- Rows: artist/album links are runs with `browseEndpoint` and pageType `MUSIC_PAGE_TYPE_ARTIST`/`_ALBUM`, in any flex column after the title; "N plays"/"N views" text is in a later column.
-- Like status: playlist rows have `likeButtonRenderer.likeStatus`; search/up-next rows only offer a like action whose status is `INDIFFERENT` when already liked, `LIKE` when not. Like: `like/like` / `like/removelike` with `{target:{videoId}}`.
-- Library: `FEmusic_liked_playlists`, `FEmusic_liked_albums`. Own playlists have `playlistEditorEndpoint` in their menu. Save/remove a playlist or album: `like/like` / `like/removelike` with `{target:{playlistId}}` (albums use their `OLAK5uy_…` playlist id).
-- Album page: browse `MPREb_…`; header `musicResponsiveHeaderRenderer` (strapline = artist, save toggle `toggleButtonRenderer`); rows lack artist/art (filled from the header). Own playlists use `musicEditablePlaylistDetailHeaderRenderer`.
-- Artist page: `musicImmersiveHeaderRenderer` (`monthlyListenerCount`), first `musicShelfRenderer` = top songs, carousels "Albums" and "Singles & EPs".
-- The library listing lags behind edits: update lists locally (optimistic) instead of refetching.
-- Signed out, every response says `logged_in=0`: only treat that as an expired session when a session exists.
+- Artist/album links are runs with `browseEndpoint` pageType `MUSIC_PAGE_TYPE_ARTIST`/`_ALBUM` in any column after the title.
+- Like status: `likeButtonRenderer.likeStatus`, or a like action with status `INDIFFERENT` (already liked) / `LIKE`. Like: `like/like` / `like/removelike` with `{target:{videoId}}`; save/remove playlist or album with `{target:{playlistId}}` (albums use their `OLAK5uy_` id).
+- Library: `FEmusic_liked_playlists`, `FEmusic_liked_albums`. Own playlists have `playlistEditorEndpoint` in their menu. The listing lags behind edits: update locally.
+- Album page `MPREb_…`: header `musicResponsiveHeaderRenderer`; rows lack artist/art. Artist page: `musicImmersiveHeaderRenderer`, first `musicShelfRenderer` = top songs, carousels "Albums" / "Singles & EPs".
+- Signed out, responses say `logged_in=0`; only treat it as expiry when a session exists.
 
-## Measuring and testing (dev/)
+## dev/ scripts
 
-- `dev/startup.ps1`: exe size, launch-to-first-frame, idle private memory (3 runs; move the cursor off the play button first).
-- `dev/memtest.ps1`: memory over searches and playback (should plateau).
-- `dev/launch.ps1` + `dev/win.ps1` (`-Action shot|click|rclick|drag|move|type|wheel`): drive the window for screenshot checks. Coordinates are client pixels; window 1100x720; sidebar menus at x~50.
-- `dev/yt.ps1 <endpoint> '<json>' <out>`: authenticated InnerTube probe using cookies.txt; `rows.js`, `menus.js`, `jq.js` summarize responses.
-- `dev/pxdiff.py`: pixel diff of screenshots (used to prove the font subset renders identically).
-- `YTMCROSS_TRACE=1` logs timings to `trace.log` in the data dir; `YTMCROSS_STATS=1` shows ms/frame in the title.
+- `startup.ps1` (size, first frame, idle memory), `memtest.ps1` (memory over use).
+- `launch.ps1` + `win.ps1 -Action shot|click|rclick|drag|move|type` to drive the window (client pixels, 1100x720).
+- `yt.ps1 <endpoint> '<json>' <out>` authenticated InnerTube probe; `rows.js`, `menus.js`, `jq.js` summarize responses; `pxdiff.py` pixel diffs.
+- `YTMCROSS_TRACE=1` writes timings to `trace.log` in the data dir.
 
-## Baselines (latest)
+## Baselines
 
-Main exe 10.71 MB, login exe 0.68 MB. First frame ~40 ms after main (wall ~80 ms). Idle 7.8–8.0 MB private, ~17.4 MB while playing (plateaus). Idle CPU 0. Playing ~1.7% of one core; pitch adds ~0.6%.
+Main exe 10.71 MB, login exe 0.68 MB. Wall launch-to-first-frame ~80 ms. Idle 7.8–8.0 MB private, ~17.4 MB playing. Idle CPU 0.
 
-## Data locations (Windows)
+## Data
 
-Config + themes: `%APPDATA%\ytmcross`. Session (`cookies.txt`), `last-played`, `signed-out` marker, solver cache, trace.log: `%LOCALAPPDATA%\ytmcross`. Never print or publish cookies.txt.
-
-## Ideas not done yet
-
-- Unhinted Inter subset would save another ~170 KB, but changes ~5k pixels of rendering (rejected for now).
-- Dirty-rect presenting (only the bar changes during playback) could cut the 1 Hz clock repaint cost.
-- Artist pages show YouTube's first page only (no "see all").
+Config and themes: `%APPDATA%\ytmcross`. `cookies.txt` (never print or publish), `last-played`, solver cache, `trace.log`: `%LOCALAPPDATA%\ytmcross`.
