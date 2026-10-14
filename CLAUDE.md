@@ -72,7 +72,7 @@ $env:RUSTUP_HOME = "$env:USERPROFILE\scoop\persist\rustup\.rustup"
 
 Main exe 10.42 MB, login exe 0.72 MB. Process creation to main ~30 ms (OS; a trivial exe is the same), main to first frame ~34 ms (~20 ms of it is winit window creation). Idle 3.5 MB private, 6 threads. memtest settles ~8.5 MB. Playing ~13 Mcycles/s visible, ~9.7 minimized; true idle ~0. Seek ~30 ms. (Windows.)
 
-Linux: not measured yet (record `dev/startup.sh` and `dev/memtest.sh` results here, with the distro, desktop and backend).
+Linux (Fedora 44, Hyprland 0.56, Ryzen AI 7 350, 2026-10-14): main exe 12.43 MB, login exe 0.79 MB. Wayland: launch to first frame ~21 ms wall (main to first frame ~12 ms, event loop ready ~4 ms); idle 11.0 MB private, 3.1 MB anon, 1 thread, 0 ms/s CPU once settled. X11 (XWayland): ~22-29 ms wall (event loop ready ~10-15 ms); settled 11.6 MB private, 3.6 MB anon, 1 thread, ~3 ms/s CPU. The first launch blocks on sign-in and then builds the solver, so measure from the second run on. memtest (X11, `WINIT_X11_SCALE_FACTOR=1`, window floated at 1100x720): 11.4 MB at start, 21.8 after four searches, settles ~25.8 MB private / 16.1 anon while playing; playing ~28 ms/s CPU. Hyprland has no minimize, so the "minimized" line equals the visible one. Search now shows an Albums shelf above Songs, so memtest's "track 1" click (y 150) opens an album and "track 2" plays from it.
 
 ## Data
 
