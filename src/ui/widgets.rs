@@ -6,17 +6,66 @@ use std::sync::Arc;
 
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{
-    Align2, Color32, CornerRadius, FontId, Galley, Id, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, Vec2, pos2, vec2,
+    Align2, Color32, CornerRadius, FontId, Galley, Id, IdMap, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, Vec2, pos2,
+    vec2,
 };
 
 use super::images::Images;
 use crate::api::models::Track;
 use crate::theme::{self, Theme};
 
-pub const HOVER_TIME: f32 = 0.12;
+/// Stiffness of the hover/press springs: settles in ~0.19 s.
+const SPRING: f32 = 40.0;
 
+/// A critically damped spring: no overshoot, and turning around mid-way
+/// keeps its velocity instead of jumping like a restarted tween.
+#[derive(Clone, Copy)]
+struct Spring {
+    value: f32,
+    velocity: f32,
+    pass: u64,
+}
+
+/// Springs in motion or resting away from 0. A spring at rest at 0 is
+/// dropped, so the map only holds what is hovered or animating.
+#[derive(Clone, Default)]
+struct Springs(IdMap<Spring>);
+
+/// 0..1 following `on` with a spring. Repaints only while moving.
 pub fn ease(ui: &Ui, id: Id, on: bool) -> f32 {
-    ui.ctx().animate_bool_with_time_and_easing(id, on, HOVER_TIME, egui::emath::easing::cubic_out)
+    let ctx = ui.ctx();
+    let (pass, dt) = (ctx.cumulative_pass_nr(), ui.input(|i| i.stable_dt).min(1.0 / 30.0));
+    let target = if on { 1.0 } else { 0.0 };
+    let (value, moving) = ctx.data_mut(|d| {
+        let map = &mut d.get_temp_mut_or_default::<Springs>(Id::NULL).0;
+        if !on && !map.contains_key(&id) {
+            return (0.0, false);
+        }
+        if map.len() > 64 {
+            // Widgets that stopped being drawn mid-animation.
+            map.retain(|_, s| s.pass + 1 >= pass);
+        }
+        let s = map.entry(id).or_insert(Spring { value: 0.0, velocity: 0.0, pass: pass.wrapping_sub(1) });
+        if s.pass != pass {
+            // Exact solution for one step of `dt`: stable at any frame rate.
+            let (d, v, e) = (s.value - target, s.velocity, (-SPRING * dt).exp());
+            let k = (v + SPRING * d) * dt;
+            (s.value, s.velocity, s.pass) = (target + (d + k) * e, (v - SPRING * k) * e, pass);
+        }
+        if (s.value - target).abs() < 0.002 && s.velocity.abs() < 0.05 {
+            s.value = target;
+            s.velocity = 0.0;
+        }
+        let out = (s.value.clamp(0.0, 1.0), s.value != target);
+        if !on && !out.1 {
+            map.remove(&id);
+        }
+        out
+    });
+    if moving {
+        ctx.request_repaint();
+    }
+    value
 }
 
 fn radius(theme: &Theme) -> CornerRadius {
@@ -343,8 +392,8 @@ pub fn text_button(ui: &mut Ui, theme: &Theme, label: &str) -> Response {
 
 #[derive(Clone, Copy)]
 pub enum Icon {
-    Play,
-    Pause,
+    /// 0 = play, 1 = pause, in between a morph.
+    PlayPause(f32),
     Prev,
     Next,
 }
@@ -374,15 +423,24 @@ pub fn icon_button(ui: &Ui, theme: &Theme, rect: Rect, id: Id, icon: Icon, prima
 fn paint_icon(p: &egui::Painter, icon: Icon, c: Pos2, s: f32, color: Color32) {
     let tri = |points: Vec<Pos2>| Shape::convex_polygon(points, color, Stroke::NONE);
     match icon {
-        Icon::Play => {
-            // Optical centring: nudge right a little.
-            let c = c + vec2(s * 0.15, 0.0);
-            p.add(tri(vec![pos2(c.x - s * 0.8, c.y - s), pos2(c.x + s, c.y), pos2(c.x - s * 0.8, c.y + s)]));
-        }
-        Icon::Pause => {
-            let w = s * 0.55;
-            for dx in [-s * 0.55, s * 0.55] {
-                p.rect_filled(Rect::from_center_size(pos2(c.x + dx, c.y), vec2(w, s * 2.0)), CornerRadius::same(1), color);
+        Icon::PlayPause(t) => {
+            // The play triangle cut in two halves, each morphing into a
+            // pause bar. Corners as (x, y) offsets in units of `s`, clockwise.
+            // Play is nudged right a little for optical centring.
+            const PLAY: [[(f32, f32); 4]; 2] = [
+                [(-0.65, -1.0), (0.25, -0.5), (0.25, 0.5), (-0.65, 1.0)],
+                [(0.25, -0.5), (1.15, -0.01), (1.15, 0.01), (0.25, 0.5)],
+            ];
+            const PAUSE: [[(f32, f32); 4]; 2] = [
+                [(-0.825, -1.0), (-0.275, -1.0), (-0.275, 1.0), (-0.825, 1.0)],
+                [(0.275, -1.0), (0.825, -1.0), (0.825, 1.0), (0.275, 1.0)],
+            ];
+            for (play, pause) in PLAY.iter().zip(&PAUSE) {
+                let corner = |i: usize| {
+                    let (a, b) = (play[i], pause[i]);
+                    c + vec2(a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t) * s
+                };
+                p.add(tri((0..4).map(corner).collect()));
             }
         }
         Icon::Next | Icon::Prev => {

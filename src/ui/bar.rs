@@ -74,7 +74,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         let cx = centre.center().x;
         let by = rect.top() + 18.0;
         let enabled = track.is_some();
-        let play_icon = if pb.paused || track.is_none() { Icon::Play } else { Icon::Pause };
+        let play_icon = Icon::PlayPause(widgets::ease(ui, Id::new("play-morph"), !pb.paused && track.is_some()));
         let btn = |x: f32, d: f32| Rect::from_center_size(pos2(x, by), vec2(d, d));
         if icon_button(ui, theme, btn(cx - 52.0, 30.0), Id::new("prev"), Icon::Prev, false, enabled).clicked() {
             action = Some(Action::Prev);

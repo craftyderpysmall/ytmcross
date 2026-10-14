@@ -6,7 +6,8 @@
 //! Frame policy, all in one place:
 //! - Something woke us (input, a worker message, an animation tick):
 //!   run `App::logic` and schedule a frame.
-//! - Frames are paced to the monitor's refresh rate, never faster.
+//! - Frames are paced to the monitor's refresh rate, never faster; while
+//!   animating, on Windows, in step with the compositor's vblank.
 //! - Minimized or fully covered: logic still runs (the queue keeps
 //!   advancing), but nothing is laid out or drawn.
 //! - Nothing scheduled: the thread sleeps in the OS until the next event.
@@ -41,7 +42,8 @@ struct Shell {
     win: Option<Surface>,
     occluded: bool,
     next_frame: Option<Instant>,
-    last_frame: Instant,
+    /// Earliest start of the next frame (refresh-rate pacing).
+    ready_at: Instant,
     frame_interval: Duration,
     /// `YTMCROSS_STATS=1`: average frame time shown in the window title.
     stats: Option<(Duration, u32)>,
@@ -75,7 +77,7 @@ pub fn run(
         win: None,
         occluded: false,
         next_frame: Some(Instant::now()),
-        last_frame: Instant::now(),
+        ready_at: Instant::now(),
         frame_interval: Duration::from_micros(16_667),
     };
     event_loop.run_app(&mut shell)?;
@@ -125,12 +127,20 @@ impl Shell {
             }
         }
 
-        let now = Instant::now();
-        self.last_frame = now;
-        if let Some(vp) = out.viewport_output.get(&egui::ViewportId::ROOT)
-            && vp.repaint_delay < Duration::from_secs(3600)
-        {
-            self.schedule(now + vp.repaint_delay);
+        // The next frame may start one refresh after this one started.
+        self.ready_at = started + self.frame_interval;
+        let delay = out.viewport_output.get(&egui::ViewportId::ROOT).map_or(Duration::MAX, |vp| vp.repaint_delay);
+        if delay.is_zero() {
+            // Animating: wait for the compositor's next vblank, so frames are
+            // evenly spaced and in step with the display instead of judder.
+            #[cfg(windows)]
+            // SAFETY: no arguments; blocks until the next DWM composition.
+            if unsafe { windows_sys::Win32::Graphics::Dwm::DwmFlush() } >= 0 {
+                self.ready_at = Instant::now();
+            }
+        }
+        if delay < Duration::from_secs(3600) {
+            self.schedule(Instant::now() + delay);
         }
         Ok(())
     }
@@ -210,7 +220,7 @@ impl ApplicationHandler<Wake> for Shell {
             el.set_control_flow(ControlFlow::Wait);
             return;
         };
-        let when = when.max(self.last_frame + self.frame_interval);
+        let when = when.max(self.ready_at);
         if Instant::now() >= when {
             self.next_frame = None;
             // Hidden: drop the frame. Showing the window again triggers one.
