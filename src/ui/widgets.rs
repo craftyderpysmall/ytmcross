@@ -72,70 +72,211 @@ fn row_frame(ui: &mut Ui, theme: &Theme, active: bool, sense: Sense) -> (Rect, R
     (rect, resp)
 }
 
-/// Title + subtitle stacked next to optional art; `right` is drawn right-aligned.
-fn row_content(ui: &Ui, images: &Images, theme: &Theme, rect: Rect, item: RowText<'_>) {
+/// What was clicked inside a track row, besides the row itself.
+#[derive(Default)]
+pub struct RowClicks {
+    pub like: bool,
+    pub title: bool,
+    pub artist: bool,
+    pub album: bool,
+}
+
+/// A piece of text that acts as a link: underlined and pointing-hand on
+/// hover. Returns whether it was clicked; its response is merged into
+/// `row`, so right-clicking the text still opens the row's menu.
+fn link(ui: &Ui, row: &mut Response, id: Id, pos: Pos2, galley: Arc<Galley>, color: Color32, enabled: bool) -> bool {
+    let Some(resp) = text_link(ui, id, pos, galley, color, enabled) else { return false };
+    let clicked = resp.clicked();
+    *row = row.union(resp);
+    clicked
+}
+
+/// Draws `galley` at `pos`; when `enabled` it's clickable, underlined on hover.
+pub fn text_link(ui: &Ui, id: Id, pos: Pos2, galley: Arc<Galley>, color: Color32, enabled: bool) -> Option<Response> {
+    let rect = Rect::from_min_size(pos, galley.size());
+    ui.painter().galley(pos, galley, color);
+    if !enabled {
+        return None;
+    }
+    let resp = ui.interact(rect, id, Sense::click());
+    if resp.hovered() {
+        let y = rect.bottom() - 1.0;
+        ui.painter().line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], Stroke::new(1.0_f32, color));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    Some(resp)
+}
+
+/// Track row: art, title (links to the album), "artist • album" (each a
+/// link), and on the right the like button and duration. The like button
+/// shows on hover, and always when the song is liked.
+pub fn track_row(ui: &mut Ui, images: &Images, theme: &Theme, track: &Track, look: RowLook) -> (Response, RowClicks) {
+    let sense = if look.draggable { Sense::click_and_drag() } else { Sense::click() };
+    let (rect, mut resp) = row_frame(ui, theme, look.active, sense);
+    let mut clicks = RowClicks::default();
+    if !ui.is_rect_visible(rect) {
+        return (resp, clicks);
+    }
+    let hovered = ui.rect_contains_pointer(rect);
     let pad = 8.0;
     let mut x = rect.left() + pad;
     if theme.show_art {
         let s = theme.art_size;
-        art(ui, images, Rect::from_min_size(pos2(x, rect.center().y - s / 2.0), Vec2::splat(s)), item.thumb, theme);
+        art(ui, images, Rect::from_min_size(pos2(x, rect.center().y - s / 2.0), Vec2::splat(s)), track.thumb.as_deref(), theme);
         x += s + 12.0;
     }
     let c = &theme.colors;
-    let mut right_w = 0.0;
-    if let Some(right) = item.right {
-        let g = line(ui, right, small(theme), c.text_dim, 80.0);
-        right_w = g.size().x + 16.0;
-        ui.painter().galley(pos2(rect.right() - pad - g.size().x, rect.center().y - g.size().y / 2.0), g, c.text_dim);
+    // Right side: duration, then the like button left of it.
+    let mut right = rect.right() - pad;
+    if let Some(d) = &track.duration {
+        let g = line(ui, d, small(theme), c.text_dim, 80.0);
+        right -= g.size().x;
+        ui.painter().galley(pos2(right, rect.center().y - g.size().y / 2.0), g, c.text_dim);
+        right -= 12.0;
     }
-    let max_w = rect.right() - pad - right_w - x;
-    let title_color = if item.highlight { c.accent } else { c.text };
-    let title = line(ui, item.title, title_font(theme), title_color, max_w);
-    let sub = line(ui, item.subtitle, small(theme), c.text_dim, max_w);
-    let total = title.size().y + 2.0 + sub.size().y;
+    if look.can_like {
+        let size = 26.0;
+        let btn = Rect::from_center_size(pos2(right - size / 2.0, rect.center().y), Vec2::splat(size));
+        right -= size + 8.0;
+        let like = ui.interact(btn, resp.id.with("like"), Sense::click());
+        let t = ease(ui, resp.id.with("like-vis"), hovered || look.liked);
+        if t > 0.0 {
+            let over = ease(ui, resp.id.with("like-hover"), like.hovered());
+            let base = if look.liked { c.accent } else { c.text_dim.lerp_to_gamma(c.text, over) };
+            thumbs_up(ui.painter(), btn.center(), 15.0, base.gamma_multiply(t), look.liked);
+        }
+        if like.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        clicks.like = like.clicked();
+    }
+
+    let row_id = resp.id;
+    let max_w = (right - x).max(0.0);
+    let title_color = if look.playing { c.accent } else { c.text };
+    let title = line(ui, &track.title, title_font(theme), title_color, max_w);
+    let sub_font = small(theme);
+    let artist = line(ui, &track.artists, sub_font.clone(), c.text_dim, max_w);
+    let total = title.size().y + 2.0 + artist.size().y;
     let top = rect.center().y - total / 2.0;
     let sub_y = top + title.size().y + 2.0;
-    ui.painter().galley(pos2(x, top), title, title_color);
-    ui.painter().galley(pos2(x, sub_y), sub, c.text_dim);
-    if item.highlight {
+    clicks.title = link(ui, &mut resp, row_id.with("title"), pos2(x, top), title, title_color, track.album_id.is_some());
+    let artist_w = artist.size().x;
+    clicks.artist = link(ui, &mut resp, row_id.with("artist"), pos2(x, sub_y), artist, c.text_dim, track.artist_id.is_some());
+    if let Some(album) = &track.album {
+        let mut ax = x + artist_w;
+        if !track.artists.is_empty() {
+            let sep = line(ui, " • ", sub_font.clone(), c.text_dim, f32::INFINITY);
+            let w = sep.size().x;
+            ui.painter().galley(pos2(ax, sub_y), sep, c.text_dim);
+            ax += w;
+        }
+        if right - ax > 24.0 {
+            let g = line(ui, album, sub_font, c.text_dim, right - ax);
+            clicks.album = link(ui, &mut resp, row_id.with("album"), pos2(ax, sub_y), g, c.text_dim, track.album_id.is_some());
+        }
+    }
+    if look.playing {
         let bar = Rect::from_center_size(pos2(rect.left() + 2.0, rect.center().y), vec2(3.0, rect.height() * 0.5));
         ui.painter().rect_filled(bar, CornerRadius::same(2), c.accent);
     }
+    (resp.on_hover_cursor(egui::CursorIcon::PointingHand), clicks)
 }
 
-struct RowText<'a> {
-    title: &'a str,
-    subtitle: &'a str,
-    right: Option<&'a str>,
-    thumb: Option<&'a str>,
-    highlight: bool,
+/// How a track row is drawn.
+#[derive(Clone, Copy, Default)]
+pub struct RowLook {
+    pub playing: bool,
+    pub active: bool,
+    pub draggable: bool,
+    pub can_like: bool,
+    pub liked: bool,
 }
 
-/// `draggable` rows can be dragged (to reorder); a click still plays.
-pub fn track_row(ui: &mut Ui, images: &Images, theme: &Theme, track: &Track, playing: bool, active: bool, draggable: bool) -> Response {
-    let sense = if draggable { Sense::click_and_drag() } else { Sense::click() };
-    let (rect, resp) = row_frame(ui, theme, active, sense);
+/// Thumbs-up icon in a `size` box: outlined, or filled when `filled`.
+/// Built from convex pieces, since egui only fills convex polygons.
+pub fn thumbs_up(p: &egui::Painter, center: Pos2, size: f32, color: Color32, filled: bool) {
+    let o = center - Vec2::splat(size / 2.0);
+    let pt = |x: f32, y: f32| o + vec2(x, y) * size;
+    if filled {
+        p.rect_filled(Rect::from_min_max(pt(0.04, 0.42), pt(0.26, 0.96)), CornerRadius::same(1), color);
+        let palm = vec![pt(0.33, 0.38), pt(0.90, 0.38), pt(0.97, 0.47), pt(0.87, 0.90), pt(0.80, 0.96), pt(0.33, 0.96)];
+        p.add(Shape::convex_polygon(palm, color, Stroke::NONE));
+        let thumb = vec![pt(0.33, 0.46), pt(0.51, 0.10), pt(0.59, 0.04), pt(0.67, 0.08), pt(0.66, 0.40), pt(0.33, 0.40)];
+        p.add(Shape::convex_polygon(thumb, color, Stroke::NONE));
+    } else {
+        let stroke = Stroke::new(1.4_f32, color);
+        p.rect_stroke(Rect::from_min_max(pt(0.04, 0.42), pt(0.26, 0.96)), CornerRadius::same(1), stroke, egui::StrokeKind::Middle);
+        let hand = vec![
+            pt(0.33, 0.96),
+            pt(0.33, 0.46),
+            pt(0.51, 0.10),
+            pt(0.59, 0.04),
+            pt(0.67, 0.08),
+            pt(0.65, 0.38),
+            pt(0.90, 0.38),
+            pt(0.97, 0.47),
+            pt(0.87, 0.90),
+            pt(0.80, 0.96),
+        ];
+        p.add(Shape::closed_line(hand, stroke));
+    }
+}
+
+/// Album/playlist tile: square art with title and subtitle under it.
+pub fn card(ui: &mut Ui, images: &Images, theme: &Theme, title: &str, subtitle: &str, thumb: Option<&str>, size: f32) -> Response {
+    let text_h = theme.font_size * 2.6;
+    let (rect, resp) = ui.allocate_exact_size(vec2(size, size + text_h + 6.0), Sense::click());
     if ui.is_rect_visible(rect) {
-        let subtitle = match &track.album {
-            Some(album) if !track.artists.is_empty() => format!("{} • {album}", track.artists),
-            Some(album) => album.clone(),
-            None => track.artists.clone(),
-        };
-        row_content(ui, images, theme, rect, RowText {
-            title: &track.title,
-            subtitle: &subtitle,
-            right: track.duration.as_deref(),
-            thumb: track.thumb.as_deref(),
-            highlight: playing,
-        });
+        let t = ease(ui, resp.id.with("hover"), resp.hovered());
+        let art_rect = Rect::from_min_size(rect.min, Vec2::splat(size)).shrink(2.0 * (1.0 - t));
+        art(ui, images, art_rect, thumb, theme);
+        let c = &theme.colors;
+        let title_g = line(ui, title, title_font(theme), c.text, size);
+        let y = rect.top() + size + 6.0;
+        let h = title_g.size().y;
+        ui.painter().galley(pos2(rect.left(), y), title_g, c.text);
+        let sub = line(ui, subtitle, small(theme), c.text_dim, size);
+        ui.painter().galley(pos2(rect.left(), y + h + 1.0), sub, c.text_dim);
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Outlined rounded button, the quieter sibling of `pill`.
+pub fn ghost_pill(ui: &mut Ui, theme: &Theme, label: &str) -> Response {
+    let font = title_font(theme);
+    let g = line(ui, label, font, theme.colors.text, f32::INFINITY);
+    let size = g.size() + vec2(28.0, 14.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let t = ease(ui, resp.id.with("hover"), resp.hovered());
+    let c = &theme.colors;
+    ui.painter().rect_filled(rect, CornerRadius::same(255), c.hover.gamma_multiply(t));
+    let stroke = Stroke::new(1.0_f32, c.text_dim.lerp_to_gamma(c.text, t));
+    ui.painter().rect_stroke(rect, CornerRadius::same(255), stroke, egui::StrokeKind::Inside);
+    ui.painter().galley(rect.center() - g.size() / 2.0, g, c.text);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Playlist/album row: art with title and subtitle.
 pub fn playlist_row(ui: &mut Ui, images: &Images, theme: &Theme, title: &str, subtitle: &str, thumb: Option<&str>) -> Response {
     let (rect, resp) = row_frame(ui, theme, false, Sense::click());
     if ui.is_rect_visible(rect) {
-        row_content(ui, images, theme, rect, RowText { title, subtitle, right: None, thumb, highlight: false });
+        let pad = 8.0;
+        let mut x = rect.left() + pad;
+        if theme.show_art {
+            let s = theme.art_size;
+            art(ui, images, Rect::from_min_size(pos2(x, rect.center().y - s / 2.0), Vec2::splat(s)), thumb, theme);
+            x += s + 12.0;
+        }
+        let c = &theme.colors;
+        let max_w = rect.right() - pad - x;
+        let title = line(ui, title, title_font(theme), c.text, max_w);
+        let sub = line(ui, subtitle, small(theme), c.text_dim, max_w);
+        let total = title.size().y + 2.0 + sub.size().y;
+        let top = rect.center().y - total / 2.0;
+        let sub_y = top + title.size().y + 2.0;
+        ui.painter().galley(pos2(x, top), title, c.text);
+        ui.painter().galley(pos2(x, sub_y), sub, c.text_dim);
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }

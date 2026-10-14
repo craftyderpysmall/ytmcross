@@ -18,6 +18,14 @@ pub struct Config {
     pub layout: LayoutConfig,
     pub player: PlayerConfig,
     pub equalizer: EqualizerConfig,
+    pub pitch: PitchConfig,
+}
+
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct PitchConfig {
+    /// -12..=12; 0 leaves the audio untouched.
+    pub semitones: i32,
 }
 
 /// Number of equalizer bands (see `player::eq::BANDS`).
@@ -74,6 +82,7 @@ impl Default for Config {
             layout: LayoutConfig::default(),
             player: PlayerConfig::default(),
             equalizer: EqualizerConfig::default(),
+            pitch: PitchConfig::default(),
         }
     }
 }
@@ -145,6 +154,12 @@ pub fn save_equalizer(eq: &EqualizerConfig) -> std::io::Result<()> {
         gains.join(", ")
     );
     edit_config(|text| set_section(text, "equalizer", &body))
+}
+
+/// Rewrites the `[pitch]` section of config.toml (the app owns it).
+pub fn save_pitch(semitones: i32) -> std::io::Result<()> {
+    let body = format!("# Managed by the Pitch menu. Semitones, -12 to 12.\nsemitones = {semitones}\n");
+    edit_config(|text| set_section(text, "pitch", &body))
 }
 
 fn edit_config(edit: impl FnOnce(&str) -> String) -> std::io::Result<()> {

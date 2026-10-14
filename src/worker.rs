@@ -6,7 +6,7 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::api::client::{ApiError, Client};
-use crate::api::models::{Continuation, Playlist, Track};
+use crate::api::models::{Artist, Continuation, Header, Kind, Playlist, Track};
 use crate::auth::session::Session;
 use crate::config::{self, Config, EqualizerConfig};
 use crate::paths;
@@ -14,10 +14,13 @@ use crate::player::PlayerEvent;
 use crate::theme::{self, Theme};
 
 pub enum Request {
+    /// Songs, then albums.
     Search(String),
-    Library,
-    Playlist(String),
-    PlaylistMore(String, Continuation),
+    /// Saved playlists (`albums` false) or saved albums.
+    Library { albums: bool },
+    Playlist(Playlist),
+    PlaylistMore(Playlist, Continuation),
+    Artist(String),
     /// Up-next tracks seeded from a video; `autoplay` starts the first one.
     Radio { video_id: String, autoplay: bool },
     /// Re-read config.toml and the theme it names.
@@ -30,19 +33,25 @@ pub enum Request {
     /// Save the theme choice to config.toml, then reload.
     SetTheme(String),
     SaveEqualizer(EqualizerConfig),
+    SavePitch(i32),
     CreatePlaylist(String),
-    DeletePlaylist { id: String, title: String },
+    DeletePlaylist(Playlist),
     AddToPlaylist { id: String, title: String, video_id: String },
     /// Move an entry to just before `before` (or to the end).
     MoveInPlaylist { id: String, set_video_id: String, before: Option<String> },
+    Like { video_id: String, like: bool },
+    /// Save a playlist or album to the library (by `save_id`), or remove it.
+    Save { list: Playlist, save_id: String, save: bool },
 }
 
 pub enum Response {
     Search { query: String, result: Result<Vec<Track>, String> },
-    Library(Result<Vec<Playlist>, String>),
-    /// `editable` is set on the first page only.
-    PlaylistPage { id: String, tracks: Vec<Track>, done: bool, editable: Option<bool> },
+    SearchAlbums { query: String, albums: Vec<Playlist> },
+    Library { albums: bool, result: Result<Vec<Playlist>, String> },
+    /// `header` is set on the first page only.
+    PlaylistPage { id: String, tracks: Vec<Track>, done: bool, header: Option<Box<Header>> },
     PlaylistFailed { id: String, error: String },
+    Artist { id: String, result: Result<Box<Artist>, String> },
     Radio { seed: String, tracks: Vec<Track>, autoplay: bool },
     Reloaded { config: Box<Config>, theme: Box<theme::Loaded>, config_error: Option<String> },
     LoggedOut,
@@ -54,6 +63,8 @@ pub enum Response {
     /// A playlist was created. The library listing lags behind edits, so the
     /// UI adds it locally instead of fetching the library again.
     Created(Playlist),
+    /// A like/unlike didn't go through: the UI puts the old state back.
+    LikeFailed { video_id: String, liked: bool, error: String },
     Player(PlayerEvent),
     /// A stream URL lookup finished (see stream/mod.rs).
     Resolved { video_id: String, result: Result<String, String> },
@@ -109,11 +120,20 @@ fn run(requests: Receiver<Request>, requeue: Sender<Request>, out: Notifier, age
         match request {
             Request::Search(query) => {
                 let result = client.search(&query).map_err(err);
-                out.send(Response::Search { query, result });
+                let ok = result.is_ok();
+                out.send(Response::Search { query: query.clone(), result });
+                if ok {
+                    let albums = client.search_albums(&query).unwrap_or_default();
+                    out.send(Response::SearchAlbums { query, albums });
+                }
             }
-            Request::Library => out.send(Response::Library(client.library().map_err(err))),
-            Request::Playlist(id) => playlist_page(&client, &requeue, &out, id, None, err),
-            Request::PlaylistMore(id, cont) => playlist_page(&client, &requeue, &out, id, Some(cont), err),
+            Request::Library { albums } => out.send(Response::Library { albums, result: client.library(albums).map_err(err) }),
+            Request::Playlist(list) => playlist_page(&client, &requeue, &out, list, None, err),
+            Request::PlaylistMore(list, cont) => playlist_page(&client, &requeue, &out, list, Some(cont), err),
+            Request::Artist(id) => {
+                let result = client.artist(&id).map(Box::new).map_err(err);
+                out.send(Response::Artist { id, result });
+            }
             Request::Radio { video_id, autoplay } => {
                 let tracks = client.radio(&video_id).map_err(err).unwrap_or_default();
                 out.send(Response::Radio { seed: video_id, tracks, autoplay });
@@ -136,12 +156,25 @@ fn run(requests: Receiver<Request>, requeue: Sender<Request>, out: Notifier, age
                     edited(format!("Couldn't save equalizer: {e}"), false, None);
                 }
             }
+            Request::SavePitch(semitones) => {
+                if let Err(e) = config::save_pitch(semitones) {
+                    edited(format!("Couldn't save pitch: {e}"), false, None);
+                }
+            }
             Request::CreatePlaylist(title) => match client.create_playlist(&title) {
-                Ok(id) => out.send(Response::Created(Playlist { id, title, subtitle: "Private".into(), thumb: None })),
+                Ok(id) => out.send(Response::Created(Playlist {
+                    id,
+                    kind: Kind::Playlist,
+                    title,
+                    subtitle: "Private".into(),
+                    thumb: None,
+                    owned: true,
+                    save_id: None,
+                })),
                 Err(e) => edited(format!("Couldn't create playlist: {}", err(e)), false, None),
             },
-            Request::DeletePlaylist { id, title } => match client.delete_playlist(&id) {
-                Ok(()) => edited(format!("Deleted \u{201c}{title}\u{201d}"), false, None),
+            Request::DeletePlaylist(list) => match client.delete_playlist(&list.id) {
+                Ok(()) => edited(format!("Deleted \u{201c}{}\u{201d}", list.title), false, None),
                 // The UI already removed it: bring the real library back.
                 Err(e) => edited(format!("Couldn't delete playlist: {}", err(e)), true, None),
             },
@@ -155,6 +188,19 @@ fn run(requests: Receiver<Request>, requeue: Sender<Request>, out: Notifier, age
                     edited(format!("Couldn't reorder: {}", err(e)), false, Some(id));
                 }
             }
+            Request::Like { video_id, like } => {
+                if let Err(e) = client.like(&video_id, like) {
+                    out.send(Response::LikeFailed { video_id, liked: !like, error: err(e) });
+                }
+            }
+            Request::Save { list, save_id, save } => match client.save(&save_id, save) {
+                Ok(()) => {
+                    let verb = if save { "Saved" } else { "Removed" };
+                    edited(format!("{verb} \u{201c}{}\u{201d}", list.title), false, None);
+                }
+                // The UI already changed the library: bring the real one back.
+                Err(e) => edited(format!("Couldn't update library: {}", err(e)), true, None),
+            },
         }
     }
 }
@@ -169,23 +215,24 @@ fn playlist_page(
     client: &Client,
     requeue: &Sender<Request>,
     out: &Notifier,
-    id: String,
+    list: Playlist,
     cont: Option<Continuation>,
     err: impl Fn(ApiError) -> String,
 ) {
-    match client.playlist_page(&id, cont.as_ref()) {
+    match client.playlist_page(&list, cont.as_ref()) {
         Ok(page) => {
             // Stop if a page comes back empty, so a bad token can't loop forever.
             let next = page.next.filter(|_| !page.tracks.is_empty());
             let done = next.is_none();
+            let id = list.id.clone();
             if let Some(next) = next {
-                let _ = requeue.send(Request::PlaylistMore(id.clone(), next));
+                let _ = requeue.send(Request::PlaylistMore(list, next));
             }
-            out.send(Response::PlaylistPage { id, tracks: page.tracks, done, editable: page.editable });
+            out.send(Response::PlaylistPage { id, tracks: page.tracks, done, header: page.header.map(Box::new) });
         }
         Err(e) => {
             let error = err(e);
-            out.send(Response::PlaylistFailed { id, error });
+            out.send(Response::PlaylistFailed { id: list.id, error });
         }
     }
 }

@@ -7,12 +7,13 @@
 //! comes from.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use super::eq::{EqShared, EqState};
+use super::pitch::PitchShifter;
 use crate::config::EqualizerConfig;
 
 /// Seconds of decoded audio kept ahead of the speakers. Covers network
@@ -25,16 +26,22 @@ pub struct Shared {
     gain: AtomicU32,
     /// Frames handed to the device since the last reset.
     played: AtomicU64,
+    /// Bumped by `reset`, so the callback drops what its pitch shifter holds.
+    generation: AtomicU32,
     pub eq: EqShared,
+    /// Pitch shift in semitones (0 = off).
+    pub pitch: AtomicI32,
 }
 
 impl Shared {
-    pub fn new(eq: &EqualizerConfig) -> Arc<Shared> {
+    pub fn new(eq: &EqualizerConfig, pitch: i32) -> Arc<Shared> {
         Arc::new(Shared {
             samples: Mutex::new(VecDeque::new()),
             gain: AtomicU32::new(1.0f32.to_bits()),
             played: AtomicU64::new(0),
+            generation: AtomicU32::new(0),
             eq: EqShared::new(eq),
+            pitch: AtomicI32::new(pitch),
         })
     }
 
@@ -50,6 +57,7 @@ impl Shared {
 
     pub fn reset(&self) {
         self.samples.lock().unwrap().clear();
+        self.generation.fetch_add(1, Ordering::Relaxed);
         self.played.store(0, Ordering::Relaxed);
     }
 
@@ -61,8 +69,8 @@ impl Shared {
 /// An open output stream at a fixed rate and channel count.
 pub struct Output {
     stream: cpal::Stream,
-    pub rate: u32,
-    pub channels: u16,
+    rate: u32,
+    channels: u16,
     /// Source rate when we had to resample ourselves (device refused the source rate).
     resample_from: Option<u32>,
     resample_pos: f64,
@@ -170,6 +178,8 @@ fn build(device: &cpal::Device, config: &cpal::StreamConfig, shared: &Arc<Shared
     let channels = config.channels as usize;
     let shared = shared.clone();
     let mut eq = EqState::new(config.sample_rate, config.channels);
+    let mut pitch = PitchShifter::new(config.sample_rate, config.channels);
+    let (mut generation, mut pitch_on) = (0, false);
     device
         .build_output_stream(
             *config,
@@ -177,11 +187,26 @@ fn build(device: &cpal::Device, config: &cpal::StreamConfig, shared: &Arc<Shared
                 let gain = f32::from_bits(shared.gain.load(Ordering::Relaxed));
                 let mut written = 0;
                 if let Ok(mut q) = shared.samples.try_lock() {
-                    let n = out.len().min(q.len());
-                    for (dst, src) in out[..n].iter_mut().zip(q.drain(..n)) {
-                        *dst = src * gain;
+                    let g = shared.generation.load(Ordering::Relaxed);
+                    let semitones = shared.pitch.load(Ordering::Relaxed);
+                    // A seek/new track, or pitch just turned off: drop what it holds.
+                    if g != generation || (pitch_on && semitones == 0) {
+                        generation = g;
+                        pitch.clear();
                     }
-                    written = n;
+                    pitch_on = semitones != 0;
+                    if pitch_on {
+                        pitch.set_semitones(semitones);
+                        written = pitch.process(&mut q, out);
+                    } else {
+                        written = out.len().min(q.len());
+                        for (dst, src) in out[..written].iter_mut().zip(q.drain(..written)) {
+                            *dst = src;
+                        }
+                    }
+                }
+                for s in &mut out[..written] {
+                    *s *= gain;
                 }
                 eq.process(&shared.eq, &mut out[..written]);
                 out[written..].fill(0.0);

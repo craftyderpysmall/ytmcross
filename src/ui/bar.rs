@@ -12,9 +12,13 @@ pub const HEIGHT: f32 = 58.0;
 enum Action {
     Prev,
     Toggle,
+    /// The pointer rests on play: the click is likely coming.
+    Warm,
     Next,
     Seek(f64),
     Volume(f32),
+    OpenAlbum(crate::api::models::Track),
+    OpenArtist(String),
 }
 
 pub fn show(app: &mut App, ui: &mut Ui) {
@@ -42,8 +46,17 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         let total = g_title.size().y + 3.0 + g_sub.size().y;
         let top = rect.center().y - total / 2.0;
         let sub_y = top + g_title.size().y + 3.0;
-        ui.painter().galley(pos2(text_x, top), g_title, c.text);
-        ui.painter().galley(pos2(text_x, sub_y), g_sub, c.text_dim);
+        // Title opens the album, artist the artist page.
+        let album = track.filter(|t| t.album_id.is_some());
+        let title_link = widgets::text_link(ui, Id::new("bar-title"), pos2(text_x, top), g_title, c.text, album.is_some());
+        if let (Some(t), true) = (album, title_link.is_some_and(|r| r.clicked())) {
+            action = Some(Action::OpenAlbum(t.clone()));
+        }
+        let artist = track.and_then(|t| t.artist_id.clone());
+        let artist_link = widgets::text_link(ui, Id::new("bar-artist"), pos2(text_x, sub_y), g_sub, c.text_dim, artist.is_some());
+        if let (Some(id), true) = (artist, artist_link.is_some_and(|r| r.clicked())) {
+            action = Some(Action::OpenArtist(id));
+        }
 
         // Right: volume (hidden when the window is narrow).
         let show_volume = rect.width() > 640.0;
@@ -67,8 +80,11 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         if icon_button(ui, theme, btn(cx - 52.0, 30.0), Id::new("prev"), Icon::Prev, false, enabled).clicked() {
             action = Some(Action::Prev);
         }
-        if icon_button(ui, theme, btn(cx, 38.0), Id::new("play"), play_icon, true, enabled).clicked() {
+        let play = icon_button(ui, theme, btn(cx, 38.0), Id::new("play"), play_icon, true, enabled);
+        if play.clicked() {
             action = Some(Action::Toggle);
+        } else if play.hovered() {
+            action = Some(Action::Warm);
         }
         if icon_button(ui, theme, btn(cx + 52.0, 30.0), Id::new("next"), Icon::Next, false, enabled).clicked() {
             action = Some(Action::Next);
@@ -97,9 +113,12 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     match action {
         Some(Action::Prev) => app.prev(),
         Some(Action::Toggle) => app.toggle_pause(),
+        Some(Action::Warm) => app.warm_resume(),
         Some(Action::Next) => app.next(),
         Some(Action::Seek(t)) => app.seek(t),
         Some(Action::Volume(v)) => app.set_volume(v),
+        Some(Action::OpenAlbum(t)) => app.open_album(ui.ctx(), &t),
+        Some(Action::OpenArtist(id)) => app.open_artist(ui.ctx(), &id),
         None => {}
     }
 }

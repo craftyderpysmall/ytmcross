@@ -79,6 +79,7 @@ pub fn run(
         frame_interval: Duration::from_micros(16_667),
     };
     event_loop.run_app(&mut shell)?;
+    shell.app.on_exit();
     Ok(())
 }
 

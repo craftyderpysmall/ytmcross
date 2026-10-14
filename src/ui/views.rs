@@ -1,29 +1,34 @@
 //! Sidebar and the main content views. Views draw with shared borrows and
 //! return the action the user took; it is applied afterwards.
 
+use std::ops::Range;
+
 use egui::{Align, CornerRadius, CursorIcon, FontId, Id, Layout, Rect, RichText, ScrollArea, TextEdit, Ui, pos2, vec2};
 
-use super::app::{App, View, is_special_playlist};
-use super::images::Images;
+use super::app::{App, View};
 use super::menus::{self, MenuAction, PlaylistChoice, TrackChoice};
-use super::widgets::{self, nav_item, pill, playlist_row, text_button, track_row};
-use crate::api::models::{Playlist, Track};
+use super::widgets::{self, RowLook, card, ghost_pill, nav_item, pill, playlist_row, text_button, track_row};
+use crate::api::models::{Kind, Playlist, Track};
 use crate::theme::{self, Theme};
 
-const VIEW_FADE: f64 = 0.18;
+/// Entrance animation of a view: fade in while sliding up this far.
+const VIEW_ENTER: f64 = 0.22;
+const VIEW_SLIDE: f32 = 14.0;
 const NEW_PLAYLIST_FIELD: &str = "new-playlist-title";
 /// Distance from the list's edge where dragging a row scrolls the list.
 const DRAG_SCROLL_ZONE: f32 = 48.0;
+/// Album tiles (search, artist pages) and page header art.
+const CARD: f32 = 132.0;
+const HEADER_ART: f32 = 128.0;
 
-/// Which list a track row belongs to (for right-click actions).
-#[derive(Clone, Copy)]
-enum Source {
-    Search,
-    Playlist,
-    Queue,
+/// One line of a track list.
+enum Entry<'a> {
+    Track(&'a Track),
+    /// Section title (the queue's "Next in queue", ...).
+    Header(&'a str),
 }
 
-/// What a track list reported this frame.
+/// What a track list reported this frame. Indexes are list rows.
 #[derive(Default)]
 struct ListResult {
     clicked: Option<usize>,
@@ -33,6 +38,9 @@ struct ListResult {
     /// Rows laid out on screen this frame.
     on_screen: Vec<String>,
     menu: Option<(usize, TrackChoice)>,
+    like: Option<usize>,
+    album: Option<usize>,
+    artist: Option<usize>,
     drag_start: Option<usize>,
     /// Where a dragged row would land (insert before this index).
     drop_at: Option<usize>,
@@ -40,24 +48,43 @@ struct ListResult {
 
 /// How a track list is drawn.
 struct ListSpec<'a> {
-    tracks: &'a [Track],
+    len: usize,
+    entry: &'a dyn Fn(usize) -> Entry<'a>,
     playing: Option<&'a str>,
-    current: Option<usize>,
-    /// For "Add to playlist" (None when signed out).
-    playlists: Option<&'a [Playlist]>,
+    /// Row drawn as selected (the queue's current track).
+    active: Option<usize>,
     /// Some when rows can be dragged to reorder: the drag in progress.
     reorder: Option<Option<(usize, usize)>>,
 }
 
+/// A row of the queue view.
+#[derive(Clone, Copy)]
+enum QueueRow {
+    Header,
+    Current,
+    Manual(usize),
+    Context(usize),
+}
+
 enum Action {
     Go(View),
+    Back,
     PlaySearch(usize),
-    OpenPlaylist(usize),
-    PlayPlaylist(usize),
-    PlayQueue(usize),
-    PlayLibraryPlaylist(usize),
-    TrackMenu(Source, usize, TrackChoice),
-    AskDelete(usize),
+    /// Play the open playlist/album from a row, or shuffled.
+    PlayPage(usize, bool),
+    ToggleSaved,
+    Open(Playlist),
+    /// Open and start playing as soon as it loads.
+    PlayCollection(Playlist),
+    OpenArtist(String),
+    OpenAlbum(Track),
+    PlayQueue(QueueRow),
+    PlayArtistSong(usize),
+    TrackMenu(Track, TrackChoice),
+    Like(Track),
+    AskDelete(Playlist),
+    Remove(Playlist),
+    LibraryTab(Kind),
     StartNewPlaylist,
     CreatePlaylist,
     CancelNewPlaylist,
@@ -73,7 +100,7 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
         ui.label(RichText::new("ytmcross").font(FontId::new(theme.font_size * 1.25, theme::bold())).color(theme.colors.accent));
         ui.add_space(14.0);
         for view in app.config.layout.sidebar_items.iter().filter_map(|n| View::from_name(n)) {
-            let selected = app.view == view || (view == View::Library && app.view == View::Playlist);
+            let selected = app.section() == view;
             if nav_item(ui, theme, view.label(), selected).clicked() {
                 action = Some(Action::Go(view));
             }
@@ -82,7 +109,8 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
             status(app, ui);
             ui.add_space(8.0);
             // A fixed-height block at the bottom, laid out top-down inside.
-            let height = 3.0 * theme.font_size * 2.5 + 2.0 * ui.spacing().item_spacing.y;
+            let items = menus::MENU_COUNT as f32;
+            let height = items * theme.font_size * 2.5 + (items - 1.0) * ui.spacing().item_spacing.y;
             ui.allocate_ui_with_layout(vec2(ui.available_width(), height), Layout::top_down(Align::Min), |ui| {
                 if let Some(m) = menus::menus(app, ui, false) {
                     action = Some(Action::Menu(m));
@@ -102,13 +130,15 @@ fn status(app: &App, ui: &mut Ui) {
 }
 
 pub fn content(app: &mut App, ui: &mut Ui) {
-    // Fade the view in after switching.
+    // Entrance: the view fades in while gliding up into place.
     let now = ui.input(|i| i.time);
-    let t = ((now - app.view_since) / VIEW_FADE).clamp(0.0, 1.0) as f32;
+    let t = ((now - app.view_since) / VIEW_ENTER).clamp(0.0, 1.0) as f32;
     if t < 1.0 {
         ui.ctx().request_repaint();
     }
-    ui.multiply_opacity(egui::emath::easing::cubic_out(t));
+    let e = egui::emath::easing::cubic_out(t);
+    ui.multiply_opacity(e);
+    ui.add_space((1.0 - e) * VIEW_SLIDE);
 
     let mut action = None;
     if !app.config.layout.sidebar {
@@ -128,13 +158,12 @@ pub fn content(app: &mut App, ui: &mut Ui) {
         ui.add_space(8.0);
     }
 
-    let playing = app.now_playing().map(|t| t.video_id.clone());
-    let playing = playing.as_deref();
     let mut list = ListResult::default();
     action = match app.view {
-        View::Search => search(app, ui, playing, &mut list),
+        View::Search => search(app, ui, &mut list),
         View::Library => library(app, ui),
-        View::Playlist => playlist(app, ui, playing, &mut list),
+        View::Playlist => playlist(app, ui, &mut list),
+        View::Artist => artist(app, ui, &mut list),
         View::Queue => queue(app, ui, &mut list),
     }
     .or(action);
@@ -177,68 +206,81 @@ fn drag(app: &mut App, ui: &Ui, start: Option<usize>, drop_at: Option<usize>) {
 
 fn apply(app: &mut App, ui: &Ui, action: Option<Action>) {
     let ctx = ui.ctx();
+    let Some(action) = action else { return };
     match action {
-        Some(Action::Go(view)) => app.go(ctx, view),
-        Some(Action::PlaySearch(i)) => {
+        Action::Go(view) => app.go(ctx, view),
+        Action::Back => app.back(ctx),
+        Action::PlaySearch(i) => {
             if let Some(t) = app.search.results.get(i).cloned() {
-                app.play_list(vec![t], 0, true);
+                app.play_list(vec![t], 0, true, String::new(), None);
             }
         }
-        Some(Action::OpenPlaylist(i)) => {
-            if let Some(meta) = app.library.as_ref().and_then(|l| l.get(i)).cloned() {
-                app.open_playlist(ctx, meta, false);
+        Action::PlayPage(i, shuffle) => app.play_page(i, shuffle),
+        Action::ToggleSaved => app.toggle_saved(),
+        Action::Open(list) => app.open_playlist(ctx, list, false),
+        Action::PlayCollection(list) => app.open_playlist(ctx, list, true),
+        Action::OpenArtist(id) => app.open_artist(ctx, &id),
+        Action::OpenAlbum(track) => app.open_album(ctx, &track),
+        Action::PlayQueue(row) => match row {
+            QueueRow::Manual(i) => app.skip_to_manual(i),
+            QueueRow::Context(i) => app.skip_to_context(i),
+            QueueRow::Current | QueueRow::Header => {}
+        },
+        Action::PlayArtistSong(i) => {
+            if let Some(a) = app.artist.as_ref().and_then(|a| a.artist.as_ref()) {
+                let (songs, name) = (a.songs.clone(), a.name.clone());
+                app.play_list(songs, i, true, name, None);
             }
         }
-        Some(Action::PlayLibraryPlaylist(i)) => {
-            // Opens it and starts playing as soon as its first page arrives.
-            if let Some(meta) = app.library.as_ref().and_then(|l| l.get(i)).cloned() {
-                app.open_playlist(ctx, meta, true);
-            }
-        }
-        Some(Action::PlayPlaylist(i)) => {
-            if let Some(tracks) = app.playlist.as_ref().map(|p| p.tracks.clone()) {
-                app.play_list(tracks, i, false);
-            }
-        }
-        Some(Action::PlayQueue(i)) => app.play_queue_index(i),
-        Some(Action::TrackMenu(source, i, choice)) => {
-            let track = match source {
-                Source::Search => app.search.results.get(i),
-                Source::Playlist => app.playlist.as_ref().and_then(|p| p.tracks.get(i)),
-                Source::Queue => app.queue.get(i),
-            }
-            .cloned();
-            let Some(track) = track else { return };
-            match choice {
-                TrackChoice::PlayNext => app.play_next(track),
-                TrackChoice::AddToQueue => app.add_to_queue(track),
-                TrackChoice::AddToPlaylist(p) => {
-                    if let Some(playlist) = app.library.as_ref().and_then(|l| l.get(p)) {
-                        app.add_to_playlist(playlist, &track);
-                    }
+        Action::TrackMenu(track, choice) => match choice {
+            TrackChoice::PlayNext => app.play_next(track),
+            TrackChoice::AddToQueue => app.add_to_queue(track),
+            TrackChoice::AddToPlaylist(p) => {
+                if let Some(playlist) = app.library.as_ref().and_then(|l| l.get(p)) {
+                    app.add_to_playlist(playlist, &track);
                 }
             }
+        },
+        Action::Like(track) => app.toggle_like(&track),
+        Action::AskDelete(list) => app.confirm_delete = Some(list),
+        Action::Remove(list) => {
+            if let Some(id) = list.save_id.clone() {
+                app.set_saved(list, id, false);
+            }
         }
-        Some(Action::AskDelete(i)) => app.confirm_delete = app.library.as_ref().and_then(|l| l.get(i)).cloned(),
-        Some(Action::StartNewPlaylist) => {
+        Action::LibraryTab(kind) => {
+            app.library_tab = kind;
+            app.ensure_library();
+        }
+        Action::StartNewPlaylist => {
             app.new_playlist = Some(String::new());
             ctx.memory_mut(|m| m.request_focus(Id::new(NEW_PLAYLIST_FIELD)));
         }
-        Some(Action::CreatePlaylist) => {
+        Action::CreatePlaylist => {
             let title = app.new_playlist.take().unwrap_or_default();
             app.create_playlist(&title);
         }
-        Some(Action::CancelNewPlaylist) => app.new_playlist = None,
-        Some(Action::SignIn) => app.sign_in(),
-        Some(Action::Menu(m)) => menus::apply(app, m),
-        None => {}
+        Action::CancelNewPlaylist => app.new_playlist = None,
+        Action::SignIn => app.sign_in(),
+        Action::Menu(m) => menus::apply(app, m),
     }
 }
 
 fn heading(ui: &mut Ui, theme: &Theme, text: &str) {
     ui.add_space(6.0);
-    ui.label(RichText::new(text).font(FontId::new(theme.font_size * 1.7, theme::bold())).color(theme.colors.text));
+    ui.label(heading_text(theme, text));
     ui.add_space(10.0);
+}
+
+fn heading_text(theme: &Theme, text: &str) -> RichText {
+    RichText::new(text).font(FontId::new(theme.font_size * 1.7, theme::bold())).color(theme.colors.text)
+}
+
+/// Smaller section title inside a view ("Albums", "Top songs").
+fn section(ui: &mut Ui, theme: &Theme, text: &str) {
+    ui.add_space(8.0);
+    ui.label(RichText::new(text).font(FontId::new(theme.font_size * 1.15, theme::bold())).color(theme.colors.text));
+    ui.add_space(4.0);
 }
 
 fn dim(ui: &mut Ui, theme: &Theme, text: &str) {
@@ -250,39 +292,91 @@ fn spinner(ui: &mut Ui, theme: &Theme) {
     ui.vertical_centered(|ui| ui.add(egui::Spinner::new().size(22.0).color(theme.colors.accent)));
 }
 
+fn back_button(ui: &mut Ui, theme: &Theme) -> Option<Action> {
+    ui.add_space(4.0);
+    text_button(ui, theme, "‹ Back").clicked().then_some(Action::Back)
+}
+
+/// Lays out rows `range` of a list directly (no scrolling of its own).
+fn rows(ui: &mut Ui, app: &App, spec: &ListSpec, range: Range<usize>, out: &mut ListResult) -> Vec<(usize, Rect)> {
+    let theme = &app.theme;
+    // "Add to playlist" offers the user's own playlists.
+    let playlists = (!app.signed_out).then_some(app.library.as_deref().unwrap_or_default());
+    let mut rects = Vec::with_capacity(range.len());
+    for i in range {
+        let t = match (spec.entry)(i) {
+            Entry::Track(t) => t,
+            Entry::Header(text) => {
+                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), widgets::row_height(theme)), egui::Sense::hover());
+                let g = widgets::line(ui, text, widgets::title_font(theme), theme.colors.text_dim, rect.width());
+                ui.painter().galley(pos2(rect.left() + 8.0, rect.bottom() - g.size().y - 8.0), g, theme.colors.text_dim);
+                continue;
+            }
+        };
+        let look = RowLook {
+            playing: spec.playing == Some(t.video_id.as_str()),
+            active: spec.active == Some(i),
+            draggable: spec.reorder.is_some(),
+            can_like: app.can_like(),
+            liked: app.is_liked(t),
+        };
+        let (resp, clicks) = track_row(ui, &app.images, theme, t, look);
+        rects.push((i, resp.rect));
+        if clicks.like {
+            out.like = Some(i);
+        } else if clicks.title || clicks.album {
+            out.album = Some(i);
+        } else if clicks.artist {
+            out.artist = Some(i);
+        } else if resp.clicked() {
+            out.clicked = Some(i);
+        }
+        if resp.hovered() {
+            out.hovered = Some(t.video_id.clone());
+        }
+        if resp.is_pointer_button_down_on() {
+            out.pressed = Some(t.video_id.clone());
+        }
+        if resp.drag_started() && spec.reorder.is_some() {
+            out.drag_start = Some(i);
+        }
+        if let Some(choice) = menus::track_menu(&resp, playlists) {
+            out.menu = Some((i, choice));
+        }
+        out.on_screen.push(t.video_id.clone());
+    }
+    rects
+}
+
 /// Virtualized list: only rows inside the viewport are laid out and painted.
-fn track_list(ui: &mut Ui, images: &Images, theme: &Theme, spec: ListSpec) -> ListResult {
+fn track_list(ui: &mut Ui, app: &App, spec: ListSpec) -> ListResult {
     let mut out = ListResult::default();
     let dragging = spec.reorder.flatten();
     let pointer = ui.ctx().pointer_latest_pos();
-    ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, widgets::row_height(theme), spec.tracks.len(), |ui, range| {
-        let mut rows: Vec<(usize, Rect)> = Vec::with_capacity(range.len());
-        for i in range.clone() {
-            let t = &spec.tracks[i];
-            let resp = track_row(ui, images, theme, t, spec.playing == Some(t.video_id.as_str()), spec.current == Some(i), spec.reorder.is_some());
-            rows.push((i, resp.rect));
-            if resp.clicked() {
-                out.clicked = Some(i);
-            }
-            if resp.hovered() {
-                out.hovered = Some(t.video_id.clone());
-            }
-            if resp.is_pointer_button_down_on() {
-                out.pressed = Some(t.video_id.clone());
-            }
-            if resp.drag_started() && spec.reorder.is_some() {
-                out.drag_start = Some(i);
-            }
-            if let Some(choice) = menus::track_menu(&resp, spec.playlists) {
-                out.menu = Some((i, choice));
-            }
-            out.on_screen.push(t.video_id.clone());
-        }
+    let theme = &app.theme;
+    ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, widgets::row_height(theme), spec.len, |ui, range| {
+        let end = range.end;
+        let rects = rows(ui, app, &spec, range, &mut out);
         if let (Some((from, _)), Some(pointer)) = (dragging.or(out.drag_start.map(|f| (f, f))), pointer) {
-            drop_indicator(ui, theme, &rows, from, pointer.y, range.end, &mut out.drop_at);
+            drop_indicator(ui, theme, &rects, from, pointer.y, end, &mut out.drop_at);
         }
     });
     out
+}
+
+/// Turns what a list reported into an action, given how its rows map to tracks.
+fn row_action<'a>(list: &mut ListResult, track: impl Fn(usize) -> Option<&'a Track>) -> Option<Action> {
+    let cloned = |i: Option<usize>| i.and_then(&track).cloned();
+    if let Some((i, choice)) = list.menu.take() {
+        return cloned(Some(i)).map(|t| Action::TrackMenu(t, choice));
+    }
+    if let Some(t) = cloned(list.like) {
+        return Some(Action::Like(t));
+    }
+    if let Some(t) = cloned(list.album) {
+        return Some(Action::OpenAlbum(t));
+    }
+    cloned(list.artist).and_then(|t| t.artist_id).map(Action::OpenArtist)
 }
 
 /// Finds where a dragged row would land, draws the insertion line, dims the
@@ -313,7 +407,37 @@ fn drop_indicator(ui: &Ui, theme: &Theme, rows: &[(usize, Rect)], from: usize, y
     }
 }
 
-fn search(app: &mut App, ui: &mut Ui, playing: Option<&str>, list: &mut ListResult) -> Option<Action> {
+/// A horizontal strip (or wrapped grid) of album/playlist tiles.
+fn cards(ui: &mut Ui, app: &App, items: &[Playlist], wrap: bool) -> Option<Action> {
+    let mut action = None;
+    let mut draw = |ui: &mut Ui| {
+        for item in items {
+            let resp = card(ui, &app.images, &app.theme, &item.title, &item.subtitle, item.thumb.as_deref(), CARD);
+            if resp.clicked() {
+                action = Some(Action::Open(item.clone()));
+            }
+            if let Some(PlaylistChoice::Play) = menus::playlist_menu(&resp, item, app.signed_out) {
+                action = Some(Action::PlayCollection(item.clone()));
+            }
+        }
+    };
+    if wrap {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(14.0, 14.0);
+            draw(ui);
+        });
+    } else {
+        ScrollArea::horizontal().id_salt(ui.next_auto_id()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                draw(ui);
+            });
+        });
+    }
+    action
+}
+
+fn search(app: &mut App, ui: &mut Ui, list: &mut ListResult) -> Option<Action> {
     heading(ui, &app.theme, "Search");
     let font = FontId::proportional(app.theme.font_size * 1.1);
     let resp = ui.add(
@@ -331,17 +455,26 @@ fn search(app: &mut App, ui: &mut Ui, playing: Option<&str>, list: &mut ListResu
     }
     ui.add_space(10.0);
 
+    let app = &*app;
     let s = &app.search;
+    let theme = &app.theme;
     if s.loading {
-        spinner(ui, &app.theme);
+        spinner(ui, theme);
         return None;
     }
     if s.searched && s.results.is_empty() {
-        dim(ui, &app.theme, "No results.");
+        dim(ui, theme, "No results.");
     }
-    let spec = ListSpec { tracks: &s.results, playing, current: None, playlists: app.library.as_deref(), reorder: None };
-    *list = track_list(ui, &app.images, &app.theme, spec);
-    list.menu.take().map(|(i, c)| Action::TrackMenu(Source::Search, i, c)).or(list.clicked.map(Action::PlaySearch))
+    let mut action = None;
+    if !s.albums.is_empty() {
+        section(ui, theme, "Albums");
+        action = cards(ui, app, &s.albums, false);
+        section(ui, theme, "Songs");
+    }
+    let playing = app.now_playing().map(|t| t.video_id.as_str());
+    let entry = |i: usize| Entry::Track(&s.results[i]);
+    *list = track_list(ui, app, ListSpec { len: s.results.len(), entry: &entry, playing, active: None, reorder: None });
+    row_action(list, |i| s.results.get(i)).or(list.clicked.map(Action::PlaySearch)).or(action)
 }
 
 fn library(app: &mut App, ui: &mut Ui) -> Option<Action> {
@@ -349,8 +482,17 @@ fn library(app: &mut App, ui: &mut Ui) -> Option<Action> {
     // `heading`'s spacing, applied outside the row (inside it would be horizontal).
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Library").font(FontId::new(app.theme.font_size * 1.7, theme::bold())).color(app.theme.colors.text));
+        ui.label(heading_text(&app.theme, "Library"));
         if app.signed_out {
+            return;
+        }
+        ui.add_space(12.0);
+        for (kind, label) in [(Kind::Playlist, "Playlists"), (Kind::Album, "Albums")] {
+            if ui.add(egui::Button::selectable(app.library_tab == kind, label)).clicked() && app.library_tab != kind {
+                action = Some(Action::LibraryTab(kind));
+            }
+        }
+        if app.library_tab != Kind::Playlist {
             return;
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| match &mut app.new_playlist {
@@ -376,33 +518,37 @@ fn library(app: &mut App, ui: &mut Ui) -> Option<Action> {
     ui.add_space(10.0);
     let theme = &app.theme;
     if app.signed_out {
-        dim(ui, theme, "Sign in to see your playlists.");
+        dim(ui, theme, "Sign in to see your playlists and albums.");
         ui.add_space(8.0);
         if pill(ui, theme, "Sign in").clicked() {
             action = Some(Action::SignIn);
         }
         return action;
     }
-    let Some(list) = &app.library else {
-        if app.library_loading {
+    let (items, loading, empty) = match app.library_tab {
+        Kind::Playlist => (&app.library, app.library_loading, "No playlists yet."),
+        Kind::Album => (&app.albums, app.albums_loading, "No saved albums yet. Open an album and press Save."),
+    };
+    let Some(items) = items else {
+        if loading {
             spinner(ui, theme);
         }
         return action;
     };
-    if list.is_empty() {
-        dim(ui, theme, "No playlists yet.");
+    if items.is_empty() {
+        dim(ui, theme, empty);
         return action;
     }
-    ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, widgets::row_height(theme), list.len(), |ui, range| {
-        for i in range {
-            let p = &list[i];
+    ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, widgets::row_height(theme), items.len(), |ui, range| {
+        for p in &items[range] {
             let resp = playlist_row(ui, &app.images, theme, &p.title, &p.subtitle, p.thumb.as_deref());
             if resp.clicked() {
-                action = Some(Action::OpenPlaylist(i));
+                action = Some(Action::Open(p.clone()));
             }
-            match menus::playlist_menu(&resp, p) {
-                Some(PlaylistChoice::Play) => action = Some(Action::PlayLibraryPlaylist(i)),
-                Some(PlaylistChoice::Delete) => action = Some(Action::AskDelete(i)),
+            match menus::playlist_menu(&resp, p, app.signed_out) {
+                Some(PlaylistChoice::Play) => action = Some(Action::PlayCollection(p.clone())),
+                Some(PlaylistChoice::Delete) => action = Some(Action::AskDelete(p.clone())),
+                Some(PlaylistChoice::Remove) => action = Some(Action::Remove(p.clone())),
                 None => {}
             }
         }
@@ -410,54 +556,163 @@ fn library(app: &mut App, ui: &mut Ui) -> Option<Action> {
     action
 }
 
-fn playlist(app: &mut App, ui: &mut Ui, playing: Option<&str>, list: &mut ListResult) -> Option<Action> {
+fn playlist(app: &mut App, ui: &mut Ui, list: &mut ListResult) -> Option<Action> {
+    let app = &*app;
     let theme = &app.theme;
-    let mut action = None;
-    ui.add_space(4.0);
-    if text_button(ui, theme, "‹ Library").clicked() {
-        action = Some(Action::Go(View::Library));
-    }
+    let mut action = back_button(ui, theme);
     let Some(pl) = &app.playlist else { return action };
-    heading(ui, theme, &pl.meta.title);
+    ui.add_space(6.0);
     ui.horizontal(|ui| {
-        if !pl.tracks.is_empty() && pill(ui, theme, "Play").clicked() {
-            action = Some(Action::PlayPlaylist(0));
-        }
-        ui.add_space(8.0);
-        let count = match pl.tracks.len() {
-            1 => "1 track".to_string(),
-            n => format!("{n} tracks"),
-        };
-        let mut info = if pl.loading { format!("{count}, loading…") } else { count };
-        if pl.editable && !is_special_playlist(&pl.meta.id) {
-            info.push_str(" · drag to reorder");
-        }
-        dim(ui, theme, &info);
+        let (rect, _) = ui.allocate_exact_size(vec2(HEADER_ART, HEADER_ART), egui::Sense::hover());
+        widgets::art(ui, &app.images, rect, pl.header.thumb.as_deref().or(pl.meta.thumb.as_deref()), theme);
+        ui.add_space(10.0);
+        ui.vertical(|ui| {
+            let kind = if pl.meta.kind == Kind::Album { "ALBUM" } else { "PLAYLIST" };
+            ui.label(RichText::new(kind).font(widgets::small(theme)).color(theme.colors.text_dim));
+            ui.add(egui::Label::new(heading_text(theme, &pl.meta.title)).truncate());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if let Some((name, id)) = &pl.header.artist {
+                    let text = RichText::new(name).font(widgets::title_font(theme)).color(theme.colors.text);
+                    let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+                    if let Some(id) = id
+                        && resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
+                    {
+                        action = Some(Action::OpenArtist(id.clone()));
+                    }
+                    if !pl.header.subtitle.is_empty() {
+                        dim(ui, theme, "  •  ");
+                    }
+                }
+                let mut info = pl.header.subtitle.clone();
+                if info.is_empty() {
+                    info = match pl.tracks.len() {
+                        1 => "1 track".into(),
+                        n => format!("{n} tracks"),
+                    };
+                }
+                if pl.loading && !pl.tracks.is_empty() {
+                    info.push_str(", loading…");
+                }
+                ui.add(egui::Label::new(RichText::new(info).color(theme.colors.text_dim)).truncate());
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if !pl.tracks.is_empty() {
+                    if pill(ui, theme, "Play").clicked() {
+                        action = Some(Action::PlayPage(0, false));
+                    }
+                    if ghost_pill(ui, theme, "Shuffle").clicked() {
+                        action = Some(Action::PlayPage(0, true));
+                    }
+                }
+                if let Some((_, saved)) = pl.header.save.as_ref().filter(|_| !app.signed_out) {
+                    let label = if *saved { "Saved" } else { "Save" };
+                    if ghost_pill(ui, theme, label).on_hover_text(if *saved { "Remove from library" } else { "Save to library" }).clicked() {
+                        action = Some(Action::ToggleSaved);
+                    }
+                }
+                if pl.reorderable() {
+                    ui.add_space(6.0);
+                    dim(ui, theme, "Drag to reorder");
+                }
+            });
+        });
     });
-    ui.add_space(10.0);
+    ui.add_space(12.0);
     if pl.loading && pl.tracks.is_empty() {
         spinner(ui, theme);
         return action;
     }
-    let reorder = (pl.editable && !is_special_playlist(&pl.meta.id)).then_some(app.drag);
-    let spec = ListSpec { tracks: &pl.tracks, playing, current: None, playlists: app.library.as_deref(), reorder };
-    *list = track_list(ui, &app.images, theme, spec);
-    list.menu
-        .take()
-        .map(|(i, c)| Action::TrackMenu(Source::Playlist, i, c))
-        .or(list.clicked.filter(|_| app.drag.is_none()).map(Action::PlayPlaylist))
+    let playing = app.now_playing().map(|t| t.video_id.as_str());
+    let entry = |i: usize| Entry::Track(&pl.tracks[i]);
+    let reorder = pl.reorderable().then_some(app.drag);
+    *list = track_list(ui, app, ListSpec { len: pl.tracks.len(), entry: &entry, playing, active: None, reorder });
+    row_action(list, |i| pl.tracks.get(i))
+        .or(list.clicked.filter(|_| app.drag.is_none()).map(|i| Action::PlayPage(i, false)))
         .or(action)
 }
 
-fn queue(app: &mut App, ui: &mut Ui, list: &mut ListResult) -> Option<Action> {
+fn artist(app: &mut App, ui: &mut Ui, list: &mut ListResult) -> Option<Action> {
+    let app = &*app;
     let theme = &app.theme;
-    heading(ui, theme, "Up next");
-    if app.queue.is_empty() {
-        dim(ui, theme, "Nothing queued. Play something from Search or your Library.");
+    let mut action = back_button(ui, theme);
+    let Some(state) = &app.artist else { return action };
+    let Some(a) = &state.artist else {
+        spinner(ui, theme);
+        return action;
+    };
+    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(HEADER_ART, HEADER_ART), egui::Sense::hover());
+            widgets::art(ui, &app.images, rect, a.thumb.as_deref(), theme);
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                ui.add_space(HEADER_ART / 2.0 - theme.font_size * 2.2);
+                ui.label(RichText::new("ARTIST").font(widgets::small(theme)).color(theme.colors.text_dim));
+                ui.add(egui::Label::new(heading_text(theme, &a.name)).truncate());
+                dim(ui, theme, &a.subtitle);
+            });
+        });
+        if !a.songs.is_empty() {
+            section(ui, theme, "Top songs");
+            let playing = app.now_playing().map(|t| t.video_id.as_str());
+            let entry = |i: usize| Entry::Track(&a.songs[i]);
+            let spec = ListSpec { len: a.songs.len(), entry: &entry, playing, active: None, reorder: None };
+            rows(ui, app, &spec, 0..a.songs.len(), list);
+            action = row_action(list, |i| a.songs.get(i)).or(list.clicked.map(Action::PlayArtistSong)).or(action.take());
+        }
+        for (title, items) in [("Albums", &a.albums), ("Singles & EPs", &a.singles)] {
+            if !items.is_empty() {
+                section(ui, theme, title);
+                action = cards(ui, app, items, true).or(action.take());
+            }
+        }
+        ui.add_space(12.0);
+    });
+    action
+}
+
+fn queue(app: &mut App, ui: &mut Ui, list: &mut ListResult) -> Option<Action> {
+    let app = &*app;
+    let theme = &app.theme;
+    heading(ui, theme, "Queue");
+    let q = &app.queue;
+    let Some(current) = &q.current else {
+        dim(ui, theme, "Nothing playing. Play something from Search or your Library.");
         return None;
-    }
-    let playing = app.now_playing().map(|t| t.video_id.as_str());
-    let spec = ListSpec { tracks: &app.queue, playing, current: app.pos, playlists: app.library.as_deref(), reorder: None };
-    *list = track_list(ui, &app.images, theme, spec);
-    list.menu.take().map(|(i, c)| Action::TrackMenu(Source::Queue, i, c)).or(list.clicked.map(Action::PlayQueue))
+    };
+    // Rows: "Now playing", the track, then "Next in queue" + the user's
+    // queue, then "Next from …" + the rest of the album/playlist/radio.
+    let rest = q.context_rest();
+    let manual_start = 2;
+    let context_start = manual_start + if q.manual.is_empty() { 0 } else { q.manual.len() + 1 };
+    let len = context_start + if rest.is_empty() { 0 } else { rest.len() + 1 };
+    let row = |i: usize| -> QueueRow {
+        match i {
+            1 => QueueRow::Current,
+            i if i > manual_start && i < context_start => QueueRow::Manual(i - manual_start - 1),
+            i if i > context_start => QueueRow::Context(i - context_start - 1),
+            _ => QueueRow::Header,
+        }
+    };
+    let context_title = if q.context_name.is_empty() { "Next up".to_string() } else { format!("Next from: {}", q.context_name) };
+    let entry = |i: usize| match row(i) {
+        QueueRow::Current => Entry::Track(current),
+        QueueRow::Manual(m) => Entry::Track(&q.manual[m]),
+        QueueRow::Context(c) => Entry::Track(&rest[c]),
+        QueueRow::Header if i == 0 => Entry::Header("Now playing"),
+        QueueRow::Header if i == manual_start => Entry::Header("Next in queue"),
+        QueueRow::Header => Entry::Header(&context_title),
+    };
+    let track = |i: usize| match row(i) {
+        QueueRow::Current => Some(current),
+        QueueRow::Manual(m) => q.manual.get(m),
+        QueueRow::Context(c) => rest.get(c),
+        QueueRow::Header => None,
+    };
+    let playing = Some(current.video_id.as_str());
+    *list = track_list(ui, app, ListSpec { len, entry: &entry, playing, active: Some(1), reorder: None });
+    row_action(list, track).or(list.clicked.map(|i| Action::PlayQueue(row(i))))
 }

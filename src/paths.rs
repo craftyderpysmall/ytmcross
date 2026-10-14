@@ -39,6 +39,11 @@ pub fn signed_out_marker() -> PathBuf {
     data_dir().join("signed-out")
 }
 
+/// The track playing at exit and its position, restored (paused) at startup.
+pub fn last_played_file() -> PathBuf {
+    data_dir().join("last-played")
+}
+
 /// Throwaway webview profile used only during `--login`; deleted afterwards.
 pub fn login_webview_dir() -> PathBuf {
     data_dir().join("login-webview")

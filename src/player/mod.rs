@@ -10,6 +10,7 @@
 
 pub mod eq;
 mod output;
+mod pitch;
 mod source;
 
 use std::sync::Arc;
@@ -47,7 +48,8 @@ pub enum PlayerEvent {
 }
 
 enum Command {
-    Load(String),
+    /// Stream URL and the position to start at.
+    Load(String, f64),
     Pause(bool),
     Seek(f64),
     Stop,
@@ -64,10 +66,11 @@ impl Player {
     pub fn spawn(
         cfg: &PlayerConfig,
         eq: &EqualizerConfig,
+        pitch: i32,
         agent: ureq::Agent,
         notify: impl Fn(PlayerEvent) + Send + 'static,
     ) -> std::io::Result<Player> {
-        let shared = Shared::new(eq);
+        let shared = Shared::new(eq, pitch);
         shared.set_volume(cfg.volume.min(100) as f32 / 100.0);
         let (tx, rx) = mpsc::channel();
         let engine_shared = shared.clone();
@@ -77,9 +80,9 @@ impl Player {
         Ok(Player { commands: tx, shared })
     }
 
-    /// Plays a direct stream URL (from the resolver).
-    pub fn load(&self, url: &str) {
-        let _ = self.commands.send(Command::Load(url.to_string()));
+    /// Plays a direct stream URL (from the resolver) from `start` seconds.
+    pub fn load(&self, url: &str, start: f64) {
+        let _ = self.commands.send(Command::Load(url.to_string(), start));
     }
 
     pub fn stop(&self) {
@@ -102,6 +105,11 @@ impl Player {
     /// Applied immediately in the audio callback.
     pub fn set_equalizer(&self, eq: &EqualizerConfig) {
         self.shared.eq.set(eq);
+    }
+
+    /// Semitones, applied immediately in the audio callback.
+    pub fn set_pitch(&self, semitones: i32) {
+        self.shared.pitch.store(semitones.clamp(-12, 12), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -164,13 +172,13 @@ impl Engine {
 
     fn handle(&mut self, cmd: Command) {
         match cmd {
-            Command::Load(url) => {
+            Command::Load(url, start) => {
                 trace!("engine: load");
                 self.stop();
                 (self.notify)(PlayerEvent::Loading);
                 self.paused = false;
                 let t = std::time::Instant::now();
-                let opened = self.open(&url, 0.0);
+                let opened = self.open(&url, start);
                 trace!("engine: opened in {:?}", t.elapsed());
                 match opened {
                     Ok(current) => {

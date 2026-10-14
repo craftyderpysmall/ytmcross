@@ -5,6 +5,7 @@
 //! queue keeps advancing. `ui` lays out the frame; the shell (shell.rs) only
 //! calls it while the window is visible and something changed.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -13,9 +14,10 @@ use egui::{CentralPanel, Frame, Margin, Panel, Ui};
 use super::images::Images;
 use super::{bar, views};
 use crate::api::client;
-use crate::api::models::{Playlist, Track};
+use crate::api::models::{Artist, Header, Kind, Playlist, Track};
 use crate::auth;
 use crate::config::{BarPosition, Config, EqualizerConfig};
+use crate::paths;
 use crate::player::{Player, PlayerEvent};
 use crate::stream::{Hint, Resolver};
 use crate::trace;
@@ -30,13 +32,17 @@ const VISIBLE_SETTLE: Duration = Duration::from_millis(300);
 const MAX_VISIBLE: usize = 12;
 /// Queue tracks resolved ahead of the current one.
 const LOOKAHEAD: usize = 3;
+/// Pages remembered for Back.
+const MAX_HISTORY: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
     Search,
     Library,
-    Playlist,
     Queue,
+    /// A playlist or album page.
+    Playlist,
+    Artist,
 }
 
 impl View {
@@ -53,8 +59,9 @@ impl View {
         match self {
             View::Search => "Search",
             View::Library => "Library",
-            View::Playlist => "Playlist",
             View::Queue => "Queue",
+            View::Playlist => "Playlist",
+            View::Artist => "Artist",
         }
     }
 }
@@ -63,6 +70,7 @@ impl View {
 pub struct SearchState {
     pub query: String,
     pub results: Vec<Track>,
+    pub albums: Vec<Playlist>,
     pub loading: bool,
     pub searched: bool,
     pub focus: bool,
@@ -70,17 +78,67 @@ pub struct SearchState {
 
 pub struct PlaylistState {
     pub meta: Playlist,
+    pub header: Header,
     pub tracks: Vec<Track>,
     pub loading: bool,
-    /// The user's own playlist: rows can be dragged to reorder.
-    pub editable: bool,
-    /// Start playing once the first page arrives ("Play" from the library).
+    /// Start playing once the first page arrives ("Play" from a menu).
     autoplay: bool,
+}
+
+impl PlaylistState {
+    /// Rows can be dragged to reorder (the user's own, real playlist).
+    pub fn reorderable(&self) -> bool {
+        self.header.editable && !is_special_playlist(&self.meta.id)
+    }
+}
+
+pub struct ArtistState {
+    pub id: String,
+    /// None while loading.
+    pub artist: Option<Box<Artist>>,
+}
+
+/// A page to return to with Back. Pages keep their content, so going back
+/// costs no request.
+enum Page {
+    View(View),
+    Playlist(Box<PlaylistState>),
+    Artist(ArtistState),
 }
 
 /// Playlists that can't be edited or deleted: Liked Music, Episodes for Later.
 pub fn is_special_playlist(id: &str) -> bool {
     matches!(id, "LM" | "SE")
+}
+
+/// What plays and in which order, like Spotify: the current track, then
+/// the songs the user queued, then the rest of the album/playlist/radio it
+/// was started from.
+#[derive(Default)]
+pub struct Queue {
+    pub current: Option<Track>,
+    /// The current track came from `manual`.
+    from_manual: bool,
+    /// Queued by the user; plays before the rest of the context.
+    pub manual: Vec<Track>,
+    /// The list playback was started from, and where in it we are.
+    pub context: Vec<Track>,
+    pub ctx_pos: Option<usize>,
+    pub context_name: String,
+    /// Playlist/album id of the context, so its later pages join it.
+    context_id: Option<String>,
+}
+
+impl Queue {
+    /// Context tracks still to come.
+    pub fn context_rest(&self) -> &[Track] {
+        let from = self.ctx_pos.map_or(0, |p| p + 1).min(self.context.len());
+        &self.context[from..]
+    }
+
+    fn upcoming(&self) -> impl Iterator<Item = &Track> {
+        self.manual.iter().chain(self.context_rest())
+    }
 }
 
 pub struct Playback {
@@ -115,8 +173,10 @@ pub struct App {
     notifier: Notifier,
     player: Option<Player>,
     resolver: Resolver,
-    /// Track we're waiting on a stream URL for.
-    pending_play: Option<String>,
+    /// Track we're waiting on a stream URL for, and where to start it.
+    pending_play: Option<(String, f64)>,
+    /// The track restored at startup isn't loaded yet: play starts it here.
+    resume_at: Option<f64>,
     /// Row under the mouse, since when, and whether it was prefetched.
     hover: Option<(String, Instant, bool)>,
     /// Row currently pressed (prefetched immediately, before the click lands).
@@ -126,19 +186,27 @@ pub struct App {
     pub images: Images,
 
     pub view: View,
-    /// egui time the current view appeared, for the fade-in.
+    /// egui time the current view appeared, for its entrance animation.
     pub view_since: f64,
+    history: Vec<Page>,
     pub search: SearchState,
+    /// Saved playlists and saved albums (None until loaded).
     pub library: Option<Vec<Playlist>>,
     pub library_loading: bool,
+    pub albums: Option<Vec<Playlist>>,
+    pub albums_loading: bool,
+    /// Which half of the library is shown.
+    pub library_tab: Kind,
     pub playlist: Option<PlaylistState>,
+    pub artist: Option<ArtistState>,
 
-    pub queue: Vec<Track>,
-    pub pos: Option<usize>,
+    pub queue: Queue,
     radio_pending: bool,
     radio_seed: Option<String>,
     advance_on_radio: bool,
     pub playback: Playback,
+    /// Likes changed in this session (they override what responses said).
+    likes: HashMap<String, bool>,
 
     pub notice: Option<(String, Instant)>,
     pub signed_out: bool,
@@ -148,6 +216,8 @@ pub struct App {
     pub themes: Vec<String>,
     /// Live equalizer settings (saved to config.toml on release).
     pub eq: EqualizerConfig,
+    /// Live pitch shift in semitones.
+    pub pitch: i32,
     /// Playlist row being dragged: (from index, current drop index).
     pub drag: Option<(usize, usize)>,
     /// Title being typed for a new playlist.
@@ -169,7 +239,9 @@ impl App {
         let player_notifier = notifier.clone();
         // Shares the agent (and its kept-alive connection to YouTube Music) with the API worker.
         let resolver = Resolver::new(&config.player.ytdlp, notifier.clone(), agent.clone());
-        let player = match Player::spawn(&config.player, &config.equalizer, agent, move |e| player_notifier.send(Response::Player(e))) {
+        let player = match Player::spawn(&config.player, &config.equalizer, config.pitch.semitones, agent, move |e| {
+            player_notifier.send(Response::Player(e))
+        }) {
             Ok(p) => Some(p),
             Err(e) => {
                 notice = Some(format!("Couldn't start the audio engine ({e})."));
@@ -179,20 +251,36 @@ impl App {
 
         let view = config.layout.sidebar_items.iter().find_map(|n| View::from_name(n)).unwrap_or(View::Library);
         if signed_in {
-            let _ = requests.send(Request::Library);
+            let _ = requests.send(Request::Library { albums: false });
         }
         let _ = requests.send(Request::ListThemes);
+
+        // The track playing at the last exit comes back paused where it was.
+        let mut queue = Queue::default();
+        let mut resume_at = None;
+        let mut playback = Playback {
+            loading: false,
+            paused: false,
+            base: 0.0,
+            at: Instant::now(),
+            duration: 0.0,
+            volume: config.player.volume.min(100) as f32 / 100.0,
+        };
+        if let Some((track, at)) = load_last_played() {
+            playback.paused = true;
+            playback.duration = track.duration.as_deref().map_or(0.0, parse_clock);
+            playback.set_position(at);
+            queue.context = vec![track.clone()];
+            queue.ctx_pos = Some(0);
+            queue.current = Some(track);
+            resume_at = Some(at);
+        }
+
         App {
             font_file: loaded.theme.font_file.clone(),
             eq: config.equalizer.clone(),
-            playback: Playback {
-                loading: false,
-                paused: false,
-                base: 0.0,
-                at: Instant::now(),
-                duration: 0.0,
-                volume: config.player.volume.min(100) as f32 / 100.0,
-            },
+            pitch: config.pitch.semitones,
+            playback,
             config,
             theme: loaded.theme,
             requests,
@@ -201,21 +289,27 @@ impl App {
             player,
             resolver,
             pending_play: None,
+            resume_at,
             hover: None,
             pressed: None,
             visible: (Vec::new(), Instant::now(), true),
             images,
             view,
             view_since: 0.0,
+            history: Vec::new(),
             search: SearchState { focus: view == View::Search, ..Default::default() },
             library: None,
             library_loading: signed_in,
+            albums: None,
+            albums_loading: false,
+            library_tab: Kind::Playlist,
             playlist: None,
-            queue: Vec::new(),
-            pos: None,
+            artist: None,
+            queue,
             radio_pending: false,
             radio_seed: None,
             advance_on_radio: false,
+            likes: HashMap::new(),
             notice: notice.map(|n| (n, Instant::now())),
             signed_out: !signed_in,
             signing_in: false,
@@ -226,9 +320,20 @@ impl App {
         }
     }
 
+    /// Called once when the window closes: remembers what was playing.
+    pub fn on_exit(&self) {
+        save_last_played(self.queue.current.as_ref(), self.playback.position());
+    }
+
     // ---- navigation -------------------------------------------------------
 
+    /// Sidebar navigation: starts a fresh history.
     pub fn go(&mut self, ctx: &egui::Context, view: View) {
+        self.history.clear();
+        self.set_view(ctx, view);
+    }
+
+    fn set_view(&mut self, ctx: &egui::Context, view: View) {
         if self.view != view {
             self.view = view;
             self.view_since = ctx.input(|i| i.time);
@@ -236,21 +341,119 @@ impl App {
         if view == View::Search {
             self.search.focus = true;
         }
-        if view == View::Library && self.library.is_none() && !self.library_loading && !self.signed_out {
-            self.refresh_library();
+        if view == View::Library {
+            self.ensure_library();
         }
     }
 
-    fn refresh_library(&mut self) {
-        self.library_loading = true;
-        let _ = self.requests.send(Request::Library);
+    /// Fetches the shown half of the library if it isn't loaded.
+    pub fn ensure_library(&mut self) {
+        if self.signed_out {
+            return;
+        }
+        match self.library_tab {
+            Kind::Playlist if self.library.is_none() && !self.library_loading => self.refresh_library(false),
+            Kind::Album if self.albums.is_none() && !self.albums_loading => self.refresh_library(true),
+            _ => {}
+        }
+    }
+
+    fn refresh_library(&mut self, albums: bool) {
+        if albums {
+            self.albums_loading = true;
+        } else {
+            self.library_loading = true;
+        }
+        let _ = self.requests.send(Request::Library { albums });
+    }
+
+    /// Moves the current page onto the Back history.
+    fn push_history(&mut self) {
+        let page = match self.view {
+            View::Playlist => self.playlist.take().map(|p| Page::Playlist(Box::new(p))),
+            View::Artist => self.artist.take().map(Page::Artist),
+            view => Some(Page::View(view)),
+        };
+        if let Some(page) = page {
+            if self.history.len() == MAX_HISTORY {
+                self.history.remove(0);
+            }
+            self.history.push(page);
+        }
+    }
+
+    pub fn back(&mut self, ctx: &egui::Context) {
+        match self.history.pop() {
+            Some(Page::Playlist(pl)) => {
+                let mut pl = *pl;
+                // Left before it finished loading: its remaining pages were dropped.
+                if pl.loading {
+                    pl.tracks.clear();
+                    let _ = self.requests.send(Request::Playlist(pl.meta.clone()));
+                }
+                self.playlist = Some(pl);
+                self.drag = None;
+                self.set_view(ctx, View::Playlist);
+            }
+            Some(Page::Artist(a)) => {
+                if a.artist.is_none() {
+                    let _ = self.requests.send(Request::Artist(a.id.clone()));
+                }
+                self.artist = Some(a);
+                self.set_view(ctx, View::Artist);
+            }
+            Some(Page::View(view)) => self.set_view(ctx, view),
+            None => self.set_view(ctx, View::Library),
+        }
+    }
+
+    /// The sidebar entry a page belongs to: the view it was opened from.
+    pub fn section(&self) -> View {
+        match (self.view, self.history.first()) {
+            (View::Playlist | View::Artist, Some(Page::View(root))) => *root,
+            (View::Playlist | View::Artist, _) => View::Library,
+            (view, _) => view,
+        }
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        !self.history.is_empty()
     }
 
     pub fn open_playlist(&mut self, ctx: &egui::Context, meta: Playlist, autoplay: bool) {
-        let _ = self.requests.send(Request::Playlist(meta.id.clone()));
-        self.playlist = Some(PlaylistState { meta, tracks: Vec::new(), loading: true, editable: false, autoplay });
+        if self.view == View::Playlist && self.playlist.as_ref().is_some_and(|p| p.meta.id == meta.id) {
+            return;
+        }
+        let _ = self.requests.send(Request::Playlist(meta.clone()));
+        self.push_history();
+        self.playlist = Some(PlaylistState { meta, header: Header::default(), tracks: Vec::new(), loading: true, autoplay });
         self.drag = None;
-        self.go(ctx, View::Playlist);
+        self.set_view(ctx, View::Playlist);
+    }
+
+    /// The album a track is from, if known.
+    pub fn open_album(&mut self, ctx: &egui::Context, track: &Track) {
+        let Some(id) = track.album_id.clone() else { return };
+        let meta = Playlist {
+            id,
+            kind: Kind::Album,
+            title: track.album.clone().unwrap_or_default(),
+            subtitle: track.artists.clone(),
+            thumb: track.thumb.clone(),
+            owned: false,
+            save_id: None,
+        };
+        self.open_playlist(ctx, meta, false);
+    }
+
+    pub fn open_artist(&mut self, ctx: &egui::Context, id: &str) {
+        if self.view == View::Artist && self.artist.as_ref().is_some_and(|a| a.id == id) {
+            return;
+        }
+        let _ = self.requests.send(Request::Artist(id.to_string()));
+        self.push_history();
+        self.artist = Some(ArtistState { id: id.to_string(), artist: None });
+        self.set_view(ctx, View::Artist);
     }
 
     fn reload_open_playlist(&mut self) {
@@ -258,7 +461,7 @@ impl App {
             pl.tracks.clear();
             pl.loading = true;
             self.drag = None;
-            let _ = self.requests.send(Request::Playlist(pl.meta.id.clone()));
+            let _ = self.requests.send(Request::Playlist(pl.meta.clone()));
         }
     }
 
@@ -288,6 +491,17 @@ impl App {
         self.eq = eq;
     }
 
+    /// Same as the equalizer: heard at once, saved on release.
+    pub fn set_pitch(&mut self, semitones: i32, save: bool) {
+        if let Some(player) = &self.player {
+            player.set_pitch(semitones);
+        }
+        if save {
+            let _ = self.requests.send(Request::SavePitch(semitones));
+        }
+        self.pitch = semitones;
+    }
+
     // ---- library edits ----------------------------------------------------
 
     pub fn create_playlist(&mut self, title: &str) {
@@ -298,16 +512,52 @@ impl App {
         self.new_playlist = None;
     }
 
-    pub fn delete_playlist(&mut self, playlist: Playlist) {
-        // Optimistic: it disappears now; a failure brings the library back.
-        if let Some(list) = &mut self.library {
-            list.retain(|p| p.id != playlist.id);
+    /// Adds or removes a playlist/album in the loaded library lists.
+    fn library_set(&mut self, list: &Playlist, saved: bool) {
+        let target = match list.kind {
+            Kind::Album => &mut self.albums,
+            Kind::Playlist => &mut self.library,
+        };
+        let Some(items) = target else { return };
+        if saved {
+            if !items.iter().any(|p| p.id == list.id) {
+                // Newest first, after Liked Music like on YouTube Music.
+                let at = items.iter().take_while(|p| is_special_playlist(&p.id)).count();
+                items.insert(at, list.clone());
+            }
+        } else {
+            items.retain(|p| p.id != list.id);
         }
+    }
+
+    /// Optimistic: it disappears now; a failure brings the library back.
+    pub fn delete_playlist(&mut self, playlist: Playlist) {
+        self.library_set(&playlist, false);
         if self.playlist.as_ref().is_some_and(|p| p.meta.id == playlist.id) {
             self.playlist = None;
+            self.history.clear();
             self.view = View::Library;
         }
-        let _ = self.requests.send(Request::DeletePlaylist { id: playlist.id, title: playlist.title });
+        let _ = self.requests.send(Request::DeletePlaylist(playlist));
+    }
+
+    /// Saves (or removes) a playlist or album someone else made.
+    pub fn set_saved(&mut self, list: Playlist, save_id: String, save: bool) {
+        self.library_set(&list, save);
+        if let Some(pl) = self.playlist.as_mut().filter(|p| p.meta.id == list.id) {
+            pl.header.save = Some((save_id.clone(), save));
+        }
+        let _ = self.requests.send(Request::Save { list, save_id, save });
+    }
+
+    /// The Save/Remove button on the open page.
+    pub fn toggle_saved(&mut self) {
+        let Some(pl) = &self.playlist else { return };
+        if let Some((save_id, saved)) = pl.header.save.clone() {
+            let mut list = pl.meta.clone();
+            list.save_id = Some(save_id.clone());
+            self.set_saved(list, save_id, !saved);
+        }
     }
 
     pub fn add_to_playlist(&self, playlist: &Playlist, track: &Track) {
@@ -336,32 +586,30 @@ impl App {
         let _ = self.requests.send(Request::MoveInPlaylist { id: pl.meta.id.clone(), set_video_id, before });
     }
 
-    // ---- queue ------------------------------------------------------------
+    // ---- likes ------------------------------------------------------------
 
-    pub fn add_to_queue(&mut self, track: Track) {
-        let idle = self.pos.is_none();
-        self.queue.push(track);
-        if idle {
-            self.start(self.queue.len() - 1);
-        } else {
-            self.prefetch_ahead();
-        }
+    pub fn is_liked(&self, track: &Track) -> bool {
+        self.likes.get(&track.video_id).copied().or(track.liked).unwrap_or(false)
     }
 
-    pub fn play_next(&mut self, track: Track) {
-        match self.pos {
-            Some(pos) => {
-                self.queue.insert(pos + 1, track);
-                self.prefetch_ahead();
-            }
-            None => self.add_to_queue(track),
-        }
+    pub fn can_like(&self) -> bool {
+        !self.signed_out
     }
+
+    /// Optimistic: flips at once; a failure flips it back.
+    pub fn toggle_like(&mut self, track: &Track) {
+        let like = !self.is_liked(track);
+        self.likes.insert(track.video_id.clone(), like);
+        let _ = self.requests.send(Request::Like { video_id: track.video_id.clone(), like });
+    }
+
+    // ---- misc -------------------------------------------------------------
 
     pub fn submit_search(&mut self) {
         let q = self.search.query.trim().to_string();
         if !q.is_empty() {
             self.search.loading = true;
+            self.search.albums.clear();
             let _ = self.requests.send(Request::Search(q));
         }
     }
@@ -383,69 +631,123 @@ impl App {
         self.notice = Some((msg.into(), Instant::now()));
     }
 
-    // ---- playback ---------------------------------------------------------
+    // ---- queue and playback ----------------------------------------------
 
     pub fn now_playing(&self) -> Option<&Track> {
-        self.pos.and_then(|i| self.queue.get(i))
+        self.queue.current.as_ref()
     }
 
-    /// Replaces the queue with `list` and starts at `index`. `radio` fills the
-    /// queue with related tracks (used when playing a single search result).
-    pub fn play_list(&mut self, list: Vec<Track>, index: usize, radio: bool) {
-        if index >= list.len() {
-            return;
-        }
-        self.queue = list;
+    /// Plays `list` from `index`, making it the context (the user's queue is
+    /// kept and still plays first). `radio` continues with related tracks.
+    pub fn play_list(&mut self, list: Vec<Track>, index: usize, radio: bool, name: String, id: Option<String>) {
+        let Some(track) = list.get(index).cloned() else { return };
+        let q = &mut self.queue;
+        q.context = list;
+        q.ctx_pos = Some(index);
+        q.context_name = name;
+        q.context_id = id;
         self.radio_pending = false;
         self.radio_seed = None;
         self.advance_on_radio = false;
-        self.start(index);
+        self.play_track(track, false);
         if radio {
             self.request_radio(false);
         }
     }
 
-    pub fn play_queue_index(&mut self, index: usize) {
-        if index < self.queue.len() {
-            self.start(index);
+    /// Plays a playlist/album page, from `index` or shuffled.
+    pub fn play_page(&mut self, index: usize, shuffle: bool) {
+        let Some(pl) = &self.playlist else { return };
+        let mut tracks = pl.tracks.clone();
+        let (name, id) = (pl.meta.title.clone(), pl.meta.id.clone());
+        if shuffle {
+            shuffle_tracks(&mut tracks);
+            self.play_list(tracks, 0, false, name, None);
+        } else {
+            // Unshuffled, pages still loading join the queue as they arrive.
+            self.play_list(tracks, index, false, name, Some(id));
         }
     }
 
-    fn start(&mut self, index: usize) {
-        self.pos = Some(index);
+    pub fn add_to_queue(&mut self, track: Track) {
+        self.queue.manual.push(track);
+        self.after_queue_edit();
+    }
+
+    pub fn play_next(&mut self, track: Track) {
+        self.queue.manual.insert(0, track);
+        self.after_queue_edit();
+    }
+
+    fn after_queue_edit(&mut self) {
+        if self.queue.current.is_none() {
+            self.next();
+        } else {
+            self.prefetch_ahead();
+        }
+    }
+
+    /// Plays the `i`th track of the user's queue, skipping the ones before it.
+    pub fn skip_to_manual(&mut self, i: usize) {
+        if i < self.queue.manual.len() {
+            self.queue.manual.drain(..i);
+            let track = self.queue.manual.remove(0);
+            self.play_track(track, true);
+        }
+    }
+
+    /// Plays the `i`th upcoming context track (the user's queue stays).
+    pub fn skip_to_context(&mut self, i: usize) {
+        let pos = self.queue.ctx_pos.map_or(0, |p| p + 1) + i;
+        if let Some(track) = self.queue.context.get(pos).cloned() {
+            self.queue.ctx_pos = Some(pos);
+            self.play_track(track, false);
+        }
+    }
+
+    fn play_track(&mut self, track: Track, from_manual: bool) {
+        self.queue.current = Some(track);
+        self.queue.from_manual = from_manual;
+        self.start(0.0);
+    }
+
+    /// Starts the current track at `at` seconds.
+    fn start(&mut self, at: f64) {
+        let Some(track) = &self.queue.current else { return };
+        self.resume_at = None;
+        let duration = track.duration.as_deref().map_or(0.0, parse_clock);
+        let id = track.video_id.clone();
         let Some(player) = &self.player else {
             self.notify("Playback unavailable: the audio engine isn't running.");
             return;
         };
-        let id = self.queue[index].video_id.clone();
         let ready = self.resolver.ready(&id);
         trace!("app: play {id} ({})", if ready.is_some() { "url ready" } else { "resolving" });
         match ready {
             Some(url) => {
                 self.resolver.playing(&url);
-                player.load(&url);
+                player.load(&url, at);
                 player.set_paused(false);
                 self.pending_play = None;
             }
             None => {
                 // Silence the previous track while the new one resolves.
                 player.stop();
-                self.pending_play = Some(id.clone());
+                self.pending_play = Some((id.clone(), at));
                 self.resolver.want(&id);
             }
         }
         self.playback.loading = true;
         self.playback.paused = false;
-        self.playback.duration = 0.0;
-        self.playback.set_position(0.0);
+        self.playback.duration = duration;
+        self.playback.set_position(at);
         self.prefetch_ahead();
     }
 
-    /// Gets the next queue tracks ready: the very next one fully (stream
-    /// resolved and its start preloaded), the ones after resolved.
+    /// Gets the next tracks ready: the very next one fully (stream resolved
+    /// and its start preloaded), the ones after resolved.
     fn prefetch_ahead(&self) {
-        let Some(pos) = self.pos else { return };
-        for (i, t) in self.queue.iter().skip(pos + 1).take(LOOKAHEAD).enumerate() {
+        for (i, t) in self.queue.upcoming().take(LOOKAHEAD).enumerate() {
             self.resolver.hint(&t.video_id, if i == 0 { Hint::Likely } else { Hint::Visible });
         }
     }
@@ -496,33 +798,79 @@ impl App {
     }
 
     fn request_radio(&mut self, autoplay: bool) {
-        if let Some(seed) = self.queue.last() {
+        let seed = self.queue.context.last().or(self.queue.current.as_ref());
+        if let Some(seed) = seed.map(|t| t.video_id.clone()) {
             self.radio_pending = true;
-            self.radio_seed = Some(seed.video_id.clone());
-            let _ = self.requests.send(Request::Radio { video_id: seed.video_id.clone(), autoplay });
+            self.radio_seed = Some(seed.clone());
+            let _ = self.requests.send(Request::Radio { video_id: seed, autoplay });
         }
     }
 
     pub fn next(&mut self) {
-        match self.pos {
-            Some(i) if i + 1 < self.queue.len() => self.start(i + 1),
-            // A prefetch is already on its way: play its first track when it lands.
-            Some(_) if self.radio_pending => self.advance_on_radio = true,
-            Some(_) => self.request_radio(true),
-            None => {}
+        if !self.queue.manual.is_empty() {
+            let track = self.queue.manual.remove(0);
+            self.play_track(track, true);
+            return;
+        }
+        let next = self.queue.ctx_pos.map_or(0, |p| p + 1);
+        if let Some(track) = self.queue.context.get(next).cloned() {
+            self.queue.ctx_pos = Some(next);
+            self.play_track(track, false);
+        } else if self.queue.current.is_some() {
+            if self.radio_pending {
+                // A prefetch is already on its way: play its first track when it lands.
+                self.advance_on_radio = true;
+            } else {
+                self.request_radio(true);
+            }
         }
     }
 
     pub fn prev(&mut self) {
-        match self.pos {
-            Some(i) if self.playback.position() < 3.0 && i > 0 => self.start(i - 1),
-            Some(_) => self.seek(0.0),
-            None => {}
+        if self.queue.current.is_none() {
+            return;
+        }
+        if self.playback.position() >= 3.0 {
+            self.seek(0.0);
+            return;
+        }
+        let q = &mut self.queue;
+        if q.from_manual {
+            // Back to the context track it interrupted; it plays again next.
+            if let Some(track) = q.ctx_pos.and_then(|p| q.context.get(p)).cloned() {
+                let current = q.current.take().expect("checked above");
+                q.manual.insert(0, current);
+                self.play_track(track, false);
+                return;
+            }
+        } else if let Some(p) = q.ctx_pos.filter(|&p| p > 0) {
+            q.ctx_pos = Some(p - 1);
+            let track = q.context[p - 1].clone();
+            self.play_track(track, false);
+            return;
+        }
+        self.seek(0.0);
+    }
+
+    /// The pointer is on the play button: get a restored track's stream ready.
+    /// (Not done at startup, where it would cost memory for nothing if the
+    /// user never presses play.)
+    pub fn warm_resume(&mut self) {
+        if let (Some(_), Some(t)) = (self.resume_at, &self.queue.current) {
+            self.resolver.hint(&t.video_id, Hint::Likely);
         }
     }
 
     pub fn toggle_pause(&mut self) {
-        let (Some(player), Some(_)) = (&self.player, self.pos) else { return };
+        if self.queue.current.is_none() {
+            return;
+        }
+        // Restored at startup and not loaded yet: start where it was left.
+        if let Some(at) = self.resume_at {
+            self.start(at);
+            return;
+        }
+        let Some(player) = &self.player else { return };
         // Optimistic: flip immediately so the button reacts on click.
         let pos = self.playback.position();
         self.playback.paused = !self.playback.paused;
@@ -531,6 +879,11 @@ impl App {
     }
 
     pub fn seek(&mut self, seconds: f64) {
+        if self.resume_at.is_some() {
+            self.resume_at = Some(seconds);
+            self.playback.set_position(seconds);
+            return;
+        }
         if let Some(player) = &self.player {
             player.seek(seconds);
             self.playback.set_position(seconds);
@@ -564,30 +917,50 @@ impl App {
                     }
                 }
             }
-            Response::Library(result) => {
-                self.library_loading = false;
+            Response::SearchAlbums { query, albums } => {
+                if query == self.search.query.trim() {
+                    self.search.albums = albums;
+                }
+            }
+            Response::Library { albums, result } => {
+                let (list, loading) =
+                    if albums { (&mut self.albums, &mut self.albums_loading) } else { (&mut self.library, &mut self.library_loading) };
+                *loading = false;
                 match result {
-                    Ok(list) => self.library = Some(list),
+                    Ok(items) => *list = Some(items),
                     Err(e) => self.notify(format!("Couldn't load library: {e}")),
                 }
             }
-            Response::PlaylistPage { id, tracks, done, editable } => {
-                if let Some(pl) = self.playlist.as_mut().filter(|p| p.meta.id == id) {
-                    pl.tracks.extend(tracks);
-                    pl.loading = !done;
-                    if let Some(editable) = editable {
-                        pl.editable = editable;
+            Response::PlaylistPage { id, tracks, done, header } => {
+                // An unshuffled play of this page: later pages join the queue.
+                if !tracks.is_empty() && self.queue.context_id.as_deref() == Some(id.as_str()) {
+                    self.queue.context.extend(tracks.iter().cloned());
+                    self.prefetch_ahead();
+                }
+                let Some(pl) = self.playlist.as_mut().filter(|p| p.meta.id == id) else { return };
+                pl.tracks.extend(tracks);
+                pl.loading = !done;
+                if let Some(h) = header {
+                    pl.header = *h;
+                    if pl.meta.thumb.is_none() {
+                        pl.meta.thumb = pl.header.thumb.clone();
                     }
-                    if !pl.tracks.is_empty() && std::mem::take(&mut pl.autoplay) {
-                        let tracks = pl.tracks.clone();
-                        self.play_list(tracks, 0, false);
-                    }
+                }
+                if !pl.tracks.is_empty() && std::mem::take(&mut pl.autoplay) {
+                    self.play_page(0, false);
                 }
             }
             Response::PlaylistFailed { id, error } => {
                 if let Some(pl) = self.playlist.as_mut().filter(|p| p.meta.id == id) {
                     pl.loading = false;
-                    self.notify(format!("Couldn't load playlist: {error}"));
+                    self.notify(format!("Couldn't load: {error}"));
+                }
+            }
+            Response::Artist { id, result } => {
+                let Some(state) = self.artist.as_mut().filter(|a| a.id == id) else { return };
+                match result {
+                    Ok(artist) => state.artist = Some(artist),
+                    Err(e) => self.notify(format!("Couldn't load artist: {e}")),
                 }
             }
             Response::Radio { seed, tracks, autoplay } => {
@@ -597,15 +970,19 @@ impl App {
                 }
                 self.radio_seed = None;
                 self.radio_pending = false;
-                let before = self.queue.len();
+                let q = &mut self.queue;
+                let before = q.context.len();
                 for t in tracks {
-                    if !self.queue.iter().any(|q| q.video_id == t.video_id) {
-                        self.queue.push(t);
+                    if !q.context.iter().any(|c| c.video_id == t.video_id) {
+                        q.context.push(t);
                     }
                 }
+                if q.context_name.is_empty() || before <= 1 {
+                    q.context_name = "Radio".into();
+                }
                 let advance = autoplay || std::mem::take(&mut self.advance_on_radio);
-                if advance && self.queue.len() > before {
-                    self.start(before);
+                if advance && self.queue.context.len() > before {
+                    self.next();
                 } else {
                     self.prefetch_ahead();
                 }
@@ -620,6 +997,9 @@ impl App {
                 if config.equalizer != self.config.equalizer {
                     self.set_equalizer(config.equalizer.clone(), false);
                 }
+                if config.pitch != self.config.pitch {
+                    self.set_pitch(config.pitch.semitones, false);
+                }
                 self.config = *config;
                 self.list_themes();
                 match config_error.or(loaded.error) {
@@ -631,11 +1011,15 @@ impl App {
             Response::SignedOut => {
                 self.signed_out = true;
                 self.library = None;
+                self.albums = None;
                 self.library_loading = false;
+                self.albums_loading = false;
+                self.likes.clear();
                 if self.view == View::Playlist {
                     self.view = View::Library;
                 }
                 self.playlist = None;
+                self.history.clear();
                 self.resolver.reset();
                 self.notify("Signed out");
             }
@@ -647,7 +1031,8 @@ impl App {
                     // Streams resolved for the previous account (or none) are stale.
                     self.resolver.reset();
                     self.library = None;
-                    self.refresh_library();
+                    self.albums = None;
+                    self.ensure_library();
                     self.notify("Signed in");
                 } else {
                     self.notify("Sign-in was cancelled");
@@ -657,7 +1042,9 @@ impl App {
             Response::Edited { message, refresh_library, refresh_playlist } => {
                 self.notify(message);
                 if refresh_library {
-                    self.refresh_library();
+                    self.library = None;
+                    self.albums = None;
+                    self.ensure_library();
                 }
                 if refresh_playlist.is_some() && self.playlist.as_ref().map(|p| &p.meta.id) == refresh_playlist.as_ref() {
                     self.reload_open_playlist();
@@ -665,21 +1052,20 @@ impl App {
             }
             Response::Created(playlist) => {
                 self.notify(format!("Created \u{201c}{}\u{201d}", playlist.title));
-                if let Some(list) = &mut self.library {
-                    // Newest first, after Liked Music like on YouTube Music.
-                    let at = list.iter().take_while(|p| is_special_playlist(&p.id)).count();
-                    list.insert(at, playlist);
-                }
+                self.library_set(&playlist, true);
+            }
+            Response::LikeFailed { video_id, liked, error } => {
+                self.likes.insert(video_id, liked);
+                self.notify(format!("Couldn't update likes: {error}"));
             }
             Response::Player(event) => self.handle_player(event),
             Response::Resolved { video_id, result } => {
-                if self.pending_play.as_deref() != Some(video_id.as_str()) {
+                let Some((_, at)) = self.pending_play.take_if(|(id, _)| *id == video_id) else {
                     return; // a background prefetch; it's cached in the resolver
-                }
-                self.pending_play = None;
+                };
                 match (result, &self.player) {
                     (Ok(url), Some(player)) => {
-                        player.load(&url);
+                        player.load(&url, at);
                         player.set_paused(false);
                     }
                     (Ok(_), None) => {}
@@ -695,10 +1081,7 @@ impl App {
     fn handle_player(&mut self, event: PlayerEvent) {
         let pb = &mut self.playback;
         match event {
-            PlayerEvent::Loading => {
-                pb.loading = true;
-                pb.set_position(0.0);
-            }
+            PlayerEvent::Loading => pb.loading = true,
             PlayerEvent::Position(t) => {
                 if pb.loading {
                     trace!("app: audio playing");
@@ -722,7 +1105,7 @@ impl App {
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
         let typing = ctx.egui_wants_keyboard_input();
-        let (reload, space, find, nav) = ctx.input(|i| {
+        let (reload, space, find, nav, back) = ctx.input(|i| {
             let nav = [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3]
                 .iter()
                 .position(|k| i.modifiers.command && i.key_pressed(*k));
@@ -731,6 +1114,8 @@ impl App {
                 !typing && i.key_pressed(egui::Key::Space),
                 i.modifiers.command && i.key_pressed(egui::Key::F),
                 nav,
+                i.pointer.button_pressed(egui::PointerButton::Extra1)
+                    || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)),
             )
         });
         if reload {
@@ -741,6 +1126,9 @@ impl App {
         }
         if find {
             self.go(ctx, View::Search);
+        }
+        if back && self.can_go_back() {
+            self.back(ctx);
         }
         if let Some(view) = nav.and_then(|n| self.config.layout.sidebar_items.get(n)).and_then(|n| View::from_name(n)) {
             self.go(ctx, view);
@@ -799,9 +1187,108 @@ impl App {
             }
         }
         // Tick the clock once per displayed second while playing.
-        if self.pos.is_some() && !self.playback.paused && !self.playback.loading {
+        if self.queue.current.is_some() && !self.playback.paused && !self.playback.loading {
             let frac = self.playback.position().fract();
             ctx.request_repaint_after(Duration::from_secs_f64((1.0 - frac).max(0.05)));
         }
+    }
+}
+
+/// "3:45" / "1:02:03" -> seconds.
+fn parse_clock(s: &str) -> f64 {
+    s.split(':').try_fold(0.0, |acc, part| part.trim().parse::<f64>().map(|v| acc * 60.0 + v)).unwrap_or(0.0)
+}
+
+/// Fisher–Yates with a time-seeded xorshift (no RNG crate needed).
+fn shuffle_tracks(tracks: &mut [Track]) {
+    let mut s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64) | 1;
+    for i in (1..tracks.len()).rev() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        tracks.swap(i, (s % (i as u64 + 1)) as usize);
+    }
+}
+
+// The last-played file: one field per line, position last. Plain text keeps
+// it readable and needs no serializer.
+const LAST_FIELDS: usize = 10;
+
+fn save_last_played(track: Option<&Track>, position: f64) {
+    let path = paths::last_played_file();
+    let Some(t) = track else {
+        let _ = std::fs::remove_file(path);
+        return;
+    };
+    let opt = |o: &Option<String>| o.clone().unwrap_or_default();
+    let fields = [
+        t.video_id.clone(),
+        t.title.clone(),
+        t.artists.clone(),
+        opt(&t.album),
+        opt(&t.duration),
+        opt(&t.thumb),
+        opt(&t.artist_id),
+        opt(&t.album_id),
+        t.liked.map_or(String::new(), |l| l.to_string()),
+        format!("{position:.1}"),
+    ];
+    let text: Vec<String> = fields.iter().map(|f| f.replace('\n', " ")).collect();
+    let _ = std::fs::write(path, text.join("\n"));
+}
+
+fn load_last_played() -> Option<(Track, f64)> {
+    let text = std::fs::read_to_string(paths::last_played_file()).ok()?;
+    let f: Vec<&str> = text.split('\n').collect();
+    if f.len() != LAST_FIELDS || f[0].is_empty() {
+        return None;
+    }
+    let opt = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    let track = Track {
+        video_id: f[0].to_string(),
+        title: f[1].to_string(),
+        artists: f[2].to_string(),
+        album: opt(f[3]),
+        duration: opt(f[4]),
+        thumb: opt(f[5]),
+        set_video_id: None,
+        artist_id: opt(f[6]),
+        album_id: opt(f[7]),
+        liked: f[8].parse().ok(),
+    };
+    Some((track, f[9].parse().unwrap_or(0.0)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clock_strings_parse() {
+        assert_eq!(parse_clock("3:45"), 225.0);
+        assert_eq!(parse_clock("1:02:03"), 3723.0);
+        assert_eq!(parse_clock("live"), 0.0);
+    }
+
+    #[test]
+    fn shuffle_keeps_every_track() {
+        let mut tracks: Vec<Track> = (0..50)
+            .map(|i| Track {
+                video_id: i.to_string(),
+                title: String::new(),
+                artists: String::new(),
+                album: None,
+                duration: None,
+                thumb: None,
+                set_video_id: None,
+                artist_id: None,
+                album_id: None,
+                liked: None,
+            })
+            .collect();
+        shuffle_tracks(&mut tracks);
+        let mut ids: Vec<usize> = tracks.iter().map(|t| t.video_id.parse().unwrap()).collect();
+        ids.sort();
+        assert_eq!(ids, (0..50).collect::<Vec<_>>());
     }
 }

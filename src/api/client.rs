@@ -4,14 +4,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use super::models::{Continuation, Playlist, Track};
+use super::models::{Artist, Continuation, Header, Kind, Playlist, Track};
 use super::parse;
 use crate::auth::session::{ORIGIN, Session};
 
 pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 
-/// "Songs" filter for search (same value the website sends).
+/// Search filters (same values the website sends).
 const SONGS_FILTER: &str = "EgWKAQIIAWoMEA4QChADEAQQCRAF";
+const ALBUMS_FILTER: &str = "EgWKAQIYAWoMEA4QChADEAQQCRAF";
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -34,7 +35,7 @@ pub struct PlaylistPage {
     pub tracks: Vec<Track>,
     pub next: Option<Continuation>,
     /// Set on the first page only.
-    pub editable: Option<bool>,
+    pub header: Option<Header>,
 }
 
 pub struct Client {
@@ -84,22 +85,65 @@ impl Client {
         Ok(parse::tracks(&resp))
     }
 
-    pub fn library(&self) -> Result<Vec<Playlist>> {
-        let resp = self.post("browse", json!({"browseId": "FEmusic_liked_playlists"}), "")?;
-        Ok(parse::playlists(&resp))
+    pub fn search_albums(&self, query: &str) -> Result<Vec<Playlist>> {
+        let resp = self.post("search", json!({"query": query, "params": ALBUMS_FILTER}), "")?;
+        let mut albums = parse::playlists(&resp);
+        albums.retain(|a| a.kind == Kind::Album);
+        Ok(albums)
     }
 
-    /// One page of a playlist. Pass the returned continuation to get the
-    /// next. The first page also says whether the playlist is editable.
-    pub fn playlist_page(&self, id: &str, cont: Option<&Continuation>) -> Result<PlaylistPage> {
+    /// Saved playlists (`albums` false) or saved albums.
+    pub fn library(&self, albums: bool) -> Result<Vec<Playlist>> {
+        let id = if albums { "FEmusic_liked_albums" } else { "FEmusic_liked_playlists" };
+        Ok(parse::playlists(&self.post("browse", json!({"browseId": id}), "")?))
+    }
+
+    pub fn artist(&self, id: &str) -> Result<Artist> {
+        Ok(parse::artist(&self.post("browse", json!({"browseId": id}), "")?))
+    }
+
+    /// One page of a playlist or album. Pass the returned continuation to
+    /// get the next. The first page also carries the header.
+    pub fn playlist_page(&self, list: &Playlist, cont: Option<&Continuation>) -> Result<PlaylistPage> {
         let resp = match cont {
-            None => self.post("browse", json!({"browseId": format!("VL{id}")}), "")?,
+            None => self.post("browse", json!({"browseId": list.browse_id()}), "")?,
             Some(Continuation::Command(t)) => self.post("browse", json!({"continuation": t}), "")?,
             Some(Continuation::Next(t)) => self.post("browse", json!({}), &format!("&ctoken={t}&continuation={t}&type=next"))?,
         };
-        let editable = cont.is_none().then(|| parse::playlist_editable(&resp));
+        let header = cont.is_none().then(|| parse::header(&resp));
         let scope = parse::playlist_scope(&resp);
-        Ok(PlaylistPage { tracks: parse::tracks(scope), next: parse::continuation(scope), editable })
+        let mut tracks = parse::tracks(scope);
+        // Album rows leave out what the header already says.
+        if list.kind == Kind::Album
+            && let Some(h) = &header
+        {
+            for t in &mut tracks {
+                if t.artists.is_empty()
+                    && let Some((name, id)) = &h.artist
+                {
+                    t.artists = name.clone();
+                    t.artist_id = id.clone();
+                }
+                t.album.get_or_insert_with(|| list.title.clone());
+                t.album_id.get_or_insert_with(|| list.id.clone());
+                if t.thumb.is_none() {
+                    t.thumb = h.thumb.clone().or_else(|| list.thumb.clone());
+                }
+            }
+        }
+        Ok(PlaylistPage { tracks, next: parse::continuation(scope), header })
+    }
+
+    /// Adds a song to Liked Music, or takes it out.
+    pub fn like(&self, video_id: &str, like: bool) -> Result<()> {
+        let endpoint = if like { "like/like" } else { "like/removelike" };
+        self.post(endpoint, json!({"target": {"videoId": video_id}}), "").map(|_| ())
+    }
+
+    /// Saves a playlist or album (by its playlist id) to the library, or removes it.
+    pub fn save(&self, playlist_id: &str, save: bool) -> Result<()> {
+        let endpoint = if save { "like/like" } else { "like/removelike" };
+        self.post(endpoint, json!({"target": {"playlistId": playlist_id}}), "").map(|_| ())
     }
 
     /// Creates a private playlist; returns its id.

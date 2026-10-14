@@ -1,6 +1,6 @@
-//! Menus: Account / Equalizer / Theme popups, right-click menus for songs
-//! and playlists, and the delete confirmation. All of them are drawn only
-//! while open, so they cost nothing otherwise.
+//! Menus: Account / Equalizer / Pitch / Theme popups, right-click menus
+//! for songs and playlists, and the delete confirmation. All of them are
+//! drawn only while open, so they cost nothing otherwise.
 //!
 //! Like the views, they draw with shared borrows and return what the user
 //! chose; the caller applies it.
@@ -14,6 +14,9 @@ use crate::api::models::Playlist;
 use crate::config::{EQ_BANDS, EqualizerConfig};
 use crate::player::eq::{BANDS, MAX_GAIN_DB};
 
+/// Buttons `menus` draws (the sidebar reserves room for them).
+pub const MENU_COUNT: usize = 4;
+
 pub enum MenuAction {
     SignIn,
     SignOut,
@@ -21,6 +24,8 @@ pub enum MenuAction {
     SetTheme(String),
     /// New settings, and whether to save them (on release, not every step).
     Equalizer(EqualizerConfig, bool),
+    /// Semitones, and whether to save.
+    Pitch(i32, bool),
 }
 
 const EQ_PRESETS: &[(&str, [f32; EQ_BANDS])] = &[
@@ -30,8 +35,8 @@ const EQ_PRESETS: &[(&str, [f32; EQ_BANDS])] = &[
     ("Treble", [0.0, 0.0, 0.0, 3.0, 6.0]),
 ];
 
-/// The Account, Equalizer and Theme buttons with their popups. `compact`
-/// lays them out as small text buttons (for the layout without a sidebar).
+/// The Account, Equalizer, Pitch and Theme buttons with their popups.
+/// `compact` lays them out as small text buttons (layout without a sidebar).
 pub fn menus(app: &App, ui: &mut Ui, compact: bool) -> Option<MenuAction> {
     let theme = &app.theme;
     let trigger = |ui: &mut Ui, label: &str| if compact { text_button(ui, theme, label) } else { nav_item(ui, theme, label, false) };
@@ -67,6 +72,9 @@ pub fn menus(app: &App, ui: &mut Ui, compact: bool) -> Option<MenuAction> {
     let eq_button = trigger(ui, "Equalizer");
     popup(&eq_button).show(|ui| action = equalizer(app, ui).or(action.take()));
 
+    let pitch_button = trigger(ui, "Pitch");
+    popup(&pitch_button).show(|ui| action = pitch(app, ui).or(action.take()));
+
     let theme_button = trigger(ui, "Theme");
     if theme_button.clicked() {
         action = Some(MenuAction::ListThemes); // pick up theme files added since
@@ -87,13 +95,17 @@ pub fn menus(app: &App, ui: &mut Ui, compact: bool) -> Option<MenuAction> {
     action
 }
 
-fn equalizer(app: &App, ui: &mut Ui) -> Option<MenuAction> {
-    // Widgets default to the panel colour, which is also the popup's: lift
-    // them so the checkbox and slider rails show.
+/// Widgets default to the panel colour, which is also the popup's: lift
+/// them so checkboxes and slider rails show.
+fn lift(app: &App, ui: &mut Ui) {
     let v = ui.visuals_mut();
     v.widgets.inactive.bg_fill = app.theme.colors.hover;
     v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, app.theme.colors.text_dim.gamma_multiply(0.5));
     v.slider_trailing_fill = true;
+}
+
+fn equalizer(app: &App, ui: &mut Ui) -> Option<MenuAction> {
+    lift(app, ui);
     ui.spacing_mut().slider_width = 120.0;
     let mut eq = app.eq.clone();
     let mut changed = false;
@@ -134,6 +146,45 @@ fn equalizer(app: &App, ui: &mut Ui) -> Option<MenuAction> {
     (changed || save).then_some(MenuAction::Equalizer(eq, save))
 }
 
+fn pitch(app: &App, ui: &mut Ui) -> Option<MenuAction> {
+    lift(app, ui);
+    ui.set_width(260.0);
+    ui.spacing_mut().slider_width = 220.0;
+    let theme = &app.theme;
+    let mut semitones = app.pitch;
+    let mut save = false;
+    ui.horizontal(|ui| {
+        ui.label("Pitch");
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            let text = match semitones {
+                0 => "Original".to_string(),
+                1 | -1 => format!("{semitones:+} semitone"),
+                s => format!("{s:+} semitones"),
+            };
+            ui.label(RichText::new(text).color(theme.colors.text_dim));
+        });
+    });
+    ui.add_space(6.0);
+    let r = ui.add(Slider::new(&mut semitones, -12..=12).show_value(false));
+    save |= r.drag_stopped() || (r.changed() && !r.dragged());
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        for (label, step) in [("−1", -1), ("+1", 1)] {
+            if ui.button(label).clicked() {
+                semitones = (semitones + step).clamp(-12, 12);
+                save = true;
+            }
+        }
+        if ui.add_enabled(semitones != 0, egui::Button::new("Reset")).clicked() {
+            semitones = 0;
+            save = true;
+        }
+    });
+    ui.add_space(4.0);
+    ui.label(RichText::new("Changes pitch, not speed.").font(widgets::small(theme)).color(theme.colors.text_dim));
+    (semitones != app.pitch || save).then_some(MenuAction::Pitch(semitones, save))
+}
+
 pub enum TrackChoice {
     PlayNext,
     AddToQueue,
@@ -141,7 +192,7 @@ pub enum TrackChoice {
     AddToPlaylist(usize),
 }
 
-/// Right-click menu on a song row.
+/// Right-click menu on a song row. `playlists` is None when signed out.
 pub fn track_menu(resp: &Response, playlists: Option<&[Playlist]>) -> Option<TrackChoice> {
     let mut choice = None;
     resp.context_menu(|ui| {
@@ -161,18 +212,18 @@ pub fn track_menu(resp: &Response, playlists: Option<&[Playlist]>) -> Option<Tra
                     ui.label("Sign in to use playlists");
                 }
                 Some(list) => {
-                    let mut any = false;
+                    // Only the user's own playlists can be added to.
+                    let mut own = list.iter().enumerate().filter(|(_, p)| p.owned && !is_special_playlist(&p.id)).peekable();
+                    if own.peek().is_none() {
+                        ui.label("No playlists yet");
+                    }
                     egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                        for (i, p) in list.iter().enumerate().filter(|(_, p)| !is_special_playlist(&p.id)) {
-                            any = true;
+                        for (i, p) in own {
                             if ui.button(&p.title).clicked() {
                                 choice = Some(TrackChoice::AddToPlaylist(i));
                             }
                         }
                     });
-                    if !any {
-                        ui.label("No playlists yet");
-                    }
                 }
             }
         });
@@ -183,18 +234,27 @@ pub fn track_menu(resp: &Response, playlists: Option<&[Playlist]>) -> Option<Tra
 pub enum PlaylistChoice {
     Play,
     Delete,
+    Remove,
 }
 
-/// Right-click menu on a playlist row.
-pub fn playlist_menu(resp: &Response, playlist: &Playlist) -> Option<PlaylistChoice> {
+/// Right-click menu on a playlist or album: own playlists can be deleted,
+/// saved ones removed from the library.
+pub fn playlist_menu(resp: &Response, playlist: &Playlist, signed_out: bool) -> Option<PlaylistChoice> {
     let mut choice = None;
     resp.context_menu(|ui| {
         ui.set_min_width(170.0);
         if ui.button("Play").clicked() {
             choice = Some(PlaylistChoice::Play);
         }
-        if !is_special_playlist(&playlist.id) && ui.button("Delete playlist…").clicked() {
-            choice = Some(PlaylistChoice::Delete);
+        if signed_out || is_special_playlist(&playlist.id) {
+            return;
+        }
+        if playlist.owned {
+            if ui.button("Delete playlist…").clicked() {
+                choice = Some(PlaylistChoice::Delete);
+            }
+        } else if playlist.save_id.is_some() && ui.button("Remove from library").clicked() {
+            choice = Some(PlaylistChoice::Remove);
         }
     });
     choice
@@ -233,5 +293,6 @@ pub fn apply(app: &mut App, action: MenuAction) {
         MenuAction::ListThemes => app.list_themes(),
         MenuAction::SetTheme(name) => app.set_theme(&name),
         MenuAction::Equalizer(eq, save) => app.set_equalizer(eq, save),
+        MenuAction::Pitch(semitones, save) => app.set_pitch(semitones, save),
     }
 }

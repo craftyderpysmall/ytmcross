@@ -7,10 +7,13 @@
 
 use serde_json::Value;
 
-use super::models::{Continuation, Playlist, Track};
+use super::models::{Artist, Continuation, Header, Kind, Playlist, Track};
 
 /// Subtrees that duplicate rows we already collect (video counterparts of songs).
 const SKIP_KEYS: &[&str] = &["counterpart"];
+
+const ARTIST_PAGE: &str = "MUSIC_PAGE_TYPE_ARTIST";
+const ALBUM_PAGE: &str = "MUSIC_PAGE_TYPE_ALBUM";
 
 /// Collects every value stored under `key`, anywhere in the tree.
 fn find_all<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
@@ -80,6 +83,38 @@ fn thumb(v: &Value) -> Option<String> {
     list.last()?["url"].as_str().map(str::to_string)
 }
 
+/// Browse id and page type a node navigates to.
+fn browse(v: &Value) -> Option<(&str, &str)> {
+    let b = &v["navigationEndpoint"]["browseEndpoint"];
+    let page = b["browseEndpointContextSupportedConfigs"]["browseEndpointContextMusicConfig"]["pageType"].as_str();
+    Some((b["browseId"].as_str()?, page.unwrap_or_default()))
+}
+
+/// First run linking to a page of type `page`: (text, browse id).
+fn link<'a>(runs: &[&'a Value], page: &str) -> Option<(&'a str, &'a str)> {
+    runs.iter().find_map(|run| {
+        let (id, p) = browse(run)?;
+        (p == page).then(|| (run["text"].as_str().unwrap_or_default(), id))
+    })
+}
+
+fn runs_of(v: &Value) -> impl Iterator<Item = &Value> {
+    v["runs"].as_array().into_iter().flatten()
+}
+
+/// Like status from a row's menu: a like button, or the like action it
+/// offers ("LIKE" when not liked yet, "INDIFFERENT" to un-like).
+fn liked(menu: &Value) -> Option<bool> {
+    if let Some(status) = find_str(menu, "likeStatus") {
+        return Some(status == "LIKE");
+    }
+    match find(menu, "likeEndpoint")?["status"].as_str()? {
+        "LIKE" => Some(false),
+        "INDIFFERENT" => Some(true),
+        _ => None,
+    }
+}
+
 /// Rows from search results, playlists and the up-next queue.
 pub fn tracks(resp: &Value) -> Vec<Track> {
     let mut nodes = Vec::new();
@@ -107,37 +142,152 @@ fn list_item(r: &Value) -> Option<Track> {
     if duration.is_none() {
         duration = text(&r["fixedColumns"][0]["musicResponsiveListItemFixedColumnRenderer"]["text"]);
     }
-    let artists = groups.first().cloned().unwrap_or_default();
-    // Search rows carry the album in column 1; playlist rows in column 2.
-    let album = groups.get(1).cloned().or_else(|| text(col(2)));
+    // Artist and album links can be in any column after the title.
+    let runs: Vec<&Value> = r["flexColumns"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .skip(1)
+        .flat_map(|c| runs_of(&c["musicResponsiveListItemFlexColumnRenderer"]["text"]))
+        .collect();
+    let album_link = link(&runs, ALBUM_PAGE);
 
     Some(Track {
         video_id,
         title,
-        artists,
-        album,
+        artists: groups.first().cloned().unwrap_or_default(),
+        album: album_link.map(|(t, _)| t.to_string()).or_else(|| groups.get(1).cloned()),
         duration,
         thumb: thumb(&r["thumbnail"]),
         set_video_id: r["playlistItemData"]["playlistSetVideoId"].as_str().map(str::to_string),
+        artist_id: link(&runs, ARTIST_PAGE).map(|(_, id)| id.to_string()),
+        album_id: album_link.map(|(_, id)| id.to_string()),
+        liked: liked(&r["menu"]),
     })
 }
 
 fn panel_item(r: &Value) -> Option<Track> {
     let groups = run_groups(&r["longBylineText"]);
+    let runs: Vec<&Value> = runs_of(&r["longBylineText"]).collect();
+    let album_link = link(&runs, ALBUM_PAGE);
     Some(Track {
         video_id: r["videoId"].as_str()?.to_string(),
         title: text(&r["title"])?,
         artists: groups.first().cloned().unwrap_or_default(),
-        album: groups.get(1).cloned(),
+        album: album_link.map(|(t, _)| t.to_string()).or_else(|| groups.get(1).cloned()),
         duration: text(&r["lengthText"]),
         thumb: thumb(&r["thumbnail"]),
         set_video_id: None,
+        // Panel links carry no page type: artists are channels (UC…).
+        artist_id: runs.iter().find_map(|run| browse(run).map(|(id, _)| id).filter(|id| id.starts_with("UC"))).map(str::to_string),
+        album_id: album_link.or_else(|| runs.iter().find_map(|run| browse(run).filter(|(id, _)| id.starts_with("MPRE")).map(|(id, _)| ("", id)))).map(|(_, id)| id.to_string()),
+        liked: liked(&r["menu"]),
     })
 }
 
-/// True on the first page of a playlist the user can edit (their own).
-pub fn playlist_editable(resp: &Value) -> bool {
-    find(resp, "musicEditablePlaylistDetailHeaderRenderer").is_some()
+/// Playlists and albums: library and carousel cards, and search result rows.
+pub fn playlists(resp: &Value) -> Vec<Playlist> {
+    let mut cards = Vec::new();
+    find_all(resp, "musicTwoRowItemRenderer", &mut cards);
+    let mut out: Vec<Playlist> = cards.into_iter().filter_map(card).collect();
+    let mut rows = Vec::new();
+    find_all(resp, "musicResponsiveListItemRenderer", &mut rows);
+    out.extend(rows.into_iter().filter_map(collection_row));
+    out
+}
+
+/// "VLxyz" -> playlist xyz; "MPREb_…" -> album.
+fn collection_id<'a>(id: &'a str, page: &str) -> Option<(&'a str, Kind)> {
+    if let Some(id) = id.strip_prefix("VL") {
+        Some((id, Kind::Playlist))
+    } else if page == ALBUM_PAGE || id.starts_with("MPRE") {
+        Some((id, Kind::Album))
+    } else {
+        None
+    }
+}
+
+fn card(r: &Value) -> Option<Playlist> {
+    let (id, page) = browse(r).or_else(|| runs_of(&r["title"]).find_map(browse))?;
+    let (id, kind) = collection_id(id, page)?;
+    Some(Playlist {
+        id: id.to_string(),
+        kind,
+        title: text(&r["title"])?,
+        subtitle: text(&r["subtitle"]).unwrap_or_default(),
+        thumb: thumb(&r["thumbnailRenderer"]),
+        // Only the owner's menu offers to edit it.
+        owned: find(&r["menu"], "playlistEditorEndpoint").is_some(),
+        save_id: save_id(r, &r["thumbnailOverlay"]),
+    })
+}
+
+/// The playlist id a card's "Save to library" acts on; albums also name
+/// it in their play button. Own and auto playlists have none.
+fn save_id(r: &Value, overlay: &Value) -> Option<String> {
+    let like = find(&r["menu"], "likeEndpoint").and_then(|l| l["target"]["playlistId"].as_str());
+    let album = browse(r).is_some_and(|(id, _)| id.starts_with("MPRE"));
+    like.or_else(|| if album { find_str(overlay, "playlistId") } else { None }).map(str::to_string)
+}
+
+fn collection_row(r: &Value) -> Option<Playlist> {
+    let (id, page) = browse(r)?;
+    let (id, kind) = collection_id(id, page)?;
+    let col = |i: usize| &r["flexColumns"][i]["musicResponsiveListItemFlexColumnRenderer"]["text"];
+    Some(Playlist {
+        id: id.to_string(),
+        kind,
+        title: text(col(0))?,
+        subtitle: text(col(1)).unwrap_or_default(),
+        thumb: thumb(&r["thumbnail"]),
+        owned: false,
+        save_id: save_id(r, &r["overlay"]),
+    })
+}
+
+/// Header of a playlist or album page.
+pub fn header(resp: &Value) -> Header {
+    let editable = find(resp, "musicEditablePlaylistDetailHeaderRenderer").is_some();
+    let Some(h) = find(resp, "musicResponsiveHeaderRenderer") else { return Header { editable, ..Header::default() } };
+    let subtitle: Vec<String> = [text(&h["subtitle"]), text(&h["secondSubtitle"])].into_iter().flatten().collect();
+    let artist = runs_of(&h["straplineTextOne"])
+        .next()
+        .and_then(|r| Some((r["text"].as_str()?.to_string(), browse(r).map(|(id, _)| id.to_string()))));
+    let save = (!editable)
+        .then(|| {
+            h["buttons"].as_array()?.iter().find_map(|b| {
+                let t = &b["toggleButtonRenderer"];
+                let id = t["defaultServiceEndpoint"]["likeEndpoint"]["target"]["playlistId"].as_str()?;
+                Some((id.to_string(), t["isToggled"].as_bool().unwrap_or(false)))
+            })
+        })
+        .flatten();
+    Header { subtitle: subtitle.join(" • "), artist, thumb: thumb(&h["thumbnail"]), save, editable }
+}
+
+/// An artist page: header, top songs, albums and singles.
+pub fn artist(resp: &Value) -> Artist {
+    let h = find(resp, "musicImmersiveHeaderRenderer").or_else(|| find(resp, "musicVisualHeaderRenderer")).unwrap_or(&Value::Null);
+    let subtitle = text(&h["monthlyListenerCount"]).or_else(|| find(&h["subscriptionButton"], "longSubscriberCountText").and_then(text));
+    let mut out = Artist {
+        name: text(&h["title"]).unwrap_or_default(),
+        subtitle: subtitle.unwrap_or_default(),
+        thumb: thumb(&h["thumbnail"]),
+        songs: find(resp, "musicShelfRenderer").map(tracks).unwrap_or_default(),
+        ..Artist::default()
+    };
+    let mut shelves = Vec::new();
+    find_all(resp, "musicCarouselShelfRenderer", &mut shelves);
+    for shelf in shelves {
+        let title = text(&shelf["header"]["musicCarouselShelfBasicHeaderRenderer"]["title"]).unwrap_or_default();
+        let items = || shelf["contents"].as_array().into_iter().flatten().filter_map(|c| card(&c["musicTwoRowItemRenderer"]));
+        match title.as_str() {
+            "Albums" => out.albums = items().collect(),
+            t if t.starts_with("Singles") => out.singles = items().collect(),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Whether a playlist edit (add/move) went through.
@@ -145,29 +295,11 @@ pub fn edit_succeeded(resp: &Value) -> bool {
     resp["status"].as_str() == Some("STATUS_SUCCEEDED")
 }
 
-/// Playlist cards from the library page.
-pub fn playlists(resp: &Value) -> Vec<Playlist> {
-    let mut nodes = Vec::new();
-    find_all(resp, "musicTwoRowItemRenderer", &mut nodes);
-    nodes
-        .into_iter()
-        .filter_map(|r| {
-            let browse_id = find_str(&r["navigationEndpoint"], "browseId").or_else(|| find_str(&r["title"], "browseId"))?;
-            let id = browse_id.strip_prefix("VL")?.to_string();
-            Some(Playlist {
-                id,
-                title: text(&r["title"])?,
-                subtitle: text(&r["subtitle"]).unwrap_or_default(),
-                thumb: thumb(&r["thumbnailRenderer"]),
-            })
-        })
-        .collect()
-}
-
-/// For playlist pages: narrows the response to the track list itself, so
-/// "suggestions" shelves and their continuations are ignored.
+/// For playlist and album pages: narrows the response to the track list
+/// itself, so "suggestions" shelves and their continuations are ignored.
 pub fn playlist_scope(resp: &Value) -> &Value {
     find(resp, "musicPlaylistShelfRenderer")
+        .or_else(|| find(resp, "musicShelfRenderer"))
         .or_else(|| find(resp, "appendContinuationItemsAction"))
         .or_else(|| find(resp, "musicPlaylistShelfContinuation"))
         .unwrap_or(resp)
@@ -198,6 +330,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn link_run(text: &str, id: &str, page: &str) -> Value {
+        json!({"text": text, "navigationEndpoint": {"browseEndpoint": {"browseId": id,
+            "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": page}}}}})
+    }
+
     #[test]
     fn parses_search_row() {
         let resp = json!({"contents": {"x": [{"musicResponsiveListItemRenderer": {
@@ -206,8 +343,11 @@ mod tests {
             "flexColumns": [
                 {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Title"}]}}},
                 {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [
-                    {"text": "Artist"}, {"text": " • "}, {"text": "Album"}, {"text": " • "}, {"text": "3:45"}]}}}
-            ]}}]}});
+                    link_run("Artist", "UC1", ARTIST_PAGE), {"text": " • "}, link_run("Album", "MPREb_1", ALBUM_PAGE),
+                    {"text": " • "}, {"text": "3:45"}]}}}
+            ],
+            "menu": {"menuRenderer": {"items": [{"toggleMenuServiceItemRenderer": {
+                "defaultServiceEndpoint": {"likeEndpoint": {"status": "INDIFFERENT"}}}}]}}}}]}});
         let t = &tracks(&resp)[0];
         assert_eq!(t.video_id, "abc");
         assert_eq!(t.title, "Title");
@@ -215,12 +355,30 @@ mod tests {
         assert_eq!(t.album.as_deref(), Some("Album"));
         assert_eq!(t.duration.as_deref(), Some("3:45"));
         assert_eq!(t.thumb.as_deref(), Some("big"));
+        assert_eq!((t.artist_id.as_deref(), t.album_id.as_deref()), (Some("UC1"), Some("MPREb_1")));
+        assert_eq!(t.liked, Some(true));
     }
 
     #[test]
     fn skips_rows_without_video() {
         let resp = json!({"musicResponsiveListItemRenderer": {"flexColumns": []}});
         assert!(tracks(&resp).is_empty());
+    }
+
+    #[test]
+    fn library_cards_know_kind_and_owner() {
+        let resp = json!({"items": [
+            {"musicTwoRowItemRenderer": {"title": {"runs": [{"text": "Mine"}]},
+                "navigationEndpoint": {"browseEndpoint": {"browseId": "VLPL1"}},
+                "menu": {"menuRenderer": {"items": [{"menuNavigationItemRenderer": {"navigationEndpoint": {"playlistEditorEndpoint": {}}}}]}}}},
+            {"musicTwoRowItemRenderer": {"title": {"runs": [{"text": "Disc"}]},
+                "navigationEndpoint": {"browseEndpoint": {"browseId": "MPREb_2"}}}},
+            {"musicTwoRowItemRenderer": {"title": {"runs": [{"text": "New playlist"}]}}}
+        ]});
+        let list = playlists(&resp);
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[0].id.as_str(), list[0].kind, list[0].owned), ("PL1", Kind::Playlist, true));
+        assert_eq!((list[1].id.as_str(), list[1].kind, list[1].owned), ("MPREb_2", Kind::Album, false));
     }
 
     #[test]
