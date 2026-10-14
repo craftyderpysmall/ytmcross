@@ -277,6 +277,14 @@ impl ApplicationHandler<Wake> for Shell {
                 return;
             }
         };
+        // Title bar and taskbar icon: the exe's own (build.rs), loaded by the OS.
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::{IconExtWindows, WindowExtWindows};
+            let icon = winit::window::Icon::from_resource(1, None).ok();
+            window.set_window_icon(icon.clone());
+            window.set_taskbar_icon(icon);
+        }
         if let Some(mhz) = window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).filter(|&m| m > 0) {
             self.frame_interval = Duration::from_secs_f64(1000.0 / mhz as f64);
         }

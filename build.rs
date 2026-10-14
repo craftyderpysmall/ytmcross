@@ -2,7 +2,8 @@
 //! short-lived solver-builder process ever reads them, and only when the
 //! native preprocessing fails, so they shouldn't cost 150 KB of exe.
 //!
-//! On Windows, also embeds the app manifest (assets/ytmcross.manifest).
+//! On Windows, also embeds the app manifest (assets/ytmcross.manifest) and,
+//! with the GNU toolchain, the icon (assets/ytmcross.ico).
 
 use std::io::Write;
 
@@ -31,13 +32,17 @@ fn embed_manifest(out: &std::path::Path) {
         println!("cargo:rustc-link-arg-bin=ytmcross=/MANIFESTINPUT:{}", manifest.display());
         return;
     }
-    // GNU: compile a resource script naming the manifest (RT_MANIFEST = 24).
+    // GNU: compile a resource script naming the manifest (RT_MANIFEST = 24)
+    // and the icon (ICON 1: Explorer, shortcuts, and the window via ui/shell.rs).
+    let icon = manifest.with_file_name("ytmcross.ico");
+    println!("cargo:rerun-if-changed=assets/ytmcross.ico");
+    let path = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
     let rc = out.join("manifest.rc");
-    std::fs::write(&rc, format!("1 24 \"{}\"\n", manifest.to_string_lossy().replace('\\', "/"))).unwrap();
+    std::fs::write(&rc, format!("1 24 \"{}\"\n1 ICON \"{}\"\n", path(&manifest), path(&icon))).unwrap();
     let obj = out.join("manifest.o");
     let windres = std::env::var("WINDRES").unwrap_or_else(|_| "windres".into());
     match std::process::Command::new(&windres).arg(&rc).arg("-O").arg("coff").arg("-o").arg(&obj).status() {
         Ok(s) if s.success() => println!("cargo:rustc-link-arg-bin=ytmcross={}", obj.display()),
-        _ => println!("cargo:warning=windres not found: building without the app manifest"),
+        _ => println!("cargo:warning=windres not found: building without the app manifest and icon"),
     }
 }

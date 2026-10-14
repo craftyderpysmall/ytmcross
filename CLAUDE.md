@@ -23,7 +23,7 @@ $env:RUSTUP_HOME = "$env:USERPROFILE\scoop\persist\rustup\.rustup"
 - Toolchain: `stable-x86_64-pc-windows-gnu` (folder override). Release build ~2 min (fat LTO).
 - Keep `cargo clippy --all-targets` at zero warnings; `cargo test` must pass.
 - Two binaries: `ytmcross` and `ytmcross-login` (`src/bin/`, the sign-in webview, needs `WebView2Loader.dll` beside it; copy from webview2-com-sys `x64/` if missing). The main exe must never import that DLL (`objdump -p target\release\ytmcross.exe | Select-String "DLL Name"`).
-- `build.rs` deflates `assets/ejs/*.js` into the binary and embeds `assets/ytmcross.manifest` (segment heap) via `windres`.
+- `build.rs` deflates `assets/ejs/*.js` into the binary and embeds `assets/ytmcross.manifest` (segment heap) and `assets/ytmcross.ico` (from `ytmcross.svg`, PNG entries; the window loads it with `Icon::from_resource`) via `windres`.
 - Per-crate `opt-level = "s"` in Cargo.toml is only for helper-only or cold crates; measure CPU before adding more.
 
 ## Releases
