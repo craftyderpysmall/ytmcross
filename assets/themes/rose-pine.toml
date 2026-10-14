@@ -1,0 +1,12 @@
+# Example theme: Rosé Pine.
+# Only colors are set; font, shape and art come from the default theme.
+# Activate it with  theme = "rose-pine"  in config.toml, then press F5.
+
+[colors]
+background = "#090B0F"
+panel      = "#0E1117"
+text       = "#D9DEE5"
+text_dim   = "#5F6875"
+accent     = "#285A9F"
+hover      = "#151A23"
+selection  = "#151A23"

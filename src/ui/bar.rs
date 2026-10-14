@@ -1,0 +1,107 @@
+//! Now-playing bar: art + title on the left, transport and seek bar in the
+//! middle, volume on the right. Painted directly into fixed rects.
+
+use egui::{Align2, Id, Rect, Sense, Ui, pos2, vec2};
+
+use super::app::App;
+use super::widgets::{self, Icon, icon_button, line, slim_slider};
+
+/// Content height of the bar (padding is added around it).
+pub const HEIGHT: f32 = 58.0;
+
+enum Action {
+    Prev,
+    Toggle,
+    Next,
+    Seek(f64),
+    Volume(f32),
+}
+
+pub fn show(app: &mut App, ui: &mut Ui) {
+    let rect = ui.available_rect_before_wrap();
+    ui.allocate_rect(rect, Sense::hover());
+    let mut action = None;
+    {
+        let theme = &app.theme;
+        let c = &theme.colors;
+        let track = app.now_playing();
+        let pb = &app.playback;
+
+        // Left: art and title.
+        let left_w = (rect.width() * 0.28).clamp(150.0, 360.0);
+        let art = Rect::from_min_size(pos2(rect.left(), rect.center().y - HEIGHT / 2.0), vec2(HEIGHT, HEIGHT));
+        widgets::art(ui, &app.images, art, track.and_then(|t| t.thumb.as_deref()), theme);
+        let text_x = art.right() + 12.0;
+        let text_w = rect.left() + left_w - text_x - 8.0;
+        let (title, sub) = match track {
+            Some(t) => (t.title.as_str(), t.artists.as_str()),
+            None => ("Not playing", ""),
+        };
+        let g_title = line(ui, title, widgets::title_font(theme), c.text, text_w);
+        let g_sub = line(ui, sub, widgets::small(theme), c.text_dim, text_w);
+        let total = g_title.size().y + 3.0 + g_sub.size().y;
+        let top = rect.center().y - total / 2.0;
+        let sub_y = top + g_title.size().y + 3.0;
+        ui.painter().galley(pos2(text_x, top), g_title, c.text);
+        ui.painter().galley(pos2(text_x, sub_y), g_sub, c.text_dim);
+
+        // Right: volume (hidden when the window is narrow).
+        let show_volume = rect.width() > 640.0;
+        let right_w = if show_volume { 150.0 } else { 0.0 };
+        if show_volume {
+            let r = Rect::from_min_size(pos2(rect.right() - 120.0, rect.center().y - 8.0), vec2(120.0, 16.0));
+            let s = slim_slider(ui, theme, r, Id::new("volume"), pb.volume);
+            if s.dragging || s.committed {
+                if (s.value - pb.volume).abs() >= 0.01 || s.committed {
+                    action = Some(Action::Volume(s.value));
+                }
+            }
+            ui.painter().text(pos2(r.left() - 10.0, r.center().y), Align2::RIGHT_CENTER, "Vol", widgets::small(theme), c.text_dim);
+        }
+
+        // Centre: transport buttons and seek bar.
+        let centre = Rect::from_x_y_ranges(rect.left() + left_w..=rect.right() - right_w, rect.y_range());
+        let cx = centre.center().x;
+        let by = rect.top() + 18.0;
+        let enabled = track.is_some();
+        let play_icon = if pb.paused || track.is_none() { Icon::Play } else { Icon::Pause };
+        let btn = |x: f32, d: f32| Rect::from_center_size(pos2(x, by), vec2(d, d));
+        if icon_button(ui, theme, btn(cx - 52.0, 30.0), Id::new("prev"), Icon::Prev, false, enabled).clicked() {
+            action = Some(Action::Prev);
+        }
+        if icon_button(ui, theme, btn(cx, 38.0), Id::new("play"), play_icon, true, enabled).clicked() {
+            action = Some(Action::Toggle);
+        }
+        if icon_button(ui, theme, btn(cx + 52.0, 30.0), Id::new("next"), Icon::Next, false, enabled).clicked() {
+            action = Some(Action::Next);
+        }
+
+        let seek_w = (centre.width() - 120.0).clamp(80.0, 560.0);
+        let seek = Rect::from_center_size(pos2(cx, rect.bottom() - 9.0), vec2(seek_w, 14.0));
+        let frac = if pb.duration > 0.0 { (pb.position() / pb.duration) as f32 } else { 0.0 };
+        let s = slim_slider(ui, theme, seek, Id::new("seek"), frac);
+        if s.committed && pb.duration > 0.0 {
+            action = Some(Action::Seek(s.value as f64 * pb.duration));
+        }
+        let shown = if s.dragging { s.value as f64 * pb.duration } else { pb.position() };
+        let (left_txt, right_txt) = if pb.loading && track.is_some() {
+            ("Loading…".to_string(), String::new())
+        } else if track.is_some() {
+            (widgets::clock(shown), widgets::clock(pb.duration))
+        } else {
+            (String::new(), String::new())
+        };
+        let font = widgets::small(theme);
+        ui.painter().text(pos2(seek.left() - 10.0, seek.center().y), Align2::RIGHT_CENTER, left_txt, font.clone(), c.text_dim);
+        ui.painter().text(pos2(seek.right() + 10.0, seek.center().y), Align2::LEFT_CENTER, right_txt, font, c.text_dim);
+    }
+
+    match action {
+        Some(Action::Prev) => app.prev(),
+        Some(Action::Toggle) => app.toggle_pause(),
+        Some(Action::Next) => app.next(),
+        Some(Action::Seek(t)) => app.seek(t),
+        Some(Action::Volume(v)) => app.set_volume(v),
+        None => {}
+    }
+}

@@ -1,0 +1,30 @@
+# ytmcross default theme
+#
+# A theme is just a set of design tokens. Every value is optional:
+# anything you leave out falls back to this default theme, so a theme
+# can be as short as a single line, e.g.  colors.accent = "#ff5555"
+#
+# Colors are "#rrggbb" or "#rrggbbaa".
+
+[colors]
+background = "#0e0e12"   # main content area
+panel      = "#16161c"   # sidebar and now-playing bar
+text       = "#e8e8ee"   # primary text
+text_dim   = "#8a8a99"   # secondary text (artists, durations)
+accent     = "#c4a7e7"   # highlights, progress bar, play button
+hover      = "#22222b"   # row / button hover background
+selection  = "#2a2735"   # selected sidebar entry, active rows
+
+[font]
+# Path to a .ttf/.otf file. Leave empty to use the built-in Inter.
+file = ""
+size = 14
+
+[shape]
+rounding = 8    # corner radius of rows, buttons and art (px)
+spacing  = 6    # gap between items (px)
+padding  = 12   # inner padding of panels (px)
+
+[art]
+show = true     # show album art in lists
+size = 44       # album art size in lists (px)

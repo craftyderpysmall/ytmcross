@@ -1,0 +1,23 @@
+# ytmcross configuration
+# Press F5 inside the app to reload this file and the active theme.
+
+# Theme file to use, from the themes/ folder next to this file (without .toml).
+theme = "default"
+
+[window]
+width = 1100
+height = 720
+
+[layout]
+# Where the now-playing bar sits: "bottom" or "top".
+bar_position = "bottom"
+# Show the navigation sidebar.
+sidebar = true
+# Sidebar entries, in order. Available: "search", "library", "queue".
+sidebar_items = ["search", "library", "queue"]
+
+[player]
+# Path to the yt-dlp executable. A plain name is looked up on PATH.
+ytdlp = "yt-dlp"
+# Starting volume, 0-100.
+volume = 80
