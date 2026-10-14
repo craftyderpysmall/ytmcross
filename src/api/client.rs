@@ -195,12 +195,15 @@ impl Client {
 /// every part benefits from connections another part already opened.
 /// ureq's defaults (128 KiB buffers ×2, 10 idle connections) cost ~3 MB;
 /// our requests are small and responses are streamed, so smaller is enough.
+/// Each connection holds two input and two output buffers (HTTP and TLS
+/// layers): request heads stay under 4 KB (the cookie header is ~2.3 KB)
+/// and response heads are a few KB.
 pub fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(20)))
         .user_agent(USER_AGENT)
-        .input_buffer_size(32 * 1024)
-        .output_buffer_size(16 * 1024)
+        .input_buffer_size(16 * 1024)
+        .output_buffer_size(8 * 1024)
         .max_idle_connections(8)
         .max_idle_connections_per_host(2)
         // Long enough that the next track's audio reuses a warm connection.
