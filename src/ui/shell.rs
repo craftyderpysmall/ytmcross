@@ -64,7 +64,8 @@ struct Shell {
 #[derive(Default)]
 struct Stats {
     frames: u32,
-    time: Duration,
+    /// Layout, damage, tessellation, rasterization.
+    phases: [Duration; 4],
     drawn: u64,
     total: u64,
 }
@@ -130,7 +131,7 @@ impl Shell {
         let ppp = out.pixels_per_point;
         let t_ui = started.elapsed();
 
-        let scene = Scene::new(&out.shapes, ppp);
+        let (scene, shapes) = Scene::new(out.shapes, ppp);
         // New fonts (another script's, or the theme's) can change glyphs
         // without changing any layout: redraw everything.
         let fonts = self.ctx.fonts(|f| f.definitions().font_data.values().fold(0, |k, d| k * 31 + Arc::as_ptr(d) as usize));
@@ -141,6 +142,8 @@ impl Shell {
             _ => vec![Region::full(w, h)],
         };
         let full = regions.first() == Some(&Region::full(w, h));
+        let t_scene = started.elapsed();
+        let mut t_tess = t_scene;
         if regions.is_empty() {
             if !out.textures_delta.is_empty() {
                 // Nothing to draw, but the renderer's textures must keep up.
@@ -148,7 +151,12 @@ impl Shell {
                 self.renderer.render(&mut BufferMutRef::new(&mut px, 1, 1), &[], &out.textures_delta, ppp);
             }
         } else {
-            let primitives = self.ctx.tessellate(out.shapes, ppp);
+            let shapes = if full { shapes } else { scene.touching(shapes, &regions) };
+            let mut primitives = self.ctx.tessellate(shapes, ppp);
+            if full {
+                damage::seal(&mut primitives);
+            }
+            t_tess = started.elapsed();
             let renderer = &mut self.renderer;
             let (delta, none) = (&out.textures_delta, egui::TexturesDelta::default());
             win.presenter.draw(w, h, &regions, |pixels| {
@@ -159,7 +167,9 @@ impl Shell {
                     if full {
                         renderer.render(target, &primitives, delta, ppp);
                     } else {
-                        renderer.render(target, &damage::clip(&primitives, *r, ppp), delta, ppp);
+                        let mut part = damage::clip(&primitives, *r, ppp);
+                        damage::seal(&mut part);
+                        renderer.render(target, &part, delta, ppp);
                     }
                 }
             });
@@ -173,13 +183,23 @@ impl Shell {
         }
         if let Some(s) = &mut self.stats {
             s.frames += 1;
-            s.time += started.elapsed();
+            s.phases[0] += t_ui;
+            s.phases[1] += t_scene - t_ui;
+            s.phases[2] += t_tess - t_scene;
+            s.phases[3] += started.elapsed() - t_tess;
             s.drawn += regions.iter().map(|r| u64::from(r.width()) * u64::from(r.height())).sum::<u64>();
             s.total += u64::from(w) * u64::from(h);
             if s.frames == 30 {
-                let ms = s.time.as_secs_f64() * 1000.0 / 30.0;
+                let ms = s.phases.map(|p| p.as_secs_f64() * 1000.0 / 30.0);
                 let share = s.drawn as f64 * 100.0 / s.total as f64;
-                win.window.set_title(&format!("ytmcross - {ms:.2} ms/frame, {share:.0}% drawn"));
+                win.window.set_title(&format!(
+                    "ytmcross - {:.2} ms/frame: ui {:.2}, diff {:.2}, tessellate {:.2}, raster {:.2}; {share:.0}% drawn",
+                    ms.iter().sum::<f64>(),
+                    ms[0],
+                    ms[1],
+                    ms[2],
+                    ms[3]
+                ));
                 *s = Stats::default();
             }
         }

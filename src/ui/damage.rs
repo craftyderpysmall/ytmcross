@@ -90,6 +90,10 @@ impl Region {
     fn near(&self, o: &Region, gap: u32) -> bool {
         self.x0 <= o.x1 + gap && o.x0 <= self.x1 + gap && self.y0 <= o.y1 + gap && o.y0 <= self.y1 + gap
     }
+
+    fn meets(&self, r: &Rect) -> bool {
+        r.min.x < self.x1 as f32 && r.max.x > self.x0 as f32 && r.min.y < self.y1 as f32 && r.max.y > self.y0 as f32
+    }
 }
 
 /// What a frame painted: per shape, a hash and the pixels it can touch.
@@ -99,30 +103,40 @@ pub struct Scene {
 }
 
 impl Scene {
-    pub fn new(shapes: &[ClippedShape], pixels_per_point: f32) -> Scene {
+    /// Hashes the visible shapes of a frame. Returns them too, flattened
+    /// and in step with the scene.
+    pub fn new(shapes: Vec<ClippedShape>, pixels_per_point: f32) -> (Scene, Vec<ClippedShape>) {
         let mut scene = Scene { shapes: Vec::with_capacity(shapes.len()) };
+        let mut visible = Vec::with_capacity(shapes.len());
         for s in shapes {
-            scene.add(s.clip_rect, &s.shape, pixels_per_point);
+            scene.add(s.clip_rect, s.shape, pixels_per_point, &mut visible);
         }
-        scene
+        (scene, visible)
     }
 
-    fn add(&mut self, clip: Rect, shape: &Shape, ppp: f32) {
+    fn add(&mut self, clip: Rect, shape: Shape, ppp: f32, visible: &mut Vec<ClippedShape>) {
         match shape {
             Shape::Noop => {}
-            Shape::Vec(list) => list.iter().for_each(|s| self.add(clip, s, ppp)),
-            _ => {
+            Shape::Vec(list) => list.into_iter().for_each(|s| self.add(clip, s, ppp, visible)),
+            shape => {
                 let bounds = shape.visual_bounding_rect().intersect(clip);
                 if !bounds.is_positive() {
                     return;
                 }
                 let mut h = Fx::default();
                 rect(&mut h, clip);
-                hash_shape(&mut h, shape);
+                hash_shape(&mut h, &shape);
                 // Anti-aliasing feathers about a pixel beyond the geometry.
                 self.shapes.push((h.finish(), (bounds * ppp).expand(2.0)));
+                visible.push(ClippedShape { clip_rect: clip, shape });
             }
         }
+    }
+
+    /// Of this scene's `shapes`, the ones that can touch `regions`: the rest
+    /// needn't even be tessellated.
+    pub fn touching(&self, shapes: Vec<ClippedShape>, regions: &[Region]) -> Vec<ClippedShape> {
+        shapes.into_iter().zip(&self.shapes).filter(|(_, (_, r))| regions.iter().any(|g| g.meets(r))).map(|(s, _)| s).collect()
     }
 }
 
@@ -175,9 +189,22 @@ pub fn diff(old: &Scene, new: &Scene, w: u32, h: u32) -> Damage {
     }
 }
 
+/// Ends each mesh with a degenerate triangle. The rasterizer only treats a
+/// quad as a rectangle when more indices follow it; sealed, every quad is
+/// treated alike whichever part of the frame its mesh was cut from.
+pub fn seal(primitives: &mut [ClippedPrimitive]) {
+    for p in primitives {
+        if let Primitive::Mesh(m) = &mut p.primitive
+            && let Some(&k) = m.indices.first()
+        {
+            m.indices.extend([k, k, k]);
+        }
+    }
+}
+
 /// The parts of `primitives` that can touch `region`: only those triangles
 /// are rasterized. Vertices keep their positions, so the pixels come out
-/// exactly as in a full frame.
+/// exactly as in a full frame (once both are sealed).
 pub fn clip(primitives: &[ClippedPrimitive], region: Region, ppp: f32) -> Vec<ClippedPrimitive> {
     let area = Rect::from_min_max(pos2(region.x0 as f32, region.y0 as f32), pos2(region.x1 as f32, region.y1 as f32)) / ppp;
     // Triangles touching the edge feather into it.
@@ -197,13 +224,12 @@ pub fn clip(primitives: &[ClippedPrimitive], region: Region, ppp: f32) -> Vec<Cl
 }
 
 /// The triangles of `mesh` whose bounds meet `area`. A quad's two triangles
-/// stay together, and the original last one stays last, so the rasterizer
-/// pairs them into rectangles exactly as it does for the whole mesh.
+/// stay together, so the rasterizer pairs them into rectangles exactly as
+/// it does for the whole mesh.
 fn mesh_within(mesh: &Mesh, area: Rect) -> Option<Mesh> {
     let (vertices, indices) = (&mesh.vertices, &mesh.indices);
     let mut out = Mesh::with_texture(mesh.texture_id);
     let mut remap = vec![u32::MAX; vertices.len()];
-    let mut kept_last = false;
     let mut i = 0;
     while i + 3 <= indices.len() {
         let quad = i + 6 <= indices.len() && {
@@ -217,7 +243,6 @@ fn mesh_within(mesh: &Mesh, area: Rect) -> Option<Mesh> {
         if !bounds.intersects(area) {
             continue;
         }
-        kept_last = i == indices.len();
         for &k in unit {
             let slot = &mut remap[k as usize];
             if *slot == u32::MAX {
@@ -227,16 +252,7 @@ fn mesh_within(mesh: &Mesh, area: Rect) -> Option<Mesh> {
             out.indices.push(*slot);
         }
     }
-    if out.indices.is_empty() {
-        return None;
-    }
-    if !kept_last {
-        // The rasterizer looks for rectangles only where more indices follow:
-        // a degenerate triangle keeps the (formerly inner) last quad eligible.
-        let k = out.indices[0];
-        out.indices.extend([k, k, k]);
-    }
-    Some(out)
+    (!out.indices.is_empty()).then_some(out)
 }
 
 fn f(h: &mut Fx, v: f32) {
@@ -353,7 +369,7 @@ mod tests {
     fn scene(shapes: Vec<Shape>) -> Scene {
         let clip = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 1000.0));
         let clipped: Vec<ClippedShape> = shapes.into_iter().map(|shape| ClippedShape { clip_rect: clip, shape }).collect();
-        Scene::new(&clipped, 1.0)
+        Scene::new(clipped, 1.0).0
     }
 
     fn rect_shape(x: f32, color: Color32) -> Shape {
@@ -389,10 +405,18 @@ mod tests {
         mesh.add_colored_rect(Rect::from_min_size(pos2(100.0, 0.0), vec2(10.0, 10.0)), Color32::RED);
         mesh.add_colored_rect(Rect::from_min_size(pos2(200.0, 0.0), vec2(10.0, 10.0)), Color32::RED);
         let inner = mesh_within(&mesh, Rect::from_min_size(pos2(95.0, 0.0), vec2(20.0, 20.0))).unwrap();
-        // The middle quad, plus a degenerate triangle as it was not the last one.
-        assert_eq!(inner.vertices.len(), 4);
-        assert_eq!(inner.indices.len(), 9);
-        let last = mesh_within(&mesh, Rect::from_min_size(pos2(195.0, 0.0), vec2(20.0, 20.0))).unwrap();
-        assert_eq!(last.indices.len(), 6);
+        assert_eq!((inner.vertices.len(), inner.indices.len()), (4, 6));
+        assert!(mesh_within(&mesh, Rect::from_min_size(pos2(50.0, 50.0), vec2(20.0, 20.0))).is_none());
+    }
+
+    #[test]
+    fn only_shapes_near_damage_are_kept() {
+        let clip = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 1000.0));
+        let shapes = vec![rect_shape(10.0, Color32::RED), rect_shape(500.0, Color32::BLUE)];
+        let clipped = shapes.into_iter().map(|shape| ClippedShape { clip_rect: clip, shape }).collect();
+        let (scene, visible) = Scene::new(clipped, 1.0);
+        let kept = scene.touching(visible, &[Region { x0: 490, y0: 0, x1: 600, y1: 100 }]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].shape.visual_bounding_rect().min.x, 500.0);
     }
 }
