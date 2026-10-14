@@ -5551,6 +5551,7 @@ dependencies = [
  "egui",
  "egui-winit",
  "egui_software_backend",
+ "flate2",
  "image",
  "libc",
  "rquickjs",

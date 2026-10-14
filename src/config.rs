@@ -70,7 +70,6 @@ pub struct LayoutConfig {
 #[derive(Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct PlayerConfig {
-    pub ytdlp: String,
     pub volume: u32,
 }
 
@@ -105,7 +104,7 @@ impl Default for LayoutConfig {
 
 impl Default for PlayerConfig {
     fn default() -> Self {
-        PlayerConfig { ytdlp: "yt-dlp".into(), volume: 80 }
+        PlayerConfig { volume: 80 }
     }
 }
 
@@ -253,6 +252,7 @@ pub fn write_defaults() {
 /// Hashes of bundled theme files from earlier releases (see `fnv1a`).
 const OLD_BUNDLED_THEMES: &[u64] = &[
     0xc02b1319b10c9ac1, // default, lavender accent
+    0x2085fc8a4e8be069, // default, YouTube Music colors
 ];
 
 fn fnv1a(text: &str) -> u64 {

@@ -185,21 +185,101 @@ impl Theme {
     }
 }
 
-/// Installs Inter (or the theme's font) as the UI font. Rebuilds the font
-/// atlas, so only call at startup or when the font actually changed.
-pub fn install_fonts(ctx: &egui::Context, custom: Option<Vec<u8>>) {
+/// Installs Inter (or the theme's font) as the UI font, plus the system's
+/// fallback fonts when `fallback` is set. Rebuilds the font atlas, so only
+/// call at startup or when something changed.
+pub fn install_fonts(ctx: &egui::Context, custom: Option<Arc<FontData>>, fallback: bool) {
     let mut defs = FontDefinitions::default();
-    let regular = match custom {
-        Some(bytes) => FontData::from_owned(bytes),
-        None => FontData::from_static(INTER_REGULAR),
-    };
-    defs.font_data.insert("ui".into(), Arc::new(regular));
+    defs.font_data.insert("ui".into(), custom.unwrap_or_else(|| Arc::new(FontData::from_static(INTER_REGULAR))));
     defs.font_data.insert("ui-bold".into(), Arc::new(FontData::from_static(INTER_SEMIBOLD)));
-    // egui's bundled fonts are compiled out; Inter covers everything we draw.
-    defs.families.insert(FontFamily::Proportional, vec!["ui".into()]);
-    defs.families.insert(FontFamily::Monospace, vec!["ui".into()]);
-    defs.families.insert(bold(), vec!["ui-bold".into(), "ui".into()]);
+    let mut tail = Vec::new();
+    if fallback {
+        for (i, &(bytes, index)) in system_fallbacks().iter().enumerate() {
+            let name = format!("fallback-{i}");
+            defs.font_data.insert(name.clone(), Arc::new(FontData { index, ..FontData::from_static(bytes) }));
+            tail.push(name);
+        }
+    }
+    // egui's bundled fonts are compiled out; Inter covers Latin, Greek and
+    // Cyrillic, the fallbacks (only when needed) everything else.
+    let family = |first: &[&str]| first.iter().map(|s| s.to_string()).chain(tail.iter().cloned()).collect::<Vec<_>>();
+    defs.families.insert(FontFamily::Proportional, family(&["ui"]));
+    defs.families.insert(FontFamily::Monospace, family(&["ui"]));
+    defs.families.insert(bold(), family(&["ui-bold", "ui"]));
     ctx.set_fonts(defs);
+}
+
+/// Whether `text` has characters Inter can't draw (CJK, Hangul, Thai,
+/// Arabic, Hebrew, Indic, ...): then the system fallback fonts are needed.
+pub fn needs_fallback(text: &str) -> bool {
+    text.chars().any(|c| {
+        let c = c as u32;
+        // Inter: Latin, IPA, Greek, Cyrillic (< U+0530), phonetic and Latin/Greek
+        // extended, punctuation and symbols (U+1D00..U+2E7F); variation selectors.
+        !(c < 0x0530 || (0x1D00..0x2E80).contains(&c) || (0xFE00..0xFE10).contains(&c) || c == 0xFEFF)
+    })
+}
+
+/// System fonts covering other scripts, memory-mapped once: the OS pages in
+/// only the glyphs drawn, and that memory is file-backed, not ours.
+fn system_fallbacks() -> &'static [(&'static [u8], u32)] {
+    static FONTS: std::sync::OnceLock<Vec<(&'static [u8], u32)>> = std::sync::OnceLock::new();
+    FONTS.get_or_init(|| {
+        #[cfg(windows)]
+        let dir = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into())).join("Fonts");
+        #[cfg(windows)]
+        let files: &[&str] =
+            &["msyh.ttc", "malgun.ttf", "Nirmala.ttc", "Nirmala.ttf", "LeelawUI.ttf", "segoeui.ttf", "seguisym.ttf"];
+        #[cfg(target_os = "macos")]
+        let dir = std::path::PathBuf::from("/System/Library/Fonts");
+        #[cfg(target_os = "macos")]
+        let files: &[&str] = &["Hiragino Sans GB.ttc", "AppleSDGothicNeo.ttc", "Supplemental/Arial Unicode.ttf"];
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let dir = std::path::PathBuf::from("/usr/share/fonts");
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let files: &[&str] = &[
+            "opentype/noto/NotoSansCJK-Regular.ttc",
+            "noto-cjk/NotoSansCJK-Regular.ttc",
+            "google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc",
+            "truetype/dejavu/DejaVuSans.ttf",
+            "TTF/DejaVuSans.ttf",
+            "dejavu-sans-fonts/DejaVuSans.ttf",
+        ];
+        files.iter().filter_map(|f| map_file(&dir.join(f))).map(|bytes| (bytes, 0)).collect()
+    })
+}
+
+/// Maps a file read-only for the rest of the process's life.
+#[cfg(windows)]
+fn map_file(path: &std::path::Path) -> Option<&'static [u8]> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY};
+    let file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len() as usize;
+    // SAFETY: a read-only view of a file we opened; it's never unmapped, so
+    // the slice stays valid. Font files aren't modified while in use.
+    unsafe {
+        let mapping = CreateFileMappingW(file.as_raw_handle(), std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null());
+        if mapping.is_null() {
+            return None;
+        }
+        let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+        CloseHandle(mapping); // the view keeps the mapping alive
+        (!view.Value.is_null()).then(|| std::slice::from_raw_parts(view.Value as *const u8, len))
+    }
+}
+
+#[cfg(unix)]
+fn map_file(path: &std::path::Path) -> Option<&'static [u8]> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len() as usize;
+    // SAFETY: as on Windows: read-only, private, never unmapped.
+    unsafe {
+        let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0);
+        (p != libc::MAP_FAILED).then(|| std::slice::from_raw_parts(p as *const u8, len))
+    }
 }
 
 fn default_table() -> toml::Table {

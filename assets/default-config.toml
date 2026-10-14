@@ -17,7 +17,5 @@ sidebar = true
 sidebar_items = ["search", "library", "queue"]
 
 [player]
-# Path to the yt-dlp executable. A plain name is looked up on PATH.
-ytdlp = "yt-dlp"
 # Starting volume, 0-100.
 volume = 80

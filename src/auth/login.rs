@@ -82,12 +82,12 @@ pub fn run() -> ! {
     })
 }
 
-/// Netscape cookie-jar format: understood by yt-dlp and by `session.rs`.
+/// Netscape cookie-jar format, read back by `session.rs`.
 fn write_cookies(cookies: &[wry::cookie::Cookie<'static>]) -> std::io::Result<()> {
     let path = paths::cookies_file();
     let tmp = path.with_extension("tmp");
     let mut out = String::from("# Netscape HTTP Cookie File\n# Written by ytmcross. This is your Google session: keep it private.\n\n");
-    // Session cookies get a far-future expiry so yt-dlp doesn't discard them.
+    // Session cookies get a far-future expiry so they're kept like the rest.
     let far_future = 4_102_444_800i64; // 2100-01-01
     for c in cookies {
         let domain = match c.domain() {

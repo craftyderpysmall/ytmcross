@@ -28,7 +28,7 @@ pub fn theme_file(name: &str) -> PathBuf {
     themes_dir().join(format!("{name}.toml"))
 }
 
-/// Netscape-format cookie jar shared by our API client and yt-dlp.
+/// Netscape-format cookie jar: the Google session.
 pub fn cookies_file() -> PathBuf {
     data_dir().join("cookies.txt")
 }

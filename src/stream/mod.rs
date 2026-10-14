@@ -1,8 +1,7 @@
 //! Turns a video id into a playable audio stream, ideally before it's needed.
 //!
 //! Native path (~200 ms): ask the `player` endpoint for the track's streams
-//! and unscramble the URL in-process (`solver.rs`). yt-dlp (~4 s) is the
-//! fallback when the native path can't (see `ytdlp.rs`).
+//! and unscramble the URL in-process (`solver.rs`).
 //!
 //! Getting ahead of the user:
 //! - rows on screen are resolved in the background and the first 64 KiB of
@@ -16,7 +15,6 @@
 
 mod innertube;
 mod solver;
-mod ytdlp;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -25,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::player;
 use crate::worker::{Notifier, Response};
-use crate::{paths, trace};
+use crate::trace;
 use solver::{Solver, SolverStore};
 
 /// Entry point of the `--build-solver` helper process.
@@ -39,8 +37,6 @@ const MAX_QUEUED: usize = 16;
 const BATCH: usize = 6;
 /// Parallel player requests within a batch.
 const PARALLEL: usize = 3;
-/// After this many refused native URLs in a row, use yt-dlp for the session.
-const MAX_NATIVE_FAILURES: u32 = 2;
 /// Give up building a solver after this many failed attempts (offline, ...).
 const MAX_REFRESH_FAILURES: u32 = 3;
 /// Preloaded start of a likely next play (~4 s of 256 kbps audio).
@@ -53,7 +49,6 @@ const HEAD_BYTES: u64 = 64 * 1024;
 #[derive(PartialEq)]
 struct PreloadJob {
     url: String,
-    native: bool,
     bytes: u64,
 }
 
@@ -67,7 +62,7 @@ pub enum Hint {
 enum Entry {
     Queued,
     Running,
-    Ready { url: String, expires: SystemTime, native: bool },
+    Ready { url: String, expires: SystemTime },
     Failed,
 }
 
@@ -77,7 +72,7 @@ struct State {
     urgent: VecDeque<String>,
     background: VecDeque<String>,
     /// Ids that are likely to be played (or were clicked): they get a bigger
-    /// preload, go first, and are worth a yt-dlp fallback.
+    /// preload and go first.
     likely: HashSet<String>,
     /// Resolved URLs waiting to have their start preloaded.
     preload: VecDeque<PreloadJob>,
@@ -86,11 +81,9 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     wake: Condvar,
-    ytdlp: String,
     out: Notifier,
     agent: ureq::Agent,
     solver: SolverStore,
-    native_failures: AtomicU32,
     refresh_failures: AtomicU32,
 }
 
@@ -99,15 +92,13 @@ pub struct Resolver {
 }
 
 impl Resolver {
-    pub fn new(ytdlp: &str, out: Notifier, agent: ureq::Agent) -> Resolver {
+    pub fn new(out: Notifier, agent: ureq::Agent) -> Resolver {
         let shared = Arc::new(Shared {
             state: Mutex::default(),
             wake: Condvar::new(),
-            ytdlp: ytdlp.to_string(),
             out,
             solver: SolverStore::new(agent.clone()),
             agent,
-            native_failures: AtomicU32::new(0),
             refresh_failures: AtomicU32::new(0),
         });
         for (name, urgent) in [("resolve-now", true), ("resolve-ahead", false)] {
@@ -133,8 +124,7 @@ impl Resolver {
         let mut s = self.shared.state.lock().unwrap();
         s.likely.insert(id.to_string());
         match s.cache.get(id) {
-            // Already being fetched: its result will arrive on its own (and,
-            // being likely now, it gets the yt-dlp fallback if needed).
+            // Already being fetched: its result will arrive on its own.
             Some(Entry::Running) => return,
             Some(Entry::Ready { url, expires, .. }) if fresh(*expires) => {
                 let url = url.clone();
@@ -153,7 +143,7 @@ impl Resolver {
 
     /// Forgets everything resolved so far: stream URLs belong to the account
     /// that fetched them (Premium gets other formats), so after signing in or
-    /// out they must be fetched again. Also gives the native path a fresh start.
+    /// out they must be fetched again.
     pub fn reset(&self) {
         let mut s = self.shared.state.lock().unwrap();
         s.cache.retain(|_, e| matches!(e, Entry::Running));
@@ -162,7 +152,6 @@ impl Resolver {
         s.preload.clear();
         drop(s);
         player::clear_preloaded();
-        self.shared.native_failures.store(0, Ordering::Relaxed);
         self.shared.refresh_failures.store(0, Ordering::Relaxed);
     }
 
@@ -179,9 +168,9 @@ impl Resolver {
             s.likely.insert(id.to_string());
         }
         match s.cache.get(id) {
-            Some(Entry::Ready { url, expires, native }) if fresh(*expires) => {
+            Some(Entry::Ready { url, expires }) if fresh(*expires) => {
                 if likely && !player::is_preloaded(url) {
-                    let job = PreloadJob { url: url.clone(), native: *native, bytes: LIKELY_BYTES };
+                    let job = PreloadJob { url: url.clone(), bytes: LIKELY_BYTES };
                     s.preload.retain(|j| j.url != job.url);
                     s.preload.push_front(job);
                     self.shared.wake.notify_all();
@@ -227,16 +216,9 @@ fn expiry(url: &str) -> SystemTime {
 }
 
 impl Shared {
-    fn native_enabled(&self) -> bool {
-        self.native_failures.load(Ordering::Relaxed) < MAX_NATIVE_FAILURES
-    }
-
-    /// Resolves ids natively; one result per id.
-    fn resolve_native(&self, ids: &[String]) -> Vec<(String, Result<String, String>)> {
+    /// Resolves ids; one result per id.
+    fn resolve(&self, ids: &[String]) -> Vec<(String, Result<String, String>)> {
         let fail_all = |e: &str| ids.iter().map(|id| (id.clone(), Err(e.to_string()))).collect();
-        if !self.native_enabled() {
-            return fail_all("native resolving disabled");
-        }
         let Some((sts, bytecode)) = self.solver.ready() else {
             return fail_all("solver not ready");
         };
@@ -280,11 +262,9 @@ impl Shared {
         results
     }
 
-    /// Downloads a URL's first chunk into the player's preload cache. For
-    /// native URLs a refusal (403) means our unscrambling is wrong: the
-    /// solver is rechecked and, if it keeps happening, native resolving is
-    /// switched off for this session.
-    fn preload(&self, url: &str, native: bool, bytes: u64) -> bool {
+    /// Downloads a URL's first chunk into the player's preload cache. A
+    /// refusal (403) means our unscrambling is wrong: the solver is rebuilt.
+    fn preload(&self, url: &str, bytes: u64) -> bool {
         if player::is_preloaded(url) {
             return true;
         }
@@ -292,15 +272,11 @@ impl Shared {
         match player::preload_first_chunk(&self.agent, url, bytes) {
             Ok(()) => {
                 trace!("preload: {} KiB in {:?}", bytes / 1024, t.elapsed());
-                if native {
-                    self.native_failures.store(0, Ordering::Relaxed);
-                }
                 true
             }
             Err(e) => {
                 trace!("preload: failed after {:?}: {e}", t.elapsed());
-                if native && e.contains("403") {
-                    self.native_failures.fetch_add(1, Ordering::Relaxed);
+                if e.contains("403") {
                     self.solver.invalidate();
                     self.wake.notify_all(); // the background thread rechecks the solver
                 }
@@ -311,16 +287,16 @@ impl Shared {
 
     /// Records a result and queues its audio start for preloading (likely
     /// plays first and bigger), unless the caller already preloaded it.
-    fn finish(&self, id: &str, result: &Result<String, String>, native: bool, queue_preload: bool) {
+    fn finish(&self, id: &str, result: &Result<String, String>, queue_preload: bool) {
         let mut s = self.state.lock().unwrap();
         match result {
             Ok(url) => {
-                s.cache.insert(id.to_string(), Entry::Ready { url: url.clone(), expires: expiry(url), native });
+                s.cache.insert(id.to_string(), Entry::Ready { url: url.clone(), expires: expiry(url) });
                 if queue_preload && !s.preload.iter().any(|j| &j.url == url) {
                     if s.likely.contains(id) {
-                        s.preload.push_front(PreloadJob { url: url.clone(), native, bytes: LIKELY_BYTES });
+                        s.preload.push_front(PreloadJob { url: url.clone(), bytes: LIKELY_BYTES });
                     } else {
-                        s.preload.push_back(PreloadJob { url: url.clone(), native, bytes: HEAD_BYTES });
+                        s.preload.push_back(PreloadJob { url: url.clone(), bytes: HEAD_BYTES });
                     }
                 }
             }
@@ -328,17 +304,6 @@ impl Shared {
                 s.cache.insert(id.to_string(), Entry::Failed);
             }
         }
-    }
-
-    fn ytdlp_fallback(&self, ids: &[String], jar_name: &str) -> HashMap<String, String> {
-        let jar = paths::data_dir().join(jar_name);
-        let mut found = HashMap::new();
-        let t = Instant::now();
-        let _ = ytdlp::resolve(&self.ytdlp, &jar, ids, |id, url| {
-            found.insert(id.to_string(), url);
-        });
-        trace!("yt-dlp: {}/{} resolved in {:?}", found.len(), ids.len(), t.elapsed());
-        found
     }
 }
 
@@ -356,22 +321,16 @@ fn urgent_worker(shared: &Shared) {
             }
         };
         let t = Instant::now();
-        let ids = [id.clone()];
-        let mut native = true;
-        let mut result = shared.resolve_native(&ids).pop().map_or(Err("no result".into()), |(_, r)| r);
-        // Verify a native URL by preloading its start: the player needs those
+        let mut result = shared.resolve(std::slice::from_ref(&id)).pop().map_or(Err("no result".into()), |(_, r)| r);
+        // Verify the URL by preloading its start: the player needs those
         // bytes first anyway, so this costs nothing extra.
         if let Ok(url) = &result
-            && !shared.preload(url, true, LIKELY_BYTES)
+            && !shared.preload(url, LIKELY_BYTES)
         {
-            result = Err("native URL refused".into());
+            result = Err("stream refused".into());
         }
-        if result.is_err() {
-            native = false;
-            result = shared.ytdlp_fallback(&ids, "ytdlp-cookies-now.txt").remove(&id).ok_or_else(|| "no playable stream".to_string());
-        }
-        trace!("urgent: {id} ready in {:?} ({})", t.elapsed(), if native { "native" } else { "yt-dlp" });
-        shared.finish(&id, &result, native, false);
+        trace!("urgent: {id} done in {:?} ({})", t.elapsed(), if result.is_ok() { "ok" } else { "failed" });
+        shared.finish(&id, &result, false);
         shared.out.send(Response::Resolved { video_id: id, result });
     }
 }
@@ -390,10 +349,7 @@ fn background_worker(shared: &Shared) {
                 if let Some(job) = s.preload.pop_front() {
                     break Work::Preload(job);
                 }
-                if shared.solver.ready().is_none()
-                    && shared.native_enabled()
-                    && shared.refresh_failures.load(Ordering::Relaxed) < MAX_REFRESH_FAILURES
-                {
+                if shared.solver.ready().is_none() && shared.refresh_failures.load(Ordering::Relaxed) < MAX_REFRESH_FAILURES {
                     break Work::Refresh;
                 }
                 let batch: Vec<String> = std::iter::from_fn(|| s.background.pop_front()).take(BATCH).collect();
@@ -408,7 +364,7 @@ fn background_worker(shared: &Shared) {
         };
         match work {
             Work::Preload(job) => {
-                shared.preload(&job.url, job.native, job.bytes);
+                shared.preload(&job.url, job.bytes);
             }
             Work::Refresh => match shared.solver.refresh(true) {
                 Ok(()) => shared.refresh_failures.store(0, Ordering::Relaxed),
@@ -421,30 +377,14 @@ fn background_worker(shared: &Shared) {
             Work::Batch(ids) => {
                 let _ = shared.solver.refresh(false); // cheap unless the version check is due
                 let t = Instant::now();
-                let mut failed = Vec::new();
-                for (id, result) in shared.resolve_native(&ids) {
-                    match result {
-                        Ok(url) => shared.finish(&id, &Ok(url), true, true),
-                        Err(_) => failed.push(id),
-                    }
-                }
-                // Only tracks likely to be played are worth a slow yt-dlp run;
-                // the rest are simply forgotten and retried if hinted again.
-                let (fallback, forget): (Vec<String>, Vec<String>) = {
-                    let s = shared.state.lock().unwrap();
-                    failed.into_iter().partition(|id| s.likely.contains(id))
-                };
-                if !forget.is_empty() {
-                    let mut s = shared.state.lock().unwrap();
-                    for id in &forget {
-                        s.cache.remove(id);
-                    }
-                }
-                if !fallback.is_empty() {
-                    let mut found = shared.ytdlp_fallback(&fallback, "ytdlp-cookies-ahead.txt");
-                    for id in &fallback {
-                        let r = found.remove(id).ok_or_else(|| "no playable stream".to_string());
-                        shared.finish(id, &r, false, true);
+                for (id, result) in shared.resolve(&ids) {
+                    // A failed likely play is recorded, so a click waiting on it
+                    // hears back; others are forgotten (a later hint retries).
+                    let likely = shared.state.lock().unwrap().likely.contains(&id);
+                    if result.is_ok() || likely {
+                        shared.finish(&id, &result, true);
+                    } else {
+                        shared.state.lock().unwrap().cache.remove(&id);
                     }
                 }
                 trace!("background: batch of {} in {:?}", ids.len(), t.elapsed());

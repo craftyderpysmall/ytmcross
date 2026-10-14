@@ -6,10 +6,11 @@
 //! calls it while the window is visible and something changed.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use egui::{CentralPanel, Frame, Margin, Panel, Ui};
+use egui::{CentralPanel, FontData, Frame, Margin, Panel, Ui};
 
 use super::images::Images;
 use super::{bar, views};
@@ -168,6 +169,10 @@ pub struct App {
     pub config: Config,
     pub theme: Theme,
     font_file: String,
+    /// The theme's own font, kept to rebuild the font set with fallbacks.
+    custom_font: Option<Arc<FontData>>,
+    /// System fonts for scripts Inter lacks are installed (done on first need).
+    fallback_fonts: bool,
     requests: Sender<Request>,
     responses: Receiver<Response>,
     notifier: Notifier,
@@ -228,7 +233,11 @@ pub struct App {
 
 impl App {
     pub fn new(ctx: &egui::Context, config: Config, loaded: theme::Loaded, config_error: Option<String>, signed_in: bool) -> App {
-        theme::install_fonts(ctx, loaded.font);
+        // The track restored from the last session may need the fallback fonts.
+        let last = load_last_played();
+        let fallback_fonts = last.as_ref().is_some_and(|(t, _)| track_needs_fallback(t));
+        let custom_font = loaded.font.map(|bytes| Arc::new(FontData::from_owned(bytes)));
+        theme::install_fonts(ctx, custom_font.clone(), fallback_fonts);
         loaded.theme.apply(ctx);
 
         let agent = client::agent();
@@ -238,7 +247,7 @@ impl App {
         let mut notice = config_error.or(loaded.error);
         let player_notifier = notifier.clone();
         // Shares the agent (and its kept-alive connection to YouTube Music) with the API worker.
-        let resolver = Resolver::new(&config.player.ytdlp, notifier.clone(), agent.clone());
+        let resolver = Resolver::new(notifier.clone(), agent.clone());
         let player = match Player::spawn(&config.player, &config.equalizer, config.pitch.semitones, agent, move |e| {
             player_notifier.send(Response::Player(e))
         }) {
@@ -266,7 +275,7 @@ impl App {
             duration: 0.0,
             volume: config.player.volume.min(100) as f32 / 100.0,
         };
-        if let Some((track, at)) = load_last_played() {
+        if let Some((track, at)) = last {
             playback.paused = true;
             playback.duration = track.duration.as_deref().map_or(0.0, parse_clock);
             playback.set_position(at);
@@ -278,6 +287,8 @@ impl App {
 
         App {
             font_file: loaded.theme.font_file.clone(),
+            custom_font,
+            fallback_fonts,
             eq: config.equalizer.clone(),
             pitch: config.pitch.semitones,
             playback,
@@ -899,7 +910,18 @@ impl App {
 
     // ---- messages ---------------------------------------------------------
 
+    /// Adds the system fonts for other scripts (once; rebuilds the atlas).
+    fn use_fallback_fonts(&mut self, ctx: &egui::Context) {
+        if !self.fallback_fonts {
+            self.fallback_fonts = true;
+            theme::install_fonts(ctx, self.custom_font.clone(), true);
+        }
+    }
+
     fn handle(&mut self, ctx: &egui::Context, response: Response) {
+        if !self.fallback_fonts && response_needs_fallback(&response) {
+            self.use_fallback_fonts(ctx);
+        }
         match response {
             Response::Search { query, result } => {
                 if query == self.search.query.trim() {
@@ -990,7 +1012,8 @@ impl App {
             Response::Reloaded { config, theme: loaded, config_error } => {
                 if loaded.theme.font_file != self.font_file {
                     self.font_file = loaded.theme.font_file.clone();
-                    theme::install_fonts(ctx, loaded.font);
+                    self.custom_font = loaded.font.map(|bytes| Arc::new(FontData::from_owned(bytes)));
+                    theme::install_fonts(ctx, self.custom_font.clone(), self.fallback_fonts);
                 }
                 loaded.theme.apply(ctx);
                 self.theme = loaded.theme;
@@ -1148,6 +1171,10 @@ impl App {
         self.logic(&ui.ctx().clone());
         let ctx = ui.ctx().clone();
         self.handle_keys(&ctx);
+        // Typed or pasted text in another script: get its fonts right away.
+        if !self.fallback_fonts && theme::needs_fallback(&self.search.query) {
+            self.use_fallback_fonts(&ctx);
+        }
         let c = self.theme.colors.clone();
         let pad = self.theme.padding.clamp(0.0, 60.0) as i8;
 
@@ -1191,6 +1218,25 @@ impl App {
             let frac = self.playback.position().fract();
             ctx.request_repaint_after(Duration::from_secs_f64((1.0 - frac).max(0.05)));
         }
+    }
+}
+
+fn track_needs_fallback(t: &Track) -> bool {
+    theme::needs_fallback(&t.title) || theme::needs_fallback(&t.artists) || t.album.as_deref().is_some_and(theme::needs_fallback)
+}
+
+/// Whether a response carries text Inter can't draw.
+fn response_needs_fallback(response: &Response) -> bool {
+    let lists = |l: &[Playlist]| l.iter().any(|p| theme::needs_fallback(&p.title) || theme::needs_fallback(&p.subtitle));
+    match response {
+        Response::Search { result: Ok(tracks), .. } | Response::PlaylistPage { tracks, .. } | Response::Radio { tracks, .. } => {
+            tracks.iter().any(track_needs_fallback)
+        }
+        Response::SearchAlbums { albums, .. } | Response::Library { result: Ok(albums), .. } => lists(albums),
+        Response::Artist { result: Ok(a), .. } => {
+            theme::needs_fallback(&a.name) || a.songs.iter().any(track_needs_fallback) || lists(&a.albums) || lists(&a.singles)
+        }
+        _ => false,
     }
 }
 

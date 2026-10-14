@@ -318,16 +318,16 @@ pub fn nav_item(ui: &mut Ui, theme: &Theme, label: &str, selected: bool) -> Resp
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// Rounded "pill" button, filled with the accent color.
+/// Rounded "pill" button: accent fill, label in the text color.
 pub fn pill(ui: &mut Ui, theme: &Theme, label: &str) -> Response {
     let font = title_font(theme);
-    let g = line(ui, label, font, theme.colors.background, f32::INFINITY);
+    let g = line(ui, label, font, theme.colors.text, f32::INFINITY);
     let size = g.size() + vec2(28.0, 14.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let t = ease(ui, resp.id.with("hover"), resp.hovered());
     let fill = theme.colors.accent.gamma_multiply(0.85 + 0.15 * t);
     ui.painter().rect_filled(rect.expand(t * 1.5), CornerRadius::same(255), fill);
-    ui.painter().galley(rect.center() - g.size() / 2.0, g, theme.colors.background);
+    ui.painter().galley(rect.center() - g.size() / 2.0, g, theme.colors.text);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -361,7 +361,7 @@ pub fn icon_button(ui: &Ui, theme: &Theme, rect: Rect, id: Id, icon: Icon, prima
     let p = ui.painter();
     let fg = if primary {
         p.circle_filled(center, r, c.accent);
-        c.background
+        c.text
     } else {
         p.circle_filled(center, r, c.hover.gamma_multiply(t));
         c.text_dim.lerp_to_gamma(c.text, t)

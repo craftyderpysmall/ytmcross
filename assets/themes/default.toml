@@ -9,7 +9,7 @@
 [colors]
 background = "#030303"   # main content area
 panel      = "#0f0f0f"   # sidebar and now-playing bar
-text       = "#ffffff"   # primary text
+text       = "#ffffff"   # primary text, and labels on accent buttons
 text_dim   = "#aaaaaa"   # secondary text (artists, durations)
 accent     = "#ff0033"   # highlights, progress bar, play button
 hover      = "#1f1f1f"   # row / button hover background

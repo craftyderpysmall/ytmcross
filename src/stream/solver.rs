@@ -23,8 +23,9 @@ use rquickjs::{Context, Function, Object, Runtime, qjs};
 
 use crate::{paths, trace};
 
-const EJS_LIB: &str = include_str!("../../assets/ejs/yt.solver.lib.min.js");
-const EJS_CORE: &str = include_str!("../../assets/ejs/yt.solver.core.min.js");
+// yt-dlp's solver scripts, deflated by build.rs (see `inflate`).
+const EJS_LIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/yt.solver.lib.min.js.deflate"));
+const EJS_CORE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/yt.solver.core.min.js.deflate"));
 /// Bytecode is only valid for the QuickJS build that wrote it.
 const BYTECODE_TAG: &str = "qjs014";
 /// How long a known player version is trusted before checking again.
@@ -187,7 +188,7 @@ fn build(version: &str) -> Result<(), String> {
         let t = Instant::now();
         let attempt = preprocess(&player).and_then(|pre| compile(&pre)).and_then(|bc| {
             // Validate before saving: `n` (needed by every stream) must run.
-            // A broken `sig` shows up as a refused URL and falls back to yt-dlp.
+            // A broken `sig` shows up as a refused URL, which rebuilds the solver.
             let solver = Solver::from_bytecode(&bc)?;
             solver.n("ytmcrossprobe123")?;
             Ok(bc)
@@ -415,15 +416,21 @@ fn preprocess_official(player: &str) -> Result<String, String> {
             rquickjs::Error::Exception => format!("solver: {:?}", ctx.catch()),
             e => format!("solver: {e}"),
         };
-        ctx.eval::<(), _>(EJS_LIB).map_err(fail)?;
+        ctx.eval::<(), _>(inflate(EJS_LIB)?).map_err(fail)?;
         ctx.eval::<(), _>("globalThis.meriyah = lib.meriyah; globalThis.astring = lib.astring;").map_err(fail)?;
-        ctx.eval::<(), _>(EJS_CORE).map_err(fail)?;
+        ctx.eval::<(), _>(inflate(EJS_CORE)?).map_err(fail)?;
         ctx.globals().set("__player", player).map_err(fail)?;
         let out: Object = ctx
             .eval("jsc({type: 'player', player: __player, requests: [], output_preprocessed: true})")
             .map_err(fail)?;
         out.get::<_, String>("preprocessed_player").map_err(|_| "solver produced no output".to_string())
     })
+}
+
+fn inflate(data: &[u8]) -> Result<String, String> {
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut flate2::read::DeflateDecoder::new(data), &mut text).map_err(|e| e.to_string())?;
+    Ok(text)
 }
 
 /// Compiles the preprocessed player to stripped QuickJS bytecode.
@@ -469,5 +476,11 @@ mod tests {
         assert_eq!(signature_timestamp("a,signatureTimestamp:20737,b"), Some(20737));
         assert_eq!(signature_timestamp("x=1;sts:123;y={sts:20500}"), Some(20500));
         assert_eq!(signature_timestamp("nothing here"), None);
+    }
+
+    #[test]
+    fn bundled_scripts_inflate_to_the_originals() {
+        assert_eq!(inflate(EJS_LIB).unwrap(), include_str!("../../assets/ejs/yt.solver.lib.min.js"));
+        assert_eq!(inflate(EJS_CORE).unwrap(), include_str!("../../assets/ejs/yt.solver.core.min.js"));
     }
 }

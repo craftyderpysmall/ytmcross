@@ -19,6 +19,7 @@ winit = "0.30.13"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+flate2 = "1.1.10"
 sha1 = "0.11.0"
 tao = "0.37.1"
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
@@ -30,6 +31,9 @@ rquickjs = { version = "0.14.0", features = ["allocator"] }
 # Native (SWC) preprocessing of YouTube's player script; pinned to a tested commit.
 # Only its SWC preprocessor is used: `external` is the one runtime feature with no dependencies.
 ytdlp-ejs = { git = "https://github.com/anenasa/ytdlp-ejs", rev = "9d6fce40550e4846dd435498ed976e5488cdc693", default-features = false, features = ["external"] }
+
+[build-dependencies]
+flate2 = "1.1.10"
 
 [profile.release]
 opt-level = 3
@@ -62,5 +66,5 @@ opt-level = "s"
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2.190"

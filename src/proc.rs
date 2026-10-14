@@ -1,4 +1,4 @@
-//! Child processes (yt-dlp): no console window, and never outliving us.
+//! Child processes (the solver builder): no console window, and never outliving us.
 
 use std::process::{Child, Command};
 

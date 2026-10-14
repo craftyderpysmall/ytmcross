@@ -11,16 +11,9 @@ A minimal, fast, native YouTube Music client written in Rust. No Electron and no
 
 ## Requirements
 
-None to play music. Optionally, `yt-dlp` and a JavaScript runtime for it (`deno`) on your PATH: ytmcross falls back to them if YouTube changes something its native resolver can't handle yet.
+None: no external programs are needed to play music.
 
 To build on Linux: `libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev` (Debian/Ubuntu) or `webkit2gtk4.1-devel gtk3-devel alsa-lib-devel` (Fedora).
-
-| OS | Optional fallback |
-|---|---|
-| Windows | `scoop install yt-dlp deno` |
-| macOS | `brew install yt-dlp deno` |
-| Arch | `pacman -S yt-dlp deno` |
-| Debian/Ubuntu/Fedora | `yt-dlp` from your package manager, plus deno |
 
 ## Build
 
