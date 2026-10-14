@@ -6,6 +6,7 @@ mod auth;
 mod config;
 mod paths;
 mod player;
+mod pool;
 mod proc;
 mod stream;
 mod theme;

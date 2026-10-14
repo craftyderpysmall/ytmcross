@@ -18,11 +18,11 @@ mod solver;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::session::Session;
-use crate::player;
+use crate::{player, pool};
 use crate::worker::{Notifier, Response};
 use crate::{paths, trace};
 use solver::{Solver, SolverStore};
@@ -77,6 +77,9 @@ struct State {
     likely: HashSet<String>,
     /// Resolved URLs waiting to have their start preloaded.
     preload: VecDeque<PreloadJob>,
+    /// The worker threads exist only while there's work (see `start`).
+    urgent_running: bool,
+    background_running: bool,
 }
 
 struct Shared {
@@ -105,13 +108,8 @@ impl Resolver {
             agent,
             refresh_failures: AtomicU32::new(0),
         });
-        for (name, urgent) in [("resolve-now", true), ("resolve-ahead", false)] {
-            let shared = shared.clone();
-            std::thread::Builder::new()
-                .name(name.into())
-                .spawn(move || if urgent { urgent_worker(&shared) } else { background_worker(&shared) })
-                .expect("failed to start resolver thread");
-        }
+        // Checks the player version (and builds a solver if needed) right away.
+        start(&shared, shared.state.lock().unwrap());
         Resolver { shared }
     }
 
@@ -142,7 +140,7 @@ impl Resolver {
         s.urgent.retain(|q| q != id);
         s.cache.insert(id.to_string(), Entry::Queued);
         s.urgent.push_back(id.to_string());
-        self.shared.wake.notify_all();
+        start(&self.shared, s);
     }
 
     /// Forgets everything resolved so far: stream URLs belong to the account
@@ -178,7 +176,7 @@ impl Resolver {
                     let job = PreloadJob { url: url.clone(), bytes: LIKELY_BYTES };
                     s.preload.retain(|j| j.url != job.url);
                     s.preload.push_front(job);
-                    self.shared.wake.notify_all();
+                    start(&self.shared, s);
                 }
                 return;
             }
@@ -203,8 +201,26 @@ impl Resolver {
                 s.cache.remove(&dropped);
             }
         }
-        self.shared.wake.notify_all();
+        start(&self.shared, s);
     }
+}
+
+/// Wakes the workers, first starting whichever has work but isn't running:
+/// they exit after a few idle seconds (a thread that ran the solver would
+/// otherwise keep its grown stack).
+fn start(shared: &Arc<Shared>, mut s: MutexGuard<State>) {
+    let spawn = |name: &str, work: fn(&Arc<Shared>)| {
+        let shared = shared.clone();
+        std::thread::Builder::new().name(name.into()).spawn(move || work(&shared)).is_ok()
+    };
+    if !s.urgent.is_empty() && !s.urgent_running {
+        s.urgent_running = spawn("resolve-now", urgent_worker);
+    }
+    if !s.background_running && (!s.background.is_empty() || !s.preload.is_empty() || shared.needs_refresh()) {
+        s.background_running = spawn("resolve-ahead", background_worker);
+    }
+    drop(s);
+    shared.wake.notify_all();
 }
 
 fn fresh(expires: SystemTime) -> bool {
@@ -221,6 +237,11 @@ fn expiry(url: &str) -> SystemTime {
 }
 
 impl Shared {
+    /// No solver for the current player yet, and building one may still work.
+    fn needs_refresh(&self) -> bool {
+        self.solver.ready().is_none() && self.refresh_failures.load(Ordering::Relaxed) < MAX_REFRESH_FAILURES
+    }
+
     /// Resolves ids; one result per id.
     fn resolve(&self, ids: &[String]) -> Vec<(String, Result<String, String>)> {
         let fail_all = |e: &str| ids.iter().map(|id| (id.clone(), Err(e.to_string()))).collect();
@@ -316,7 +337,7 @@ impl Shared {
 }
 
 /// Clicks: one at a time, never behind background work.
-fn urgent_worker(shared: &Shared) {
+fn urgent_worker(shared: &Arc<Shared>) {
     loop {
         let id = {
             let mut s = shared.state.lock().unwrap();
@@ -325,7 +346,12 @@ fn urgent_worker(shared: &Shared) {
                     s.cache.insert(id.clone(), Entry::Running);
                     break id;
                 }
-                s = shared.wake.wait(s).unwrap();
+                let (guard, wait) = shared.wake.wait_timeout(s, pool::IDLE).unwrap();
+                s = guard;
+                if wait.timed_out() && s.urgent.is_empty() {
+                    s.urgent_running = false;
+                    return;
+                }
             }
         };
         let t = Instant::now();
@@ -336,6 +362,7 @@ fn urgent_worker(shared: &Shared) {
             && !shared.preload(url, LIKELY_BYTES)
         {
             result = Err("stream refused".into());
+            start(shared, shared.state.lock().unwrap()); // a refusal may need a new solver
         }
         trace!("urgent: {id} done in {:?} ({})", t.elapsed(), if result.is_ok() { "ok" } else { "failed" });
         shared.finish(&id, &result, false);
@@ -344,7 +371,7 @@ fn urgent_worker(shared: &Shared) {
 }
 
 /// Everything ahead of the user: solver upkeep, batches, preloading.
-fn background_worker(shared: &Shared) {
+fn background_worker(shared: &Arc<Shared>) {
     enum Work {
         Preload(PreloadJob),
         Refresh,
@@ -357,7 +384,7 @@ fn background_worker(shared: &Shared) {
                 if let Some(job) = s.preload.pop_front() {
                     break Work::Preload(job);
                 }
-                if shared.solver.ready().is_none() && shared.refresh_failures.load(Ordering::Relaxed) < MAX_REFRESH_FAILURES {
+                if shared.needs_refresh() {
                     break Work::Refresh;
                 }
                 let batch: Vec<String> = std::iter::from_fn(|| s.background.pop_front()).take(BATCH).collect();
@@ -367,7 +394,12 @@ fn background_worker(shared: &Shared) {
                     }
                     break Work::Batch(batch);
                 }
-                s = shared.wake.wait(s).unwrap();
+                let (guard, wait) = shared.wake.wait_timeout(s, pool::IDLE).unwrap();
+                s = guard;
+                if wait.timed_out() && s.preload.is_empty() && s.background.is_empty() && !shared.needs_refresh() {
+                    s.background_running = false;
+                    return;
+                }
             }
         };
         match work {

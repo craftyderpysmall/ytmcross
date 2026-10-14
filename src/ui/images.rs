@@ -3,12 +3,14 @@
 //! screen for a while, so memory stays flat no matter how far you scroll.
 
 use std::collections::HashMap;
-use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{ColorImage, TextureHandle, TextureId, TextureOptions};
 
+use crate::pool::Pool;
+
+/// Art fetched in parallel (threads exist only while there's art to load).
 const WORKERS: usize = 4;
 const FADE_IN: f32 = 0.2;
 const KEEP_UNUSED: Duration = Duration::from_secs(45);
@@ -29,37 +31,26 @@ type Store = Arc<Mutex<HashMap<String, Slot>>>;
 
 pub struct Images {
     store: Store,
-    jobs: Sender<(String, u32)>,
+    jobs: Pool<(String, u32)>,
     last_evict: Instant,
 }
 
 impl Images {
     pub fn new(ctx: &egui::Context, agent: ureq::Agent) -> Images {
         let store: Store = Arc::default();
-        let (jobs, rx) = mpsc::channel::<(String, u32)>();
-        let rx = Arc::new(Mutex::new(rx));
-        for i in 0..WORKERS {
-            let (rx, store, ctx, agent) = (rx.clone(), store.clone(), ctx.clone(), agent.clone());
-            std::thread::Builder::new()
-                .name(format!("art-{i}"))
-                .spawn(move || {
-                    loop {
-                        let Ok((url, px)) = rx.lock().unwrap().recv() else { return };
-                        let state = match fetch(&agent, &url, px) {
-                            Some(image) => State::Ready {
-                                texture: ctx.load_texture(&url, image, TextureOptions::LINEAR),
-                                loaded: Instant::now(),
-                            },
-                            None => State::Failed,
-                        };
-                        if let Some(slot) = store.lock().unwrap().get_mut(&url) {
-                            slot.state = state;
-                        }
-                        ctx.request_repaint();
-                    }
-                })
-                .expect("failed to start art worker");
-        }
+        let (slots, ctx) = (store.clone(), ctx.clone());
+        let jobs = Pool::new("art", WORKERS, move |(url, px): (String, u32), _: &Pool<_>| {
+            let state = match fetch(&agent, &url, px) {
+                Some(image) => {
+                    State::Ready { texture: ctx.load_texture(&url, image, TextureOptions::LINEAR), loaded: Instant::now() }
+                }
+                None => State::Failed,
+            };
+            if let Some(slot) = slots.lock().unwrap().get_mut(&url) {
+                slot.state = state;
+            }
+            ctx.request_repaint();
+        });
         Images { store, jobs, last_evict: Instant::now() }
     }
 
@@ -70,7 +61,7 @@ impl Images {
         let now = Instant::now();
         let mut store = self.store.lock().unwrap();
         let slot = store.entry(key.clone()).or_insert_with(|| {
-            let _ = self.jobs.send((key, px));
+            self.jobs.push((key, px));
             Slot { state: State::Pending, last_used: now }
         });
         slot.last_used = now;

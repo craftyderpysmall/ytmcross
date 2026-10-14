@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use egui::{CentralPanel, FontData, Frame, Margin, Panel, Ui};
@@ -20,6 +20,7 @@ use crate::auth;
 use crate::config::{BarPosition, Config, EqualizerConfig};
 use crate::paths;
 use crate::player::{Player, PlayerEvent};
+use crate::pool::Pool;
 use crate::stream::{Hint, Resolver};
 use crate::trace;
 use crate::theme::{self, Theme};
@@ -176,7 +177,7 @@ pub struct App {
     custom_font: Option<Arc<FontData>>,
     /// System fonts for scripts Inter lacks are installed (done on first need).
     fallback_fonts: bool,
-    requests: Sender<Request>,
+    requests: Pool<Request>,
     responses: Receiver<Response>,
     notifier: Notifier,
     player: Option<Player>,
@@ -265,9 +266,9 @@ impl App {
 
         let view = config.layout.sidebar_items.iter().find_map(|n| View::from_name(n)).unwrap_or(View::Library);
         if signed_in {
-            let _ = requests.send(Request::Library { albums: false });
+            requests.push(Request::Library { albums: false });
         }
-        let _ = requests.send(Request::ListThemes);
+        requests.push(Request::ListThemes);
 
         // The track playing at the last exit comes back paused where it was.
         let mut queue = Queue::default();
@@ -381,7 +382,7 @@ impl App {
         } else {
             self.library_loading = true;
         }
-        let _ = self.requests.send(Request::Library { albums });
+        self.requests.push(Request::Library { albums });
     }
 
     /// Moves the current page onto the Back history.
@@ -406,7 +407,7 @@ impl App {
                 // Left before it finished loading: its remaining pages were dropped.
                 if pl.loading {
                     pl.tracks.clear();
-                    let _ = self.requests.send(Request::Playlist(pl.meta.clone()));
+                    self.requests.push(Request::Playlist(pl.meta.clone()));
                 }
                 self.playlist = Some(pl);
                 self.drag = None;
@@ -414,7 +415,7 @@ impl App {
             }
             Some(Page::Artist(a)) => {
                 if a.artist.is_none() {
-                    let _ = self.requests.send(Request::Artist(a.id.clone()));
+                    self.requests.push(Request::Artist(a.id.clone()));
                 }
                 self.artist = Some(a);
                 self.set_view(ctx, View::Artist);
@@ -441,7 +442,7 @@ impl App {
         if self.view == View::Playlist && self.playlist.as_ref().is_some_and(|p| p.meta.id == meta.id) {
             return;
         }
-        let _ = self.requests.send(Request::Playlist(meta.clone()));
+        self.requests.push(Request::Playlist(meta.clone()));
         self.push_history();
         self.playlist = Some(PlaylistState { meta, header: Header::default(), tracks: Vec::new(), loading: true, autoplay });
         self.drag = None;
@@ -467,7 +468,7 @@ impl App {
         if self.view == View::Artist && self.artist.as_ref().is_some_and(|a| a.id == id) {
             return;
         }
-        let _ = self.requests.send(Request::Artist(id.to_string()));
+        self.requests.push(Request::Artist(id.to_string()));
         self.push_history();
         self.artist = Some(ArtistState { id: id.to_string(), artist: None });
         self.set_view(ctx, View::Artist);
@@ -478,22 +479,22 @@ impl App {
             pl.tracks.clear();
             pl.loading = true;
             self.drag = None;
-            let _ = self.requests.send(Request::Playlist(pl.meta.clone()));
+            self.requests.push(Request::Playlist(pl.meta.clone()));
         }
     }
 
     // ---- menus ------------------------------------------------------------
 
     pub fn sign_out(&mut self) {
-        let _ = self.requests.send(Request::SignOut);
+        self.requests.push(Request::SignOut);
     }
 
     pub fn list_themes(&self) {
-        let _ = self.requests.send(Request::ListThemes);
+        self.requests.push(Request::ListThemes);
     }
 
     pub fn set_theme(&self, name: &str) {
-        let _ = self.requests.send(Request::SetTheme(name.to_string()));
+        self.requests.push(Request::SetTheme(name.to_string()));
     }
 
     /// Applies equalizer settings at once; `save` also writes config.toml
@@ -503,7 +504,7 @@ impl App {
             player.set_equalizer(&eq);
         }
         if save {
-            let _ = self.requests.send(Request::SaveEqualizer(eq.clone()));
+            self.requests.push(Request::SaveEqualizer(eq.clone()));
         }
         self.eq = eq;
     }
@@ -514,7 +515,7 @@ impl App {
             player.set_pitch(semitones);
         }
         if save {
-            let _ = self.requests.send(Request::SavePitch(semitones));
+            self.requests.push(Request::SavePitch(semitones));
         }
         self.pitch = semitones;
     }
@@ -524,7 +525,7 @@ impl App {
     pub fn create_playlist(&mut self, title: &str) {
         let title = title.trim();
         if !title.is_empty() {
-            let _ = self.requests.send(Request::CreatePlaylist(title.to_string()));
+            self.requests.push(Request::CreatePlaylist(title.to_string()));
         }
         self.new_playlist = None;
     }
@@ -555,7 +556,7 @@ impl App {
             self.history.clear();
             self.view = View::Library;
         }
-        let _ = self.requests.send(Request::DeletePlaylist(playlist));
+        self.requests.push(Request::DeletePlaylist(playlist));
     }
 
     /// Saves (or removes) a playlist or album someone else made.
@@ -564,7 +565,7 @@ impl App {
         if let Some(pl) = self.playlist.as_mut().filter(|p| p.meta.id == list.id) {
             pl.header.save = Some((save_id.clone(), save));
         }
-        let _ = self.requests.send(Request::Save { list, save_id, save });
+        self.requests.push(Request::Save { list, save_id, save });
     }
 
     /// The Save/Remove button on the open page.
@@ -578,7 +579,7 @@ impl App {
     }
 
     pub fn add_to_playlist(&self, playlist: &Playlist, track: &Track) {
-        let _ = self.requests.send(Request::AddToPlaylist {
+        self.requests.push(Request::AddToPlaylist {
             id: playlist.id.clone(),
             title: playlist.title.clone(),
             video_id: track.video_id.clone(),
@@ -600,7 +601,7 @@ impl App {
         };
         pl.tracks.insert(at, track);
         let before = pl.tracks.get(at + 1).and_then(|t| t.set_video_id.clone());
-        let _ = self.requests.send(Request::MoveInPlaylist { id: pl.meta.id.clone(), set_video_id, before });
+        self.requests.push(Request::MoveInPlaylist { id: pl.meta.id.clone(), set_video_id, before });
     }
 
     // ---- likes ------------------------------------------------------------
@@ -617,7 +618,7 @@ impl App {
     pub fn toggle_like(&mut self, track: &Track) {
         let like = !self.is_liked(track);
         self.likes.insert(track.video_id.clone(), like);
-        let _ = self.requests.send(Request::Like { video_id: track.video_id.clone(), like });
+        self.requests.push(Request::Like { video_id: track.video_id.clone(), like });
     }
 
     // ---- misc -------------------------------------------------------------
@@ -627,12 +628,12 @@ impl App {
         if !q.is_empty() {
             self.search.loading = true;
             self.search.albums.clear();
-            let _ = self.requests.send(Request::Search(q));
+            self.requests.push(Request::Search(q));
         }
     }
 
     pub fn reload(&self) {
-        let _ = self.requests.send(Request::Reload);
+        self.requests.push(Request::Reload);
     }
 
     pub fn sign_in(&mut self) {
@@ -819,7 +820,7 @@ impl App {
         if let Some(seed) = seed.map(|t| t.video_id.clone()) {
             self.radio_pending = true;
             self.radio_seed = Some(seed.clone());
-            let _ = self.requests.send(Request::Radio { video_id: seed, autoplay });
+            self.requests.push(Request::Radio { video_id: seed, autoplay });
         }
     }
 
@@ -1056,7 +1057,7 @@ impl App {
                 self.signing_in = false;
                 if ok {
                     self.signed_out = false;
-                    let _ = self.requests.send(Request::ReloadSession);
+                    self.requests.push(Request::ReloadSession);
                     // Streams resolved for the previous account (or none) are stale.
                     self.resolver.reset();
                     self.library = None;

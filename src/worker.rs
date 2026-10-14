@@ -1,11 +1,14 @@
 //! The single background thread that does all network and disk work for the
-//! UI. The UI sends a `Request`, the worker answers with a `Response` and
-//! wakes the UI. Long playlists are fetched one page per request, so a
-//! search typed meanwhile is never stuck behind a 5,000-track download.
+//! UI (it exists only while there are requests, see pool.rs). The UI sends
+//! a `Request`, the worker answers with a `Response` and wakes the UI. Long
+//! playlists are fetched one page per request, so a search typed meanwhile
+//! is never stuck behind a 5,000-track download.
 
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::api::client::{ApiError, Client};
+use crate::pool::Pool;
 use crate::api::models::{Artist, Continuation, Header, Kind, Playlist, Track};
 use crate::auth::session::Session;
 use crate::config::{self, Config, EqualizerConfig};
@@ -87,21 +90,19 @@ impl Notifier {
     }
 }
 
-pub fn spawn(ctx: egui::Context, agent: ureq::Agent) -> (Sender<Request>, Receiver<Response>, Notifier) {
-    let (req_tx, req_rx) = mpsc::channel();
+pub fn spawn(ctx: egui::Context, agent: ureq::Agent) -> (Pool<Request>, Receiver<Response>, Notifier) {
     let (resp_tx, resp_rx) = mpsc::channel();
     let notifier = Notifier { tx: resp_tx, ctx };
-    let worker_notifier = notifier.clone();
-    let requeue = req_tx.clone();
-    std::thread::Builder::new()
-        .name("api-worker".into())
-        .spawn(move || run(req_rx, requeue, worker_notifier, agent))
-        .expect("failed to start worker thread");
-    (req_tx, resp_rx, notifier)
+    let out = notifier.clone();
+    let client = Mutex::new(Client::new(agent, Session::load(&paths::cookies_file())));
+    // One thread: requests are answered in the order they were made.
+    let requests = Pool::new("api-worker", 1, move |request, requests: &Pool<Request>| {
+        handle(&mut client.lock().unwrap(), requests, &out, request);
+    });
+    (requests, resp_rx, notifier)
 }
 
-fn run(requests: Receiver<Request>, requeue: Sender<Request>, out: Notifier, agent: ureq::Agent) {
-    let mut client = Client::new(agent, Session::load(&paths::cookies_file()));
+fn handle(client: &mut Client, requeue: &Pool<Request>, out: &Notifier, request: Request) {
     // Turns an API error into a message for the UI, reporting expired sessions once.
     let err = |e: ApiError| -> String {
         match e {
@@ -116,92 +117,90 @@ fn run(requests: Receiver<Request>, requeue: Sender<Request>, out: Notifier, age
         out.send(Response::Edited { message, refresh_library, refresh_playlist });
     };
 
-    for request in requests {
-        match request {
-            Request::Search(query) => {
-                let result = client.search(&query).map_err(err);
-                let ok = result.is_ok();
-                out.send(Response::Search { query: query.clone(), result });
-                if ok {
-                    let albums = client.search_albums(&query).unwrap_or_default();
-                    out.send(Response::SearchAlbums { query, albums });
-                }
+    match request {
+        Request::Search(query) => {
+            let result = client.search(&query).map_err(err);
+            let ok = result.is_ok();
+            out.send(Response::Search { query: query.clone(), result });
+            if ok {
+                let albums = client.search_albums(&query).unwrap_or_default();
+                out.send(Response::SearchAlbums { query, albums });
             }
-            Request::Library { albums } => out.send(Response::Library { albums, result: client.library(albums).map_err(err) }),
-            Request::Playlist(list) => playlist_page(&client, &requeue, &out, list, None, err),
-            Request::PlaylistMore(list, cont) => playlist_page(&client, &requeue, &out, list, Some(cont), err),
-            Request::Artist(id) => {
-                let result = client.artist(&id).map(Box::new).map_err(err);
-                out.send(Response::Artist { id, result });
-            }
-            Request::Radio { video_id, autoplay } => {
-                let tracks = client.radio(&video_id).map_err(err).unwrap_or_default();
-                out.send(Response::Radio { seed: video_id, tracks, autoplay });
-            }
-            Request::Reload => reload(&out),
-            Request::ReloadSession => client.set_session(Session::load(&paths::cookies_file())),
-            Request::SignOut => {
-                let _ = std::fs::remove_file(paths::cookies_file());
-                let _ = std::fs::write(paths::signed_out_marker(), "");
-                client.set_session(Session::default());
-                out.send(Response::SignedOut);
-            }
-            Request::ListThemes => out.send(Response::Themes(config::list_themes())),
-            Request::SetTheme(name) => match config::save_theme(&name) {
-                Ok(()) => reload(&out),
-                Err(e) => edited(format!("Couldn't save theme: {e}"), false, None),
-            },
-            Request::SaveEqualizer(eq) => {
-                if let Err(e) = config::save_equalizer(&eq) {
-                    edited(format!("Couldn't save equalizer: {e}"), false, None);
-                }
-            }
-            Request::SavePitch(semitones) => {
-                if let Err(e) = config::save_pitch(semitones) {
-                    edited(format!("Couldn't save pitch: {e}"), false, None);
-                }
-            }
-            Request::CreatePlaylist(title) => match client.create_playlist(&title) {
-                Ok(id) => out.send(Response::Created(Playlist {
-                    id,
-                    kind: Kind::Playlist,
-                    title,
-                    subtitle: "Private".into(),
-                    thumb: None,
-                    owned: true,
-                    save_id: None,
-                })),
-                Err(e) => edited(format!("Couldn't create playlist: {}", err(e)), false, None),
-            },
-            Request::DeletePlaylist(list) => match client.delete_playlist(&list.id) {
-                Ok(()) => edited(format!("Deleted \u{201c}{}\u{201d}", list.title), false, None),
-                // The UI already removed it: bring the real library back.
-                Err(e) => edited(format!("Couldn't delete playlist: {}", err(e)), true, None),
-            },
-            Request::AddToPlaylist { id, title, video_id } => match client.add_to_playlist(&id, &video_id) {
-                Ok(()) => edited(format!("Added to \u{201c}{title}\u{201d}"), false, Some(id)),
-                Err(e) => edited(format!("Couldn't add to playlist: {}", err(e)), false, None),
-            },
-            Request::MoveInPlaylist { id, set_video_id, before } => {
-                if let Err(e) = client.move_in_playlist(&id, &set_video_id, before.as_deref()) {
-                    // The local order is now wrong: show the real one again.
-                    edited(format!("Couldn't reorder: {}", err(e)), false, Some(id));
-                }
-            }
-            Request::Like { video_id, like } => {
-                if let Err(e) = client.like(&video_id, like) {
-                    out.send(Response::LikeFailed { video_id, liked: !like, error: err(e) });
-                }
-            }
-            Request::Save { list, save_id, save } => match client.save(&save_id, save) {
-                Ok(()) => {
-                    let verb = if save { "Saved" } else { "Removed" };
-                    edited(format!("{verb} \u{201c}{}\u{201d}", list.title), false, None);
-                }
-                // The UI already changed the library: bring the real one back.
-                Err(e) => edited(format!("Couldn't update library: {}", err(e)), true, None),
-            },
         }
+        Request::Library { albums } => out.send(Response::Library { albums, result: client.library(albums).map_err(err) }),
+        Request::Playlist(list) => playlist_page(client, requeue, out, list, None, err),
+        Request::PlaylistMore(list, cont) => playlist_page(client, requeue, out, list, Some(cont), err),
+        Request::Artist(id) => {
+            let result = client.artist(&id).map(Box::new).map_err(err);
+            out.send(Response::Artist { id, result });
+        }
+        Request::Radio { video_id, autoplay } => {
+            let tracks = client.radio(&video_id).map_err(err).unwrap_or_default();
+            out.send(Response::Radio { seed: video_id, tracks, autoplay });
+        }
+        Request::Reload => reload(out),
+        Request::ReloadSession => client.set_session(Session::load(&paths::cookies_file())),
+        Request::SignOut => {
+            let _ = std::fs::remove_file(paths::cookies_file());
+            let _ = std::fs::write(paths::signed_out_marker(), "");
+            client.set_session(Session::default());
+            out.send(Response::SignedOut);
+        }
+        Request::ListThemes => out.send(Response::Themes(config::list_themes())),
+        Request::SetTheme(name) => match config::save_theme(&name) {
+            Ok(()) => reload(out),
+            Err(e) => edited(format!("Couldn't save theme: {e}"), false, None),
+        },
+        Request::SaveEqualizer(eq) => {
+            if let Err(e) = config::save_equalizer(&eq) {
+                edited(format!("Couldn't save equalizer: {e}"), false, None);
+            }
+        }
+        Request::SavePitch(semitones) => {
+            if let Err(e) = config::save_pitch(semitones) {
+                edited(format!("Couldn't save pitch: {e}"), false, None);
+            }
+        }
+        Request::CreatePlaylist(title) => match client.create_playlist(&title) {
+            Ok(id) => out.send(Response::Created(Playlist {
+                id,
+                kind: Kind::Playlist,
+                title,
+                subtitle: "Private".into(),
+                thumb: None,
+                owned: true,
+                save_id: None,
+            })),
+            Err(e) => edited(format!("Couldn't create playlist: {}", err(e)), false, None),
+        },
+        Request::DeletePlaylist(list) => match client.delete_playlist(&list.id) {
+            Ok(()) => edited(format!("Deleted \u{201c}{}\u{201d}", list.title), false, None),
+            // The UI already removed it: bring the real library back.
+            Err(e) => edited(format!("Couldn't delete playlist: {}", err(e)), true, None),
+        },
+        Request::AddToPlaylist { id, title, video_id } => match client.add_to_playlist(&id, &video_id) {
+            Ok(()) => edited(format!("Added to \u{201c}{title}\u{201d}"), false, Some(id)),
+            Err(e) => edited(format!("Couldn't add to playlist: {}", err(e)), false, None),
+        },
+        Request::MoveInPlaylist { id, set_video_id, before } => {
+            if let Err(e) = client.move_in_playlist(&id, &set_video_id, before.as_deref()) {
+                // The local order is now wrong: show the real one again.
+                edited(format!("Couldn't reorder: {}", err(e)), false, Some(id));
+            }
+        }
+        Request::Like { video_id, like } => {
+            if let Err(e) = client.like(&video_id, like) {
+                out.send(Response::LikeFailed { video_id, liked: !like, error: err(e) });
+            }
+        }
+        Request::Save { list, save_id, save } => match client.save(&save_id, save) {
+            Ok(()) => {
+                let verb = if save { "Saved" } else { "Removed" };
+                edited(format!("{verb} \u{201c}{}\u{201d}", list.title), false, None);
+            }
+            // The UI already changed the library: bring the real one back.
+            Err(e) => edited(format!("Couldn't update library: {}", err(e)), true, None),
+        },
     }
 }
 
@@ -213,7 +212,7 @@ fn reload(out: &Notifier) {
 
 fn playlist_page(
     client: &Client,
-    requeue: &Sender<Request>,
+    requeue: &Pool<Request>,
     out: &Notifier,
     list: Playlist,
     cont: Option<Continuation>,
@@ -226,7 +225,7 @@ fn playlist_page(
             let done = next.is_none();
             let id = list.id.clone();
             if let Some(next) = next {
-                let _ = requeue.send(Request::PlaylistMore(list, next));
+                requeue.push(Request::PlaylistMore(list, next));
             }
             out.send(Response::PlaylistPage { id, tracks: page.tracks, done, header: page.header.map(Box::new) });
         }
