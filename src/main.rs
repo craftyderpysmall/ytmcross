@@ -20,6 +20,14 @@ use config::Config;
 use theme::Theme;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // glibc gives threads that allocate their own malloc arenas (up to 8 per
+    // core), and each of our short-lived workers would leave one behind,
+    // partly resident. Two are plenty for an app that mostly waits.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: plain libc call, made before any other thread exists.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
     trace!("main: start");
     let args: Vec<String> = std::env::args().collect();
     if let [_, flag, version] = args.as_slice()

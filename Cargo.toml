@@ -99,8 +99,12 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graph
 [target.'cfg(not(windows))'.dependencies]
 bytemuck = "1"
 softbuffer = "0.4.8"
-# Windows uses its own text clipboard (ui/clipboard.rs).
-egui-winit = { version = "0.34.3", default-features = false, features = ["clipboard"] }
+# The clipboard, text only, connected on first use (ui/clipboard.rs): egui-winit's
+# connects at startup and brings in an image codec stack.
+arboard = { version = "3.6.1", default-features = false }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+smithay-clipboard = "0.7.2"
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 symphonia = { version = "0.6.1", default-features = false, features = ["opt-simd-neon"] }

@@ -42,6 +42,8 @@ enum Job {
     Song(Track),
     /// A playlist or album, with its tracks if they are already loaded.
     List(Playlist, Option<Vec<Track>>),
+    /// Deletes a playlist's or album's download.
+    Remove(Playlist),
 }
 
 #[derive(Default)]
@@ -129,8 +131,8 @@ impl Downloads {
         }
     }
 
-    /// Downloads a playlist's or album's songs not on disk yet. `tracks`
-    /// are its loaded tracks; None fetches them.
+    /// Downloads a playlist's or album's songs. `tracks` are its loaded
+    /// tracks; None fetches them.
     pub fn list(&self, list: Playlist, tracks: Option<Vec<Track>>) {
         let mut s = self.state();
         if !s.active.contains_key(&list.id) {
@@ -138,6 +140,12 @@ impl Downloads {
             drop(s);
             self.jobs.push(Job::List(list, tracks));
         }
+    }
+
+    /// Deletes a downloaded playlist or album: its .m3u8, and its songs that
+    /// no other downloaded list uses.
+    pub fn remove_list(&self, list: Playlist) {
+        self.jobs.push(Job::Remove(list));
     }
 }
 
@@ -168,7 +176,44 @@ impl Shared {
                 self.state.lock().unwrap().active.remove(&list.id);
                 self.out.send(Response::Download(Some(message)));
             }
+            Job::Remove(list) => {
+                let message = match self.remove_list(&list) {
+                    Ok(()) => format!("Removed the download of \u{201c}{}\u{201d}", list.title),
+                    Err(e) => format!("Couldn't remove the download of \u{201c}{}\u{201d}: {e}", list.title),
+                };
+                self.out.send(Response::Download(Some(message)));
+            }
         }
+    }
+
+    fn remove_list(&self, list: &Playlist) -> io::Result<()> {
+        let dir = self.state.lock().unwrap().dir.clone();
+        // Song files of this list, and those other lists still use.
+        let (mut own, mut kept) = (HashSet::new(), HashSet::new());
+        for entry in std::fs::read_dir(&dir)?.flatten() {
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|n| file_id(n, ".m3u8")) else { continue };
+            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            let files = playlist_files(&text).map(str::to_string);
+            if id == list.id {
+                own.extend(files);
+                std::fs::remove_file(entry.path())?;
+            } else {
+                kept.extend(files);
+            }
+        }
+        // Only our own song files in this folder, never a path elsewhere
+        // (the .m3u8 may have been edited).
+        own.retain(|f: &String| !kept.contains(f) && !f.contains(['/', '\\']) && file_id(f, ".m4a").is_some());
+        for file in &own {
+            let _ = std::fs::remove_file(dir.join(file));
+        }
+        let mut s = self.state.lock().unwrap();
+        if s.dir == dir {
+            s.lists.remove(&list.id);
+            s.songs.retain(|_, name| !own.contains(name));
+        }
+        Ok(())
     }
 
     fn download_list(&self, list: &Playlist, tracks: Option<Vec<Track>>) -> String {
@@ -301,11 +346,13 @@ impl Shared {
     }
 }
 
-/// The songs and lists in a folder. Leftovers of interrupted downloads
-/// are deleted (no download runs while a folder is read).
+/// The songs and lists in a folder; a list counts only while all its songs
+/// are there. Leftovers of interrupted downloads are deleted (no download
+/// runs while a folder is read).
 fn scan(dir: &Path) -> (HashMap<String, String>, HashSet<String>) {
     let (mut songs, mut lists) = (HashMap::new(), HashSet::new());
     let Ok(entries) = std::fs::read_dir(dir) else { return (songs, lists) };
+    let mut playlists = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -314,10 +361,22 @@ fn scan(dir: &Path) -> (HashMap<String, String>, HashSet<String>) {
         } else if let Some(id) = file_id(name, ".m4a") {
             songs.insert(id.to_string(), name.to_string());
         } else if let Some(id) = file_id(name, ".m3u8") {
-            lists.insert(id.to_string());
+            playlists.push((id.to_string(), entry.path()));
+        }
+    }
+    let present: HashSet<&str> = songs.values().map(String::as_str).collect();
+    for (id, path) in playlists {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if playlist_files(&text).all(|f| present.contains(f)) {
+            lists.insert(id);
         }
     }
     (songs, lists)
+}
+
+/// The files an .m3u8 lists.
+fn playlist_files(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'))
 }
 
 /// The id in "… [id].ext".
@@ -469,6 +528,24 @@ mod tests {
             liked: None,
             plays: None,
         }
+    }
+
+    #[test]
+    fn scan_counts_only_complete_lists() {
+        let dir = std::env::temp_dir().join(format!("ytmcross-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).unwrap();
+        write("A - One [aaaaaaaaaaa].m4a", "");
+        write("A - Two [bbbbbbbbbbb].m4a.part", "");
+        write("Full [PL1].m3u8", "#EXTM3U\n#EXTINF:1,A - One\nA - One [aaaaaaaaaaa].m4a\n");
+        write("Partial [PL2].m3u8", "#EXTM3U\nA - One [aaaaaaaaaaa].m4a\nA - Two [bbbbbbbbbbb].m4a\n");
+        let (songs, lists) = scan(&dir);
+        let leftover = dir.join("A - Two [bbbbbbbbbbb].m4a.part").exists();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(songs.get("aaaaaaaaaaa").map(String::as_str), Some("A - One [aaaaaaaaaaa].m4a"));
+        assert_eq!(songs.len(), 1);
+        assert_eq!(lists, HashSet::from(["PL1".to_string()]));
+        assert!(!leftover);
     }
 
     #[test]

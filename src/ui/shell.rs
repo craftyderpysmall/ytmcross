@@ -24,6 +24,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 use super::app::App;
+use super::clipboard::Clipboard;
 use super::damage::{self, Damage, Region, Scene};
 use super::present::{Pixels, Presenter};
 
@@ -34,6 +35,8 @@ const KEEP_BUFFER: Duration = Duration::from_millis(100);
 struct Wake(Duration);
 
 struct Surface {
+    /// Dropped first: on Wayland it holds the window's display.
+    clipboard: Clipboard,
     window: Rc<Window>,
     presenter: Presenter,
     egui_winit: egui_winit::State,
@@ -56,8 +59,9 @@ struct Shell {
     drawn: ([u32; 2], f32, usize),
     /// The window's content can't be trusted: redraw all of it.
     redraw_all: bool,
+    /// We asked for the coming redraw (others come from the system).
+    requested: bool,
     /// Held modifier keys (to spot a paste).
-    #[cfg(windows)]
     modifiers: winit::keyboard::ModifiersState,
     /// `YTMCROSS_STATS=1`: frame time and share of pixels drawn, in the title.
     stats: Option<Stats>,
@@ -104,7 +108,7 @@ pub fn run(
         scene: Scene::default(),
         drawn: ([0, 0], 0.0, 0),
         redraw_all: true,
-        #[cfg(windows)]
+        requested: false,
         modifiers: Default::default(),
     };
     event_loop.run_app(&mut shell)?;
@@ -127,15 +131,14 @@ impl Shell {
         let size = win.window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
         // Before egui runs: the OS may have dropped what the window showed.
-        let lost = win.presenter.invalidated();
+        let lost = win.presenter.invalidated(!std::mem::take(&mut self.requested));
 
         let input = win.egui_winit.take_egui_input(&win.window);
         let app = &mut self.app;
         let out = self.ctx.run_ui(input, |ui| app.ui(ui));
-        #[cfg(windows)]
         for command in &out.platform_output.commands {
             if let egui::OutputCommand::CopyText(text) = command {
-                super::clipboard::set(text);
+                win.clipboard.set(&win.window, text);
             }
         }
         win.egui_winit.handle_platform_output(&win.window, out.platform_output);
@@ -147,30 +150,34 @@ impl Shell {
         // without changing any layout: redraw everything.
         let fonts = self.ctx.fonts(|f| f.definitions().font_data.values().fold(0, |k, d| k * 31 + Arc::as_ptr(d) as usize));
         let all = std::mem::take(&mut self.redraw_all) | lost | (self.drawn != ([w, h], ppp, fonts));
-        let regions = match if all { Damage::Full } else { damage::diff(&self.scene, &scene, w, h) } {
+        let damage = match if all { Damage::Full } else { damage::diff(&self.scene, &scene, w, h) } {
             Damage::None => Vec::new(),
-            Damage::Regions(r) if Presenter::PARTIAL => r,
-            _ => vec![Region::full(w, h)],
+            Damage::Regions(r) => r,
+            Damage::Full => vec![Region::full(w, h)],
         };
-        let full = regions.first() == Some(&Region::full(w, h));
         let t_scene = started.elapsed();
         let mut t_tess = t_scene;
-        if regions.is_empty() {
+        let mut regions = Vec::new();
+        if damage.is_empty() {
             if !out.textures_delta.is_empty() {
                 // Nothing to draw, but the renderer's textures must keep up.
                 let mut px = [[0u8; 4]];
                 self.renderer.render(&mut BufferMutRef::new(&mut px, 1, 1), &[], &out.textures_delta, ppp);
             }
         } else {
-            let shapes = if full { shapes } else { scene.touching(shapes, &regions) };
-            let mut primitives = self.ctx.tessellate(shapes, ppp);
-            if full {
-                damage::seal(&mut primitives);
-            }
-            t_tess = started.elapsed();
-            let renderer = &mut self.renderer;
+            let (ctx, renderer) = (&self.ctx, &mut self.renderer);
             let (delta, none) = (&out.textures_delta, egui::TexturesDelta::default());
-            win.presenter.draw(w, h, &regions, |pixels| {
+            // Wayland: lets the compositor's frame callbacks pace us.
+            win.window.pre_present_notify();
+            // The presenter may draw more than the damage (present.rs).
+            regions = win.presenter.draw(w, h, damage, |pixels, regions| {
+                let full = regions.first() == Some(&Region::full(w, h));
+                let shapes = if full { shapes } else { scene.touching(shapes, regions) };
+                let mut primitives = ctx.tessellate(shapes, ppp);
+                if full {
+                    damage::seal(&mut primitives);
+                }
+                t_tess = started.elapsed();
                 for (i, r) in regions.iter().enumerate() {
                     let delta = if i == 0 { delta } else { &none };
                     clear(pixels, w, r);
@@ -238,14 +245,15 @@ impl Shell {
     }
 }
 
-/// Ctrl+V, Shift+Insert or the Paste key, as egui-winit recognizes them.
-#[cfg(windows)]
+/// Ctrl+V (Cmd+V on macOS), Shift+Insert or the Paste key, as egui-winit
+/// recognizes them.
 fn is_paste(key: &winit::event::KeyEvent, modifiers: winit::keyboard::ModifiersState) -> bool {
     use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+    let command = if cfg!(target_os = "macos") { modifiers.super_key() } else { modifiers.control_key() };
     let v = matches!(&key.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("v"))
         || key.physical_key == PhysicalKey::Code(KeyCode::KeyV);
     let insert = key.logical_key == Key::Named(NamedKey::Insert) || key.physical_key == PhysicalKey::Code(KeyCode::Insert);
-    key.logical_key == Key::Named(NamedKey::Paste) || (modifiers.control_key() && v) || (modifiers.shift_key() && insert)
+    key.logical_key == Key::Named(NamedKey::Paste) || (command && v) || (modifiers.shift_key() && insert)
 }
 
 /// Clears a region before drawing it, as a full frame starts from black.
@@ -288,7 +296,7 @@ impl ApplicationHandler<Wake> for Shell {
             None,
             None,
         );
-        self.win = Some(Surface { window, presenter, egui_winit });
+        self.win = Some(Surface { clipboard: Clipboard::default(), window, presenter, egui_winit });
         self.schedule(Instant::now());
     }
 
@@ -319,12 +327,11 @@ impl ApplicationHandler<Wake> for Shell {
             }
             event => {
                 let Some(win) = self.win.as_mut() else { return };
-                #[cfg(windows)]
                 match &event {
                     WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
                     // egui-winit pastes from its own clipboard: fill it first.
                     WindowEvent::KeyboardInput { event: key, .. } if key.state.is_pressed() && is_paste(key, self.modifiers) => {
-                        win.egui_winit.set_clipboard_text(super::clipboard::get().unwrap_or_default());
+                        win.egui_winit.set_clipboard_text(win.clipboard.get(&win.window).unwrap_or_default());
                     }
                     _ => {}
                 }
@@ -344,6 +351,7 @@ impl ApplicationHandler<Wake> for Shell {
                 if self.visible()
                     && let Some(w) = &self.win
                 {
+                    self.requested = true;
                     w.window.request_redraw();
                 }
                 el.set_control_flow(ControlFlow::Wait);

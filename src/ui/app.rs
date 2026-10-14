@@ -600,20 +600,23 @@ impl App {
         self.downloads.song(track);
     }
 
-    /// Downloads a playlist or album; the open page's tracks are used if
-    /// they are all loaded.
-    pub fn download_list(&mut self, list: Playlist) {
-        if self.downloads.progress(&list.id).is_some() {
-            return;
+    /// Downloads a playlist or album (with the open page's tracks, if all
+    /// loaded), or removes its download.
+    pub fn toggle_download(&mut self, list: Playlist) {
+        match self.list_download(&list.id) {
+            Download::Running => {}
+            Download::Done => self.downloads.remove_list(list),
+            Download::No => {
+                let tracks = self.playlist.as_ref().filter(|p| p.meta.id == list.id && !p.loading).map(|p| p.tracks.clone());
+                self.notify(format!("Downloading \u{201c}{}\u{201d}", list.title));
+                self.downloads.list(list, tracks);
+            }
         }
-        let tracks = self.playlist.as_ref().filter(|p| p.meta.id == list.id && !p.loading).map(|p| p.tracks.clone());
-        self.notify(format!("Downloading \u{201c}{}\u{201d}", list.title));
-        self.downloads.list(list, tracks);
     }
 
-    pub fn download_page(&mut self) {
+    pub fn toggle_page_download(&mut self) {
         if let Some(meta) = self.playlist.as_ref().map(|p| p.meta.clone()) {
-            self.download_list(meta);
+            self.toggle_download(meta);
         }
     }
 

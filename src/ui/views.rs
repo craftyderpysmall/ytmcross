@@ -77,9 +77,10 @@ enum Action {
     Open(Playlist),
     /// Open and start playing as soon as it loads.
     PlayCollection(Playlist),
-    DownloadList(Playlist),
-    /// The Download button of the open playlist/album.
-    DownloadPage,
+    /// Download a playlist/album, or remove its download.
+    ToggleDownload(Playlist),
+    /// The Download/Downloaded button of the open playlist/album.
+    TogglePageDownload,
     OpenArtist(String),
     OpenAlbum(Track),
     PlayQueue(QueueRow),
@@ -223,8 +224,8 @@ fn apply(app: &mut App, ui: &Ui, action: Option<Action>) {
         Action::ToggleSaved => app.toggle_saved(),
         Action::Open(list) => app.open_playlist(ctx, list, false),
         Action::PlayCollection(list) => app.open_playlist(ctx, list, true),
-        Action::DownloadList(list) => app.download_list(list),
-        Action::DownloadPage => app.download_page(),
+        Action::ToggleDownload(list) => app.toggle_download(list),
+        Action::TogglePageDownload => app.toggle_page_download(),
         Action::OpenArtist(id) => app.open_artist(ctx, &id),
         Action::OpenAlbum(track) => app.open_album(ctx, &track),
         Action::PlayQueue(row) => match row {
@@ -433,7 +434,7 @@ fn cards(ui: &mut Ui, app: &App, items: &[Playlist], wrap: bool) -> Option<Actio
             }
             match menus::playlist_menu(&resp, item, app.signed_out, download) {
                 Some(PlaylistChoice::Play) => action = Some(Action::PlayCollection(item.clone())),
-                Some(PlaylistChoice::Download) => action = Some(Action::DownloadList(item.clone())),
+                Some(PlaylistChoice::Download) => action = Some(Action::ToggleDownload(item.clone())),
                 _ => {}
             }
         }
@@ -565,7 +566,7 @@ fn library(app: &mut App, ui: &mut Ui) -> Option<Action> {
             }
             match menus::playlist_menu(&resp, p, app.signed_out, download) {
                 Some(PlaylistChoice::Play) => action = Some(Action::PlayCollection(p.clone())),
-                Some(PlaylistChoice::Download) => action = Some(Action::DownloadList(p.clone())),
+                Some(PlaylistChoice::Download) => action = Some(Action::ToggleDownload(p.clone())),
                 Some(PlaylistChoice::Delete) => action = Some(Action::AskDelete(p.clone())),
                 Some(PlaylistChoice::Remove) => action = Some(Action::Remove(p.clone())),
                 None => {}
@@ -641,14 +642,14 @@ fn playlist(app: &mut App, ui: &mut Ui, list: &mut ListResult) -> Option<Action>
                     let (label, tip) = match app.downloads.progress(&pl.meta.id) {
                         Some((done, total)) if total > 0 => (format!("Downloading {done}/{total}"), None),
                         Some(_) => ("Downloading\u{2026}".to_string(), None),
-                        None if app.downloads.has_list(&pl.meta.id) => ("Downloaded".to_string(), Some("Download songs added since")),
+                        None if app.downloads.has_list(&pl.meta.id) => ("Downloaded".to_string(), Some("Remove the download")),
                         None => ("Download".to_string(), Some("Save every song to the downloads folder")),
                     };
                     let resp = ghost_pill(ui, theme, &label);
                     if let Some(tip) = tip
                         && resp.on_hover_text(tip).clicked()
                     {
-                        action = Some(Action::DownloadPage);
+                        action = Some(Action::TogglePageDownload);
                     }
                 }
                 if pl.reorderable() {

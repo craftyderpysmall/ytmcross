@@ -312,8 +312,8 @@ pub enum PlaylistChoice {
     Remove,
 }
 
-/// Right-click menu on a playlist or album: download it (again, for songs
-/// added since), own playlists can be deleted, saved ones removed from the library.
+/// Right-click menu on a playlist or album: download it (or remove the
+/// download), own playlists can be deleted, saved ones removed from the library.
 pub fn playlist_menu(resp: &Response, playlist: &Playlist, signed_out: bool, download: Download) -> Option<PlaylistChoice> {
     let mut choice = None;
     resp.context_menu(|ui| {
@@ -324,7 +324,7 @@ pub fn playlist_menu(resp: &Response, playlist: &Playlist, signed_out: bool, dow
         let label = match download {
             Download::No => "Download",
             Download::Running => "Downloading\u{2026}",
-            Download::Done => "Update download",
+            Download::Done => "Remove download",
         };
         if ui.add_enabled(download != Download::Running, Button::new(label)).clicked() {
             choice = Some(PlaylistChoice::Download);

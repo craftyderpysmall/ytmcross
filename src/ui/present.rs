@@ -5,7 +5,12 @@
 //! buffer's untouched pages never become resident, and between bursts of
 //! drawing it is given back to the OS: idle, no frame buffer exists at all.
 //!
-//! Elsewhere: a softbuffer surface, redrawn whole.
+//! Elsewhere: a softbuffer surface. Its buffers may be swapped or
+//! recreated, so each says how many frames old its content is: a buffer
+//! one frame old gets just the damage, two frames old the damage of both
+//! frames, anything else a full frame. Only the damage is presented.
+//! Backends whose buffers always come back blank (macOS) draw into a copy
+//! of the frame kept while drawing goes on, given back when idle.
 
 use std::rc::Rc;
 
@@ -15,6 +20,40 @@ use winit::window::Window;
 use super::damage::Region;
 
 pub type Pixels = [u8; 4];
+
+/// What to draw into a buffer whose content is `age` frames old (0:
+/// unknown): this frame's damage, plus the previous frame's (`last`) if the
+/// buffer missed it; everything when that's most of the window anyway.
+#[cfg_attr(windows, allow(dead_code))] // softbuffer platforms; tested everywhere
+fn for_buffer(age: u8, damage: Vec<Region>, last: Vec<Region>, w: u32, h: u32) -> Vec<Region> {
+    let full = Region::full(w, h);
+    let regions = match age {
+        1 => damage,
+        2 => [damage, last].concat(),
+        _ => return vec![full],
+    };
+    let area: u64 = regions.iter().map(|r| u64::from(r.width()) * u64::from(r.height())).sum();
+    if regions.contains(&full) || area * 2 > u64::from(w) * u64::from(h) { vec![full] } else { regions }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffers_get_what_they_missed() {
+        let a = Region { x0: 0, y0: 0, x1: 10, y1: 10 };
+        let b = Region { x0: 50, y0: 50, x1: 60, y1: 60 };
+        let full = Region::full(100, 100);
+        assert_eq!(for_buffer(1, vec![a], vec![b], 100, 100), vec![a]);
+        assert_eq!(for_buffer(2, vec![a], vec![b], 100, 100), vec![a, b]);
+        assert_eq!(for_buffer(0, vec![a], vec![b], 100, 100), vec![full]);
+        assert_eq!(for_buffer(3, vec![a], vec![b], 100, 100), vec![full]);
+        assert_eq!(for_buffer(2, vec![a], vec![full], 100, 100), vec![full]);
+        let big = Region { x0: 0, y0: 0, x1: 100, y1: 60 };
+        assert_eq!(for_buffer(1, vec![big], vec![], 100, 100), vec![full]);
+    }
+}
 
 #[cfg(windows)]
 pub use win32::Presenter;
@@ -70,9 +109,6 @@ mod win32 {
     }
 
     impl Presenter {
-        /// The window keeps what was copied to it: changed regions suffice.
-        pub const PARTIAL: bool = true;
-
         pub fn new(_el: &ActiveEventLoop, window: &Rc<Window>) -> Result<Presenter, String> {
             match window.window_handle().map_err(|e| e.to_string())?.as_raw() {
                 RawWindowHandle::Win32(h) => Ok(Presenter { hwnd: h.hwnd.get() as HWND, frame: None }),
@@ -80,14 +116,17 @@ mod win32 {
             }
         }
 
-        /// Renders into the `w` x `h` frame with `render`, then copies `regions` to the window.
-        pub fn draw(&mut self, w: u32, h: u32, regions: &[Region], render: impl FnOnce(&mut [Pixels])) {
+        /// Has `render` fill the regions it is given in the `w` x `h` frame,
+        /// and puts them on screen. The window keeps what was copied to it,
+        /// so the damage is all that's drawn. Returns the regions drawn.
+        pub fn draw(&mut self, w: u32, h: u32, damage: Vec<Region>, render: impl FnOnce(&mut [Pixels], &[Region])) -> Vec<Region> {
             if self.frame.as_ref().is_none_or(|f| f.width != w || f.height != h) {
                 self.frame = None;
                 self.frame = Frame::new(w, h);
             }
-            let Some(frame) = &mut self.frame else { return };
-            render(frame.pixels());
+            let Some(frame) = &mut self.frame else { return Vec::new() };
+            let regions = damage;
+            render(frame.pixels(), &regions);
             let info = |rows: u32| BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -104,7 +143,7 @@ mod win32 {
             // inside the frame buffer.
             unsafe {
                 let dc = GetDC(self.hwnd);
-                for r in regions {
+                for r in &regions {
                     // The source starts at the region's first row and spans
                     // all its rows, so the DIB's origin convention can't matter.
                     let rows = frame.pixels.add(r.y0 as usize * w as usize);
@@ -113,6 +152,7 @@ mod win32 {
                 }
                 ReleaseDC(self.hwnd, dc);
             }
+            regions
         }
 
         /// Gives the frame buffer back to the OS.
@@ -120,8 +160,9 @@ mod win32 {
             self.frame = None;
         }
 
-        /// The OS dropped part of the window's content (it's waiting to be repainted).
-        pub fn invalidated(&self) -> bool {
+        /// The OS dropped part of the window's content (it's waiting to be
+        /// repainted). Asked directly, whoever requested the redraw.
+        pub fn invalidated(&self, _unrequested: bool) -> bool {
             // SAFETY: a query on our live window.
             unsafe { GetUpdateRect(self.hwnd, ptr::null_mut(), 0) != 0 }
         }
@@ -139,34 +180,78 @@ mod soft {
     pub struct Presenter {
         surface: softbuffer::Surface<OwnedDisplayHandle, Rc<Window>>,
         _context: softbuffer::Context<OwnedDisplayHandle>,
+        /// Size of the buffers, and the regions the last frame drew.
+        size: (u32, u32),
+        last: Vec<Region>,
+        /// A buffer was presented: from then on, a blank one (age 0) means
+        /// the backend never keeps them (macOS).
+        presented: bool,
+        /// For such backends, the frame, kept while drawing goes on: the
+        /// damage is drawn into it and the whole copied over, instead of
+        /// rasterizing every frame whole. Given back when idle (`release`).
+        kept: Vec<Pixels>,
     }
 
     impl Presenter {
-        /// Buffers may be swapped or recreated: always redraw whole frames.
-        pub const PARTIAL: bool = false;
-
         pub fn new(el: &ActiveEventLoop, window: &Rc<Window>) -> Result<Presenter, String> {
             let context = softbuffer::Context::new(el.owned_display_handle()).map_err(|e| e.to_string())?;
             let surface = softbuffer::Surface::new(&context, window.clone()).map_err(|e| e.to_string())?;
-            Ok(Presenter { surface, _context: context })
+            Ok(Presenter { surface, _context: context, size: (0, 0), last: Vec::new(), presented: false, kept: Vec::new() })
         }
 
-        pub fn draw(&mut self, w: u32, h: u32, _regions: &[Region], render: impl FnOnce(&mut [Pixels])) {
-            let (Some(nw), Some(nh)) = (NonZeroU32::new(w), NonZeroU32::new(h)) else { return };
-            if self.surface.resize(nw, nh).is_err() {
-                return;
+        /// Has `render` fill the regions it is given in the `w` x `h` frame,
+        /// and presents them: the damage, widened to what the buffer missed
+        /// (see the module notes). Returns the regions drawn.
+        pub fn draw(&mut self, w: u32, h: u32, damage: Vec<Region>, render: impl FnOnce(&mut [Pixels], &[Region])) -> Vec<Region> {
+            let (Some(nw), Some(nh)) = (NonZeroU32::new(w), NonZeroU32::new(h)) else { return Vec::new() };
+            if self.size != (w, h) {
+                if self.surface.resize(nw, nh).is_err() {
+                    return Vec::new();
+                }
+                self.size = (w, h);
+                self.kept = Vec::new();
             }
-            let Ok(mut buffer) = self.surface.buffer_mut() else { return };
-            render(bytemuck::cast_slice_mut(&mut buffer));
-            if let Err(e) = buffer.present() {
+            let Ok(mut buffer) = self.surface.buffer_mut() else { return Vec::new() };
+            let last = std::mem::take(&mut self.last);
+            let regions = if buffer.age() == 0 && self.presented {
+                let pixels = w as usize * h as usize;
+                let fresh = self.kept.len() != pixels;
+                if fresh {
+                    self.kept = vec![[0; 4]; pixels]; // zeroed pages: committed as drawn
+                }
+                let regions = for_buffer(if fresh { 0 } else { 1 }, damage, last, w, h);
+                render(&mut self.kept, &regions);
+                let target: &mut [Pixels] = bytemuck::cast_slice_mut(&mut buffer);
+                target.copy_from_slice(&self.kept);
+                regions
+            } else {
+                let regions = for_buffer(buffer.age(), damage, last, w, h);
+                render(bytemuck::cast_slice_mut(&mut buffer), &regions);
+                regions
+            };
+            let rects: Vec<softbuffer::Rect> = regions
+                .iter()
+                .filter_map(|r| {
+                    Some(softbuffer::Rect { x: r.x0, y: r.y0, width: NonZeroU32::new(r.width())?, height: NonZeroU32::new(r.height())? })
+                })
+                .collect();
+            if let Err(e) = buffer.present_with_damage(&rects) {
                 eprintln!("ytmcross: present failed: {e}");
             }
+            self.presented = true;
+            self.last = regions.clone();
+            regions
         }
 
-        pub fn release(&mut self) {}
+        /// Gives the kept frame back (only backends that need one have it).
+        pub fn release(&mut self) {
+            self.kept = Vec::new();
+        }
 
-        pub fn invalidated(&self) -> bool {
-            false
+        /// The OS dropped the window's content: a redraw we didn't ask for
+        /// is the system asking for it back (X11 expose, restoring...).
+        pub fn invalidated(&self, unrequested: bool) -> bool {
+            unrequested
         }
     }
 }

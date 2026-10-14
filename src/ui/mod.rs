@@ -1,6 +1,5 @@
 mod app;
 mod bar;
-#[cfg(windows)]
 mod clipboard;
 mod damage;
 mod images;

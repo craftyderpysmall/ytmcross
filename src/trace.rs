@@ -28,7 +28,8 @@ pub fn enabled() -> bool {
     tracer().is_some()
 }
 
-/// Private memory of this process in MB (Windows; 0 elsewhere). Trace-only.
+/// Private memory of this process in MB (Windows: private bytes; Linux:
+/// anonymous resident memory; 0 elsewhere). Trace-only.
 pub fn private_mb() -> f64 {
     #[cfg(windows)]
     {
@@ -42,7 +43,13 @@ pub fn private_mb() -> f64 {
             c.PrivateUsage as f64 / 1_048_576.0
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let kb = status.lines().find_map(|l| l.strip_prefix("RssAnon:")?.trim().strip_suffix("kB")?.trim().parse::<f64>().ok());
+        kb.unwrap_or(0.0) / 1024.0
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         0.0
     }
