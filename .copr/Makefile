@@ -2,7 +2,8 @@
 # builds offline in the chroot. COPR runs `make -f .copr/Makefile srpm
 # outdir=DIR`; it works the same locally on Fedora.
 #
-# Release: 1 when HEAD is tagged v<Cargo.toml version>, otherwise a snapshot
+# Release: 1 when HEAD matches tag v<Cargo.toml version> (apart from bucket/,
+# which the release workflow commits after the tag), otherwise a snapshot
 # (0.<date>.git<commit>) that sorts below that release.
 .ONESHELL:
 SHELL := /bin/bash
@@ -16,7 +17,7 @@ srpm:
 	done
 	git() { command git -c safe.directory='*' -C '$(top)' "$$@"; }
 	version=$$(sed -n 's/^version = "\(.*\)"$$/\1/p' '$(top)/Cargo.toml' | head -n 1)
-	if git tag --points-at HEAD | grep -qx "v$$version"; then
+	if git rev-parse -q --verify "refs/tags/v$$version" >/dev/null && git diff --quiet "v$$version" HEAD -- . ':(exclude)bucket'; then
 		release=1
 	else
 		release=0.$$(git log -1 --format=%cd --date=format:%Y%m%d%H%M).git$$(git rev-parse --short HEAD)
