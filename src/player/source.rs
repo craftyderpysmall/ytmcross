@@ -3,6 +3,8 @@
 //! googlevideo URLs carry their size (`clen=`), so no extra request is
 //! needed up front. Data is fetched in 256 KiB chunks (~8 s of 256 kbps
 //! audio) over one kept-alive connection; only the current chunk is held.
+//! To start mid-track, the stream can be spliced: the file's head, then
+//! straight on from the fragment to play (see index.rs).
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -10,6 +12,8 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use symphonia::core::io::MediaSource;
+
+use super::index::FragmentIndex;
 
 const CHUNK: u64 = 256 * 1024;
 const RETRIES: u32 = 3;
@@ -124,10 +128,16 @@ fn fetch_range(agent: &ureq::Agent, url: &str, start: u64, end: u64) -> io::Resu
 pub struct HttpSource {
     agent: ureq::Agent,
     url: String,
+    /// Length of the file.
     len: u64,
+    /// Read position in the stream the demuxer sees.
     pos: u64,
     chunk: Vec<u8>,
+    /// File offset of `chunk`.
     chunk_start: u64,
+    /// Starting at a later fragment: the stream is the file's head (up to
+    /// its first fragment), then the file from this offset on.
+    splice: Option<(Vec<u8>, u64)>,
 }
 
 impl HttpSource {
@@ -138,15 +148,36 @@ impl HttpSource {
         };
         let chunk = take_preloaded(url).unwrap_or_default();
         crate::trace!("source: open, {} preloaded bytes", chunk.len());
-        Ok(HttpSource { agent, url: url.to_string(), len, pos: 0, chunk, chunk_start: 0 })
+        Ok(HttpSource { agent, url: url.to_string(), len, pos: 0, chunk, chunk_start: 0, splice: None })
     }
 
-    fn fetch(&mut self) -> io::Result<()> {
-        let end = (self.pos + CHUNK).min(self.len) - 1;
+    /// The file's fragment index, from its first chunk (fetched unless preloaded).
+    pub fn fragment_index(&mut self) -> Option<FragmentIndex> {
+        if self.chunk_start != 0 || self.chunk.is_empty() {
+            self.fetch_at(0).ok()?;
+        }
+        FragmentIndex::parse(&self.chunk)
+    }
+
+    /// Makes the stream `head` followed by the file from offset `at`.
+    pub fn splice(&mut self, head: Vec<u8>, at: u64) {
+        self.splice = Some((head, at));
+        self.pos = 0;
+    }
+
+    fn total_len(&self) -> u64 {
+        match &self.splice {
+            Some((head, at)) => head.len() as u64 + self.len.saturating_sub(*at),
+            None => self.len,
+        }
+    }
+
+    fn fetch_at(&mut self, at: u64) -> io::Result<()> {
+        let end = (at + CHUNK).min(self.len) - 1;
         let t = std::time::Instant::now();
-        self.chunk = fetch_range(&self.agent, &self.url, self.pos, end)?;
-        self.chunk_start = self.pos;
-        crate::trace!("source: fetched {} bytes at {} in {:?}", self.chunk.len(), self.pos, t.elapsed());
+        self.chunk = fetch_range(&self.agent, &self.url, at, end)?;
+        self.chunk_start = at;
+        crate::trace!("source: fetched {} bytes at {at} in {:?}", self.chunk.len(), t.elapsed());
         Ok(())
     }
 }
@@ -167,14 +198,25 @@ fn content_length_from_server(agent: &ureq::Agent, url: &str) -> io::Result<u64>
 
 impl Read for HttpSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.len || buf.is_empty() {
+        if self.pos >= self.total_len() || buf.is_empty() {
             return Ok(0);
         }
+        let file_pos = match &self.splice {
+            Some((head, _)) if self.pos < head.len() as u64 => {
+                let head = &head[self.pos as usize..];
+                let n = buf.len().min(head.len());
+                buf[..n].copy_from_slice(&head[..n]);
+                self.pos += n as u64;
+                return Ok(n);
+            }
+            Some((head, at)) => at + (self.pos - head.len() as u64),
+            None => self.pos,
+        };
         let chunk_end = self.chunk_start + self.chunk.len() as u64;
-        if self.pos < self.chunk_start || self.pos >= chunk_end {
-            self.fetch()?;
+        if file_pos < self.chunk_start || file_pos >= chunk_end {
+            self.fetch_at(file_pos)?;
         }
-        let offset = (self.pos - self.chunk_start) as usize;
+        let offset = (file_pos - self.chunk_start) as usize;
         let n = buf.len().min(self.chunk.len() - offset);
         buf[..n].copy_from_slice(&self.chunk[offset..offset + n]);
         self.pos += n as u64;
@@ -186,7 +228,7 @@ impl Seek for HttpSource {
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
         let target = match to {
             SeekFrom::Start(p) => p as i128,
-            SeekFrom::End(d) => self.len as i128 + d as i128,
+            SeekFrom::End(d) => self.total_len() as i128 + d as i128,
             SeekFrom::Current(d) => self.pos as i128 + d as i128,
         };
         if target < 0 {
@@ -203,7 +245,7 @@ impl MediaSource for HttpSource {
     }
 
     fn byte_len(&self) -> Option<u64> {
-        Some(self.len)
+        Some(self.total_len())
     }
 }
 

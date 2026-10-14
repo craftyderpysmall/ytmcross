@@ -9,6 +9,7 @@
 //! audio stream is paused, so nothing runs at all.
 
 pub mod eq;
+mod index;
 mod output;
 mod pitch;
 mod source;
@@ -27,6 +28,7 @@ use symphonia::core::units::{Time, TimeBase};
 
 use crate::config::{EqualizerConfig, PlayerConfig};
 use crate::trace;
+use index::FragmentIndex;
 use output::{Output, Shared};
 use source::HttpSource;
 pub use source::{clear_preloaded, is_preloaded, preload_first_chunk};
@@ -116,6 +118,8 @@ impl Player {
 /// The track being played.
 struct Current {
     url: String,
+    /// Where its fragments start, to seek straight to the right one.
+    index: Option<Arc<FragmentIndex>>,
     format: Box<dyn FormatReader>,
     decoder: Box<dyn AudioDecoder>,
     track_id: u32,
@@ -178,7 +182,7 @@ impl Engine {
                 (self.notify)(PlayerEvent::Loading);
                 self.paused = false;
                 let t = std::time::Instant::now();
-                let opened = self.open(&url, start);
+                let opened = self.open(&url, start, None);
                 trace!("engine: opened in {:?}", t.elapsed());
                 match opened {
                     Ok(current) => {
@@ -214,10 +218,20 @@ impl Engine {
         }
     }
 
-    /// Opens `url`, prepares the decoder and an output that fits it, and
-    /// optionally seeks.
-    fn open(&mut self, url: &str, start: f64) -> Result<Current, String> {
-        let source = HttpSource::open(self.agent.clone(), url).map_err(|e| e.to_string())?;
+    /// Opens `url` at `start` seconds and prepares the decoder and an output
+    /// that fits it. `index` is the file's, if already known.
+    fn open(&mut self, url: &str, start: f64, index: Option<Arc<FragmentIndex>>) -> Result<Current, String> {
+        let mut source = HttpSource::open(self.agent.clone(), url).map_err(|e| e.to_string())?;
+        let index = index.or_else(|| source.fragment_index().map(Arc::new));
+        // Starting later: the demuxer sees the file's head, then the fragment
+        // holding `start`, so it never fetches the fragments before it.
+        let mut skipped = 0.0;
+        if let Some(ix) = &index
+            && let Some((at, from)) = ix.fragment_at(start).filter(|f| f.1 > 0.0)
+        {
+            source.splice(ix.head.clone(), at);
+            skipped = from;
+        }
         let stream = MediaSourceStream::new(Box::new(source), MediaSourceStreamOptions::default());
         let mut hint = Hint::new();
         hint.with_extension("m4a");
@@ -240,17 +254,18 @@ impl Engine {
         self.shared.reset();
         let mut current = Current {
             url: url.to_string(),
+            index,
             format,
             decoder,
             track_id,
             time_base,
             channels,
-            base: 0.0,
+            base: skipped,
             started: false,
             eof: false,
         };
-        if start > 0.0 {
-            current.base = seek_format(&mut current, start)?;
+        if start > skipped {
+            current.base = skipped + seek_format(&mut current, start - skipped)?;
         }
         Ok(current)
     }
@@ -258,25 +273,27 @@ impl Engine {
     fn seek(&mut self, seconds: f64) {
         let Some(current) = &mut self.current else { return };
         self.shared.reset();
-        match seek_format(current, seconds) {
-            Ok(actual) => {
-                current.base = actual;
-                current.started = false;
-                current.eof = false;
-            }
-            // Seeking after the reader hit the end of the stream can fail;
-            // reopening the stream and seeking from scratch always works.
-            Err(_) => {
-                let url = current.url.clone();
-                match self.open(&url, seconds) {
-                    Ok(reopened) => self.current = Some(reopened),
-                    Err(e) => {
-                        self.stop();
-                        (self.notify)(PlayerEvent::Error(format!("seek failed: {e}")));
-                    }
-                }
+        // Without an index, the demuxer walks to the target fragment by fragment.
+        if current.index.is_none()
+            && let Ok(actual) = seek_format(current, seconds)
+        {
+            current.base = actual;
+            current.started = false;
+            current.eof = false;
+            return;
+        }
+        // With one, reopening starts right at the target's fragment (and
+        // reopening also recovers a reader that hit the end of the stream).
+        let (url, index) = (current.url.clone(), current.index.clone());
+        let t = std::time::Instant::now();
+        match self.open(&url, seconds, index) {
+            Ok(reopened) => self.current = Some(reopened),
+            Err(e) => {
+                self.stop();
+                (self.notify)(PlayerEvent::Error(format!("seek failed: {e}")));
             }
         }
+        trace!("engine: seek reopened in {:?}", t.elapsed());
     }
 
     /// Decodes until the output buffer is full, the track ends, or it fails.
