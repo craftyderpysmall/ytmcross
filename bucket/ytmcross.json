@@ -5,7 +5,8 @@
     "license": "MIT",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/craftyderpysmall/ytmcross/releases/download/v0.1.0/ytmcross-v0.1.0-windows-x64.zip"
+            "url": "https://github.com/craftyderpysmall/ytmcross/releases/download/v0.1.0/ytmcross-v0.1.0-windows-x64.zip",
+            "hash": "52f5ee72a35f6ad61fe85c5bcd5f1f4ef1cad73212f5fc2002f5d5e4b23f202f"
         }
     },
     "bin": "ytmcross.exe",
