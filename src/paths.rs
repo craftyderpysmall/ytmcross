@@ -9,11 +9,23 @@ use std::path::PathBuf;
 const APP: &str = "ytmcross";
 
 pub fn config_dir() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join(APP)
+    known("APPDATA", dirs::config_dir).join(APP)
 }
 
 pub fn data_dir() -> PathBuf {
-    dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")).join(APP)
+    known("LOCALAPPDATA", dirs::data_local_dir).join(APP)
+}
+
+/// On Windows the environment names these folders: asking the shell
+/// instead (SHGetKnownFolderPath) loads windows.storage.dll and friends.
+fn known(var: &str, ask: fn() -> Option<PathBuf>) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(dir) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    #[cfg(not(windows))]
+    let _ = var;
+    ask().unwrap_or_else(|| PathBuf::from("."))
 }
 
 pub fn config_file() -> PathBuf {

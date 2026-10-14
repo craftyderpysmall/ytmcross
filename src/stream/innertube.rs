@@ -5,7 +5,6 @@ use serde_json::{Value, json};
 
 use super::solver::Solver;
 use crate::auth::session::{ORIGIN, Session};
-use crate::paths;
 
 /// Audio formats the built-in decoder plays, best first:
 /// AAC 256 kbps (YouTube Premium), then AAC 128 kbps.
@@ -19,8 +18,7 @@ pub struct Scrambled {
     cipher: Option<String>,
 }
 
-pub fn player(agent: &ureq::Agent, video_id: &str, sts: u32) -> Result<Scrambled, String> {
-    let session = Session::load(&paths::cookies_file());
+pub fn player(agent: &ureq::Agent, session: &Session, video_id: &str, sts: u32) -> Result<Scrambled, String> {
     let version = crate::api::client::client_version();
     let body = json!({
         "context": {"client": {"clientName": "WEB_REMIX", "clientVersion": version, "hl": "en", "timeZone": "UTC", "utcOffsetMinutes": 0}},

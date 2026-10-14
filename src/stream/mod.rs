@@ -21,9 +21,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::auth::session::Session;
 use crate::player;
 use crate::worker::{Notifier, Response};
-use crate::trace;
+use crate::{paths, trace};
 use solver::{Solver, SolverStore};
 
 /// Entry point of the `--build-solver` helper process.
@@ -83,6 +84,8 @@ struct Shared {
     wake: Condvar,
     out: Notifier,
     agent: ureq::Agent,
+    /// The account's cookies (reloaded on `reset`, i.e. after signing in or out).
+    session: Mutex<Session>,
     solver: SolverStore,
     refresh_failures: AtomicU32,
 }
@@ -97,6 +100,7 @@ impl Resolver {
             state: Mutex::default(),
             wake: Condvar::new(),
             out,
+            session: Mutex::new(Session::load(&paths::cookies_file())),
             solver: SolverStore::new(agent.clone()),
             agent,
             refresh_failures: AtomicU32::new(0),
@@ -151,6 +155,7 @@ impl Resolver {
         s.likely.clear();
         s.preload.clear();
         drop(s);
+        *self.shared.session.lock().unwrap() = Session::load(&paths::cookies_file());
         player::clear_preloaded();
         self.shared.refresh_failures.store(0, Ordering::Relaxed);
     }
@@ -223,10 +228,13 @@ impl Shared {
             return fail_all("solver not ready");
         };
         let t = Instant::now();
+        let session = self.session.lock().unwrap().clone();
         // Player requests in parallel (network-bound), then one solver load.
         let scrambled: Vec<(String, Result<innertube::Scrambled, String>)> = std::thread::scope(|scope| {
             ids.chunks(ids.len().div_ceil(PARALLEL).max(1))
-                .map(|chunk| scope.spawn(|| chunk.iter().map(|id| (id.clone(), innertube::player(&self.agent, id, sts))).collect::<Vec<_>>()))
+                .map(|chunk| {
+                    scope.spawn(|| chunk.iter().map(|id| (id.clone(), innertube::player(&self.agent, &session, id, sts))).collect::<Vec<_>>())
+                })
                 .collect::<Vec<_>>()
                 .into_iter()
                 .flat_map(|h| h.join().unwrap_or_default())
