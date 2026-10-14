@@ -26,7 +26,9 @@ tao = "0.37.1"
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
 ureq = { version = "3.4.2", features = ["json"] }
 wry = "0.57.0"
-symphonia = { version = "0.6.1", default-features = false, features = ["aac", "isomp4", "opt-simd"] }
+# SIMD FFT for the AAC decoder: SSE is as fast here as SSE+AVX (measured)
+# and AVX adds 280 KB. NEON on ARM, below.
+symphonia = { version = "0.6.1", default-features = false, features = ["aac", "isomp4", "opt-simd-sse"] }
 cpal = "0.18.2"
 rquickjs = { version = "0.14.0", features = ["allocator"] }
 # Native (SWC) preprocessing of YouTube's player script; pinned to a tested commit.
@@ -63,6 +65,29 @@ opt-level = "s"
 opt-level = "s"
 [profile.release.package.tao]
 opt-level = "s"
+# Also helper-only: SWC's regex and bignum dependencies.
+[profile.release.package.regex]
+opt-level = "s"
+[profile.release.package.regex-automata]
+opt-level = "s"
+[profile.release.package.regex-syntax]
+opt-level = "s"
+[profile.release.package.aho-corasick]
+opt-level = "s"
+[profile.release.package.num-bigint]
+opt-level = "s"
+# Cold paths of the main app: TLS handshakes and record framing (the
+# bulk crypto is ring's assembly), certificate checks, config parsing.
+[profile.release.package.rustls]
+opt-level = "s"
+[profile.release.package.rustls-webpki]
+opt-level = "s"
+[profile.release.package.toml_parser]
+opt-level = "s"
+[profile.release.package.winnow]
+opt-level = "s"
+[profile.release.package.toml]
+opt-level = "s"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
@@ -71,6 +96,9 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graph
 [target.'cfg(not(windows))'.dependencies]
 bytemuck = "1"
 softbuffer = "0.4.8"
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+symphonia = { version = "0.6.1", default-features = false, features = ["opt-simd-neon"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.190"
