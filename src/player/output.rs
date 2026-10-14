@@ -63,6 +63,12 @@ impl Shared {
         self.played.store(0, Ordering::Relaxed);
     }
 
+    /// Like `reset`, also giving the queue's memory back.
+    pub fn free(&self) {
+        self.reset();
+        *self.samples.lock().unwrap() = VecDeque::new();
+    }
+
     pub fn buffered(&self) -> usize {
         self.samples.lock().unwrap().len()
     }

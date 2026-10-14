@@ -1129,6 +1129,15 @@ impl App {
                 self.notify(e);
                 self.next();
             }
+            // The engine let the paused track go: like the track restored at
+            // startup, play loads it again here (with a fresh URL if needed).
+            PlayerEvent::Released(at) => {
+                pb.set_position(at);
+                self.resume_at = Some(at);
+                if !self.playback.paused {
+                    self.start(at); // play was pressed just as it was let go
+                }
+            }
         }
     }
 

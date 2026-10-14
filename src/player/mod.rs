@@ -6,7 +6,9 @@
 //!
 //! Wake-ups: while playing, the engine refills the buffer about four times
 //! a second; paused or idle, it blocks on its command channel and the
-//! audio stream is paused, so nothing runs at all.
+//! audio stream is paused, so nothing runs at all. After 30 s of that, the
+//! track and the audio device are closed too (the app reloads the track
+//! where it was when play is pressed).
 
 pub mod eq;
 mod index;
@@ -35,6 +37,8 @@ pub use source::{clear_preloaded, is_preloaded, preload_first_chunk};
 
 /// How often the engine tops up the buffer while playing.
 const REFILL_EVERY: Duration = Duration::from_millis(250);
+/// Paused or stopped this long, the track and the audio device are let go.
+const RELEASE_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
@@ -47,6 +51,8 @@ pub enum PlayerEvent {
     /// The current track reached its end.
     Finished,
     Error(String),
+    /// Paused for long, the track was let go: play loads it again from here.
+    Released(f64),
 }
 
 enum Command {
@@ -151,13 +157,16 @@ impl Engine {
     fn run(mut self, commands: Receiver<Command>) {
         loop {
             let active = self.current.is_some() && !self.paused;
-            let next = if !active {
-                commands.recv().map_err(|_| RecvTimeoutError::Disconnected)
-            } else {
+            let next = if active {
                 commands.recv_timeout(REFILL_EVERY)
+            } else if self.output.is_some() {
+                commands.recv_timeout(RELEASE_AFTER)
+            } else {
+                commands.recv().map_err(|_| RecvTimeoutError::Disconnected)
             };
             match next {
                 Ok(cmd) => self.handle(cmd),
+                Err(RecvTimeoutError::Timeout) if !active => self.release(),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
             }
@@ -196,7 +205,8 @@ impl Engine {
             }
             Command::Stop => self.stop(),
             Command::Pause(paused) => {
-                if self.paused == paused {
+                // Nothing loaded (e.g. just released): nothing to pause or resume.
+                if self.paused == paused || self.current.is_none() {
                     return;
                 }
                 self.paused = paused;
@@ -216,6 +226,19 @@ impl Engine {
         if let Some(out) = &mut self.output {
             out.pause();
         }
+    }
+
+    /// Paused (or stopped) for a while: close the track and the audio
+    /// device, so nothing waits in the background and their memory goes.
+    fn release(&mut self) {
+        if self.current.is_some() {
+            (self.notify)(PlayerEvent::Released(self.position()));
+        }
+        trace!("engine: released the track and the audio device");
+        self.current = None;
+        self.output = None;
+        self.shared.free();
+        self.scratch = Vec::new();
     }
 
     /// Opens `url` at `start` seconds and prepares the decoder and an output
