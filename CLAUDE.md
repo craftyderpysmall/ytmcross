@@ -23,7 +23,8 @@ $env:RUSTUP_HOME = "$env:USERPROFILE\scoop\persist\rustup\.rustup"
 - Toolchain: `stable-x86_64-pc-windows-gnu` (folder override). Release build ~2 min (fat LTO).
 - Keep `cargo clippy --all-targets` at zero warnings; `cargo test` must pass.
 - Two binaries: `ytmcross` and `ytmcross-login` (`src/bin/`, the sign-in webview, needs `WebView2Loader.dll` beside it; copy from webview2-com-sys `x64/` if missing). The main exe must never import that DLL (`objdump -p target\release\ytmcross.exe | Select-String "DLL Name"`).
-- `build.rs` deflates `assets/ejs/*.js` into the binary.
+- `build.rs` deflates `assets/ejs/*.js` into the binary and embeds `assets/ytmcross.manifest` (segment heap) via `windres`.
+- Per-crate `opt-level = "s"` in Cargo.toml is only for helper-only or cold crates; measure CPU before adding more.
 
 ## Pitfalls
 
@@ -35,15 +36,18 @@ $env:RUSTUP_HOME = "$env:USERPROFILE\scoop\persist\rustup\.rustup"
 
 ## Architecture (src/)
 
-- `ui/shell.rs`: winit loop, CPU rendering (egui_software_backend + softbuffer, caching off). Draws only on change, nothing when hidden.
+- `ui/shell.rs`: winit loop, CPU rendering (egui_software_backend, caching off). Draws only on change, nothing when hidden; animation frames wait on `DwmFlush`. `YTMCROSS_STATS=1` shows per-phase frame times in the title.
+- `ui/damage.rs`: hashes every shape per frame; only changed regions are tessellated, rasterized and blitted. Partial frames must stay pixel-identical to full ones (check with screenshots + `pxdiff.py` after a forced full redraw: minimize/restore).
+- `ui/present.rs`: Windows presents with GDI from a `VirtualAlloc` frame freed whenever no animation frame is due (softbuffer elsewhere). `ui/clipboard.rs`: Win32 text clipboard (egui-winit's clipboard feature is off on Windows).
 - `ui/app.rs`: all state. Spotify-style `Queue` (current, user `manual` queue first, then `context`; radio appended at the end). Back history of pages. `likes` overrides like status. `last-played` restores the track paused; its stream is prefetched only when the pointer hovers play. System fallback fonts are installed on first need.
 - `ui/views.rs`: views return an `Action` applied afterwards; virtualized `track_list`; queue rows via `QueueRow`.
 - `ui/widgets.rs`: custom widgets. `track_row`: title (plain), `byline` (Artist and Album links, plays), like button (hover only, filled if liked) left of a fixed-width duration slot.
 - `ui/menus.rs`: Account/Equalizer/Pitch/Theme popups, context menus (Delete owned playlists, Remove saved ones), delete modal. `ui/bar.rs`: now-playing bar.
-- `worker.rs`: single API thread (`Request`/`Response`).
+- `pool.rs`: worker threads that exit after 5 idle s; used by `worker.rs` (API, one thread), album art (4), and the resolver/engine threads follow the same rule. Idle app: 6 threads.
+- `worker.rs`: API requests (`Request`/`Response`).
 - `api/`: InnerTube WEB_REMIX client, parser (searches leaf renderers), models (`Track`, `Playlist` with `kind`/`owned`/`save_id`, `Header`, `Artist`).
-- `stream/`: native stream resolving: `player` endpoint + unscrambling in QuickJS (`solver.rs`, bytecode cached, built by the `--build-solver` helper process). A 403 rebuilds the solver. yt-dlp is intentionally not used.
-- `player/`: symphonia + cpal. Callback applies volume, `pitch.rs` (WSOLA + resampler, bypassed at 0) and `eq.rs`.
+- `stream/`: native stream resolving: `player` endpoint + unscrambling in QuickJS (`solver.rs`, bytecode cached, built by the `--build-solver` helper process). A 403 rebuilds the solver. yt-dlp is intentionally not used. Only likely plays (hovered/pressed row, next in queue) get their first 128 KiB preloaded.
+- `player/`: symphonia + cpal. Callback applies volume, `pitch.rs` (WSOLA + resampler, bypassed at 0, buffers allocated on first use) and `eq.rs`. `index.rs` reads the sidx: seeks/resumes splice the stream (head + target fragment) for one request. After 30 s paused the engine releases track and device (`PlayerEvent::Released`) and its thread exits.
 - `theme.rs`: themes, subset Inter fonts, memory-mapped system fallback fonts. `config.rs`: line-based `config.toml` edits.
 
 ## YouTube Music API facts
@@ -64,7 +68,7 @@ $env:RUSTUP_HOME = "$env:USERPROFILE\scoop\persist\rustup\.rustup"
 
 ## Baselines
 
-Main exe 10.71 MB, login exe 0.68 MB. Wall launch-to-first-frame ~80 ms. Idle 7.8–8.0 MB private, ~17.4 MB playing. Idle CPU 0.
+Main exe 10.31 MB, login exe 0.72 MB. Process creation to main ~30 ms (OS; a trivial exe is the same), main to first frame ~34 ms (~20 ms of it is winit window creation). Idle 3.5 MB private, 6 threads. memtest settles ~8.5 MB. Playing ~13 Mcycles/s visible, ~9.7 minimized; true idle ~0. Seek ~30 ms.
 
 ## Data
 
