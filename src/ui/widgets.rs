@@ -76,7 +76,6 @@ fn row_frame(ui: &mut Ui, theme: &Theme, active: bool, sense: Sense) -> (Rect, R
 #[derive(Default)]
 pub struct RowClicks {
     pub like: bool,
-    pub title: bool,
     pub artist: bool,
     pub album: bool,
 }
@@ -84,11 +83,39 @@ pub struct RowClicks {
 /// A piece of text that acts as a link: underlined and pointing-hand on
 /// hover. Returns whether it was clicked; its response is merged into
 /// `row`, so right-clicking the text still opens the row's menu.
-fn link(ui: &Ui, row: &mut Response, id: Id, pos: Pos2, galley: Arc<Galley>, color: Color32, enabled: bool) -> bool {
-    let Some(resp) = text_link(ui, id, pos, galley, color, enabled) else { return false };
-    let clicked = resp.clicked();
-    *row = row.union(resp);
-    clicked
+/// "Artist • Album • 388M plays" in one line of `max_w`, artist and album
+/// as links. The album name gives way first, so the play count always fits.
+/// Returns the artist and album link responses (None when not links).
+pub fn byline(ui: &Ui, id: Id, pos: Pos2, max_w: f32, track: &Track, theme: &Theme, plays: bool) -> [Option<Response>; 2] {
+    let (font, color) = (small(theme), theme.colors.text_dim);
+    let right = pos.x + max_w;
+    let sep = |ui: &Ui, x: f32| {
+        let g = line(ui, " • ", font.clone(), color, f32::INFINITY);
+        let w = g.size().x;
+        ui.painter().galley(pos2(x, pos.y), g, color);
+        x + w
+    };
+    let plays = track.plays.as_ref().filter(|_| plays).map(|p| line(ui, p, font.clone(), color, max_w));
+    let reserve = plays.as_ref().map_or(0.0, |g| g.size().x + 14.0);
+    let artist = line(ui, &track.artists, font.clone(), color, (max_w - reserve).max(0.0));
+    let mut x = pos.x + artist.size().x;
+    let artist = text_link(ui, id.with("artist"), pos, artist, color, track.artist_id.is_some());
+    let mut album_link = None;
+    if let Some(album) = &track.album {
+        let ax = if track.artists.is_empty() { x } else { sep(ui, x) };
+        if right - reserve - ax > 24.0 {
+            let g = line(ui, album, font.clone(), color, right - reserve - ax);
+            x = ax + g.size().x;
+            album_link = text_link(ui, id.with("album"), pos2(ax, pos.y), g, color, track.album_id.is_some());
+        }
+    }
+    if let Some(g) = plays {
+        let px = if x > pos.x { sep(ui, x) } else { x };
+        if px + g.size().x <= right + 0.5 {
+            ui.painter().galley(pos2(px, pos.y), g, color);
+        }
+    }
+    [artist, album_link]
 }
 
 /// Draws `galley` at `pos`; when `enabled` it's clickable, underlined on hover.
@@ -155,25 +182,16 @@ pub fn track_row(ui: &mut Ui, images: &Images, theme: &Theme, track: &Track, loo
     let max_w = (right - x).max(0.0);
     let title_color = if look.playing { c.accent } else { c.text };
     let title = line(ui, &track.title, title_font(theme), title_color, max_w);
-    let sub_font = small(theme);
-    let artist = line(ui, &track.artists, sub_font.clone(), c.text_dim, max_w);
-    let total = title.size().y + 2.0 + artist.size().y;
+    let sub_h = line(ui, " ", small(theme), c.text_dim, f32::INFINITY).size().y;
+    let total = title.size().y + 2.0 + sub_h;
     let top = rect.center().y - total / 2.0;
     let sub_y = top + title.size().y + 2.0;
-    clicks.title = link(ui, &mut resp, row_id.with("title"), pos2(x, top), title, title_color, track.album_id.is_some());
-    let artist_w = artist.size().x;
-    clicks.artist = link(ui, &mut resp, row_id.with("artist"), pos2(x, sub_y), artist, c.text_dim, track.artist_id.is_some());
-    if let Some(album) = &track.album {
-        let mut ax = x + artist_w;
-        if !track.artists.is_empty() {
-            let sep = line(ui, " • ", sub_font.clone(), c.text_dim, f32::INFINITY);
-            let w = sep.size().x;
-            ui.painter().galley(pos2(ax, sub_y), sep, c.text_dim);
-            ax += w;
-        }
-        if right - ax > 24.0 {
-            let g = line(ui, album, sub_font, c.text_dim, right - ax);
-            clicks.album = link(ui, &mut resp, row_id.with("album"), pos2(ax, sub_y), g, c.text_dim, track.album_id.is_some());
+    ui.painter().galley(pos2(x, top), title, title_color);
+    let [artist, album] = byline(ui, row_id, pos2(x, sub_y), max_w, track, theme, true);
+    for (link, clicked) in [(artist, &mut clicks.artist), (album, &mut clicks.album)] {
+        if let Some(link) = link {
+            *clicked = link.clicked();
+            resp = resp.union(link);
         }
     }
     if look.playing {

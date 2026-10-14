@@ -13,6 +13,8 @@ pub struct Track {
     pub album_id: Option<String>,
     /// Whether it's in Liked Music, when the response said.
     pub liked: Option<bool>,
+    /// "388M plays" / "1.2M views", when listed.
+    pub plays: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

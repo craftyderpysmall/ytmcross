@@ -1255,6 +1255,7 @@ fn load_last_played() -> Option<(Track, f64)> {
         artist_id: opt(f[6]),
         album_id: opt(f[7]),
         liked: f[8].parse().ok(),
+        plays: None,
     };
     Some((track, f[9].parse().unwrap_or(0.0)))
 }
@@ -1284,6 +1285,7 @@ mod tests {
                 artist_id: None,
                 album_id: None,
                 liked: None,
+                plays: None,
             })
             .collect();
         shuffle_tracks(&mut tracks);

@@ -151,6 +151,8 @@ fn list_item(r: &Value) -> Option<Track> {
         .flat_map(|c| runs_of(&c["musicResponsiveListItemFlexColumnRenderer"]["text"]))
         .collect();
     let album_link = link(&runs, ALBUM_PAGE);
+    let plays = runs.iter().filter_map(|r| r["text"].as_str()).find(|t| is_play_count(t)).map(str::to_string);
+    groups.retain(|g| !is_play_count(g));
 
     Some(Track {
         video_id,
@@ -163,6 +165,7 @@ fn list_item(r: &Value) -> Option<Track> {
         artist_id: link(&runs, ARTIST_PAGE).map(|(_, id)| id.to_string()),
         album_id: album_link.map(|(_, id)| id.to_string()),
         liked: liked(&r["menu"]),
+        plays,
     })
 }
 
@@ -182,7 +185,37 @@ fn panel_item(r: &Value) -> Option<Track> {
         artist_id: runs.iter().find_map(|run| browse(run).map(|(id, _)| id).filter(|id| id.starts_with("UC"))).map(str::to_string),
         album_id: album_link.or_else(|| runs.iter().find_map(|run| browse(run).filter(|(id, _)| id.starts_with("MPRE")).map(|(id, _)| ("", id)))).map(|(_, id)| id.to_string()),
         liked: liked(&r["menu"]),
+        plays: None,
     })
+}
+
+/// "388M plays", "1.2K views".
+fn is_play_count(s: &str) -> bool {
+    (s.ends_with(" plays") || s.ends_with(" views")) && s.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// "852M plays" -> 852_000_000.
+pub fn play_count(s: &str) -> Option<u64> {
+    let num = s.split(' ').next()?;
+    let (digits, scale) = match num.chars().last()? {
+        'K' => (&num[..num.len() - 1], 1e3),
+        'M' => (&num[..num.len() - 1], 1e6),
+        'B' => (&num[..num.len() - 1], 1e9),
+        _ => (num, 1.0),
+    };
+    Some((digits.replace(',', "").parse::<f64>().ok()? * scale) as u64)
+}
+
+/// 1_934_000_000 -> "1.9B", the way YouTube abbreviates.
+pub fn short_count(n: u64) -> String {
+    let (v, unit) = match n {
+        n if n >= 1_000_000_000 => (n as f64 / 1e9, "B"),
+        n if n >= 1_000_000 => (n as f64 / 1e6, "M"),
+        n if n >= 1_000 => (n as f64 / 1e3, "K"),
+        n => return n.to_string(),
+    };
+    let s = if v < 10.0 { format!("{v:.1}") } else { format!("{v:.0}") };
+    format!("{}{unit}", s.trim_end_matches(".0"))
 }
 
 /// Playlists and albums: library and carousel cards, and search result rows.
@@ -357,6 +390,17 @@ mod tests {
         assert_eq!(t.thumb.as_deref(), Some("big"));
         assert_eq!((t.artist_id.as_deref(), t.album_id.as_deref()), (Some("UC1"), Some("MPREb_1")));
         assert_eq!(t.liked, Some(true));
+    }
+
+    #[test]
+    fn play_counts_round_trip() {
+        assert_eq!(play_count("852M plays"), Some(852_000_000));
+        assert_eq!(play_count("1.2B plays"), Some(1_200_000_000));
+        assert_eq!(play_count("126 plays"), Some(126));
+        assert_eq!(short_count(1_934_000_000), "1.9B");
+        assert_eq!(short_count(852_000_000), "852M");
+        assert_eq!(short_count(2_000_000), "2M");
+        assert_eq!(short_count(126), "126");
     }
 
     #[test]

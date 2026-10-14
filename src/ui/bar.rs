@@ -17,7 +17,7 @@ enum Action {
     Next,
     Seek(f64),
     Volume(f32),
-    OpenAlbum(crate::api::models::Track),
+    OpenAlbum(Box<crate::api::models::Track>),
     OpenArtist(String),
 }
 
@@ -37,25 +37,24 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         widgets::art(ui, &app.images, art, track.and_then(|t| t.thumb.as_deref()), theme);
         let text_x = art.right() + 12.0;
         let text_w = rect.left() + left_w - text_x - 8.0;
-        let (title, sub) = match track {
-            Some(t) => (t.title.as_str(), t.artists.as_str()),
-            None => ("Not playing", ""),
-        };
+        let title = track.map_or("Not playing", |t| t.title.as_str());
         let g_title = line(ui, title, widgets::title_font(theme), c.text, text_w);
-        let g_sub = line(ui, sub, widgets::small(theme), c.text_dim, text_w);
-        let total = g_title.size().y + 3.0 + g_sub.size().y;
+        let sub_h = line(ui, " ", widgets::small(theme), c.text_dim, f32::INFINITY).size().y;
+        let total = g_title.size().y + 3.0 + sub_h;
         let top = rect.center().y - total / 2.0;
         let sub_y = top + g_title.size().y + 3.0;
-        // Title opens the album, artist the artist page.
-        let album = track.filter(|t| t.album_id.is_some());
-        let title_link = widgets::text_link(ui, Id::new("bar-title"), pos2(text_x, top), g_title, c.text, album.is_some());
-        if let (Some(t), true) = (album, title_link.is_some_and(|r| r.clicked())) {
-            action = Some(Action::OpenAlbum(t.clone()));
-        }
-        let artist = track.and_then(|t| t.artist_id.clone());
-        let artist_link = widgets::text_link(ui, Id::new("bar-artist"), pos2(text_x, sub_y), g_sub, c.text_dim, artist.is_some());
-        if let (Some(id), true) = (artist, artist_link.is_some_and(|r| r.clicked())) {
-            action = Some(Action::OpenArtist(id));
+        ui.painter().galley(pos2(text_x, top), g_title, c.text);
+        // "Artist • Album": artist opens the artist page, album the album.
+        if let Some(t) = track {
+            let [artist, album] = widgets::byline(ui, Id::new("bar"), pos2(text_x, sub_y), text_w, t, theme, false);
+            if artist.is_some_and(|r| r.clicked())
+                && let Some(id) = &t.artist_id
+            {
+                action = Some(Action::OpenArtist(id.clone()));
+            }
+            if album.is_some_and(|r| r.clicked()) {
+                action = Some(Action::OpenAlbum(Box::new(t.clone())));
+            }
         }
 
         // Right: volume (hidden when the window is narrow).

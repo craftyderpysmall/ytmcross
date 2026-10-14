@@ -9,6 +9,7 @@ use super::app::{App, View};
 use super::menus::{self, MenuAction, PlaylistChoice, TrackChoice};
 use super::widgets::{self, RowLook, card, ghost_pill, nav_item, pill, playlist_row, text_button, track_row};
 use crate::api::models::{Kind, Playlist, Track};
+use crate::api::parse;
 use crate::theme::{self, Theme};
 
 /// Entrance animation of a view: fade in while sliding up this far.
@@ -324,7 +325,7 @@ fn rows(ui: &mut Ui, app: &App, spec: &ListSpec, range: Range<usize>, out: &mut 
         rects.push((i, resp.rect));
         if clicks.like {
             out.like = Some(i);
-        } else if clicks.title || clicks.album {
+        } else if clicks.album {
             out.album = Some(i);
         } else if clicks.artist {
             out.artist = Some(i);
@@ -573,11 +574,10 @@ fn playlist(app: &mut App, ui: &mut Ui, list: &mut ListResult) -> Option<Action>
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 if let Some((name, id)) = &pl.header.artist {
-                    let text = RichText::new(name).font(widgets::title_font(theme)).color(theme.colors.text);
-                    let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
-                    if let Some(id) = id
-                        && resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
-                    {
+                    let g = widgets::line(ui, name, widgets::title_font(theme), theme.colors.text, ui.available_width() * 0.6);
+                    let (rect, _) = ui.allocate_exact_size(g.size(), egui::Sense::hover());
+                    let link = widgets::text_link(ui, Id::new("page-artist"), rect.min, g, theme.colors.text, id.is_some());
+                    if let (Some(id), true) = (id, link.is_some_and(|r| r.clicked())) {
                         action = Some(Action::OpenArtist(id.clone()));
                     }
                     if !pl.header.subtitle.is_empty() {
@@ -590,6 +590,13 @@ fn playlist(app: &mut App, ui: &mut Ui, list: &mut ListResult) -> Option<Action>
                         1 => "1 track".into(),
                         n => format!("{n} tracks"),
                     };
+                }
+                // Albums: total plays of all their songs.
+                if pl.meta.kind == Kind::Album {
+                    let total: u64 = pl.tracks.iter().filter_map(|t| t.plays.as_deref().and_then(parse::play_count)).sum();
+                    if total > 0 {
+                        info.push_str(&format!(" • {} plays", parse::short_count(total)));
+                    }
                 }
                 if pl.loading && !pl.tracks.is_empty() {
                     info.push_str(", loading…");
