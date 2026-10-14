@@ -61,9 +61,9 @@ pub fn row_height(theme: &Theme) -> f32 {
 }
 
 /// A full-width clickable row with a soft animated hover background.
-fn row_frame(ui: &mut Ui, theme: &Theme, active: bool) -> (Rect, Response) {
+fn row_frame(ui: &mut Ui, theme: &Theme, active: bool, sense: Sense) -> (Rect, Response) {
     let size = vec2(ui.available_width(), row_height(theme));
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
     if ui.is_rect_visible(rect) {
         let t = ease(ui, resp.id.with("hover"), resp.hovered());
         let fill = if active { theme.colors.selection } else { theme.colors.hover.gamma_multiply(t) };
@@ -111,8 +111,10 @@ struct RowText<'a> {
     highlight: bool,
 }
 
-pub fn track_row(ui: &mut Ui, images: &Images, theme: &Theme, track: &Track, playing: bool, active: bool) -> Response {
-    let (rect, resp) = row_frame(ui, theme, active);
+/// `draggable` rows can be dragged (to reorder); a click still plays.
+pub fn track_row(ui: &mut Ui, images: &Images, theme: &Theme, track: &Track, playing: bool, active: bool, draggable: bool) -> Response {
+    let sense = if draggable { Sense::click_and_drag() } else { Sense::click() };
+    let (rect, resp) = row_frame(ui, theme, active, sense);
     if ui.is_rect_visible(rect) {
         let subtitle = match &track.album {
             Some(album) if !track.artists.is_empty() => format!("{} • {album}", track.artists),
@@ -131,7 +133,7 @@ pub fn track_row(ui: &mut Ui, images: &Images, theme: &Theme, track: &Track, pla
 }
 
 pub fn playlist_row(ui: &mut Ui, images: &Images, theme: &Theme, title: &str, subtitle: &str, thumb: Option<&str>) -> Response {
-    let (rect, resp) = row_frame(ui, theme, false);
+    let (rect, resp) = row_frame(ui, theme, false, Sense::click());
     if ui.is_rect_visible(rect) {
         row_content(ui, images, theme, rect, RowText { title, subtitle, right: None, thumb, highlight: false });
     }

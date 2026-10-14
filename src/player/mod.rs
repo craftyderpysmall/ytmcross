@@ -8,6 +8,7 @@
 //! a second; paused or idle, it blocks on its command channel and the
 //! audio stream is paused, so nothing runs at all.
 
+pub mod eq;
 mod output;
 mod source;
 
@@ -23,11 +24,11 @@ use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{Time, TimeBase};
 
-use crate::config::PlayerConfig;
+use crate::config::{EqualizerConfig, PlayerConfig};
 use crate::trace;
 use output::{Output, Shared};
 use source::HttpSource;
-pub use source::{is_preloaded, preload_first_chunk};
+pub use source::{clear_preloaded, is_preloaded, preload_first_chunk};
 
 /// How often the engine tops up the buffer while playing.
 const REFILL_EVERY: Duration = Duration::from_millis(250);
@@ -60,8 +61,13 @@ pub struct Player {
 impl Player {
     /// `agent` is shared with the resolver: preloads warm up the same
     /// connections the player then streams over.
-    pub fn spawn(cfg: &PlayerConfig, agent: ureq::Agent, notify: impl Fn(PlayerEvent) + Send + 'static) -> std::io::Result<Player> {
-        let shared = Shared::new();
+    pub fn spawn(
+        cfg: &PlayerConfig,
+        eq: &EqualizerConfig,
+        agent: ureq::Agent,
+        notify: impl Fn(PlayerEvent) + Send + 'static,
+    ) -> std::io::Result<Player> {
+        let shared = Shared::new(eq);
         shared.set_volume(cfg.volume.min(100) as f32 / 100.0);
         let (tx, rx) = mpsc::channel();
         let engine_shared = shared.clone();
@@ -91,6 +97,11 @@ impl Player {
     /// 0..=100, applied immediately in the audio callback.
     pub fn set_volume(&self, volume: f64) {
         self.shared.set_volume((volume / 100.0) as f32);
+    }
+
+    /// Applied immediately in the audio callback.
+    pub fn set_equalizer(&self, eq: &EqualizerConfig) {
+        self.shared.eq.set(eq);
     }
 }
 

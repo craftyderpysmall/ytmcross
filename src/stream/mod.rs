@@ -5,13 +5,14 @@
 //! fallback when the native path can't (see `ytdlp.rs`).
 //!
 //! Getting ahead of the user:
-//! - rows on screen are resolved in the background (`Hint::Visible`);
+//! - rows on screen are resolved in the background and the first 64 KiB of
+//!   their audio is preloaded (`Hint::Visible`);
 //! - likely next plays (row under the mouse or being pressed, next in queue,
-//!   top search result) are resolved *and* their first 256 KiB of audio is
-//!   downloaded (`Hint::Likely`), so playback starts without touching the
-//!   network;
+//!   top search result) go first and get 128 KiB (`Hint::Likely`);
 //! - a click never waits behind background work: it has its own thread.
-//! URLs are valid for hours; they are cached in memory until they expire.
+//!
+//! So playback usually starts without touching the network. URLs are valid
+//! for hours; they are cached in memory until they expire.
 
 mod innertube;
 mod solver;
@@ -148,6 +149,21 @@ impl Resolver {
         s.cache.insert(id.to_string(), Entry::Queued);
         s.urgent.push_back(id.to_string());
         self.shared.wake.notify_all();
+    }
+
+    /// Forgets everything resolved so far: stream URLs belong to the account
+    /// that fetched them (Premium gets other formats), so after signing in or
+    /// out they must be fetched again. Also gives the native path a fresh start.
+    pub fn reset(&self) {
+        let mut s = self.shared.state.lock().unwrap();
+        s.cache.retain(|_, e| matches!(e, Entry::Running));
+        s.background.clear();
+        s.likely.clear();
+        s.preload.clear();
+        drop(s);
+        player::clear_preloaded();
+        self.shared.native_failures.store(0, Ordering::Relaxed);
+        self.shared.refresh_failures.store(0, Ordering::Relaxed);
     }
 
     /// The player is about to stream `url` itself: a queued preload of it

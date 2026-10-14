@@ -30,6 +30,13 @@ impl From<ureq::Error> for ApiError {
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
+pub struct PlaylistPage {
+    pub tracks: Vec<Track>,
+    pub next: Option<Continuation>,
+    /// Set on the first page only.
+    pub editable: Option<bool>,
+}
+
 pub struct Client {
     agent: ureq::Agent,
     session: Session,
@@ -59,13 +66,14 @@ impl Client {
             .post(&url)
             .header("Origin", ORIGIN)
             .header("X-Origin", ORIGIN)
-            .header("X-Goog-AuthUser", "0")
-            .header("Cookie", self.session.cookie_header());
+            .header("X-Goog-AuthUser", "0");
         if let Some(auth) = self.session.auth_header() {
-            req = req.header("Authorization", auth);
+            req = req.header("Cookie", self.session.cookie_header()).header("Authorization", auth);
         }
         let resp: Value = req.send_json(&body)?.body_mut().read_json()?;
-        if parse::logged_in(&resp) == Some(false) {
+        // Signed out on purpose, every answer says logged out: only report
+        // it when there was a session to lose (it expired).
+        if self.session.is_signed_in() && parse::logged_in(&resp) == Some(false) {
             return Err(ApiError::LoggedOut);
         }
         Ok(resp)
@@ -81,15 +89,45 @@ impl Client {
         Ok(parse::playlists(&resp))
     }
 
-    /// One page of a playlist. Pass the returned continuation to get the next.
-    pub fn playlist_page(&self, id: &str, cont: Option<&Continuation>) -> Result<(Vec<Track>, Option<Continuation>)> {
+    /// One page of a playlist. Pass the returned continuation to get the
+    /// next. The first page also says whether the playlist is editable.
+    pub fn playlist_page(&self, id: &str, cont: Option<&Continuation>) -> Result<PlaylistPage> {
         let resp = match cont {
             None => self.post("browse", json!({"browseId": format!("VL{id}")}), "")?,
             Some(Continuation::Command(t)) => self.post("browse", json!({"continuation": t}), "")?,
             Some(Continuation::Next(t)) => self.post("browse", json!({}), &format!("&ctoken={t}&continuation={t}&type=next"))?,
         };
+        let editable = cont.is_none().then(|| parse::playlist_editable(&resp));
         let scope = parse::playlist_scope(&resp);
-        Ok((parse::tracks(scope), parse::continuation(scope)))
+        Ok(PlaylistPage { tracks: parse::tracks(scope), next: parse::continuation(scope), editable })
+    }
+
+    /// Creates a private playlist; returns its id.
+    pub fn create_playlist(&self, title: &str) -> Result<String> {
+        let resp = self.post("playlist/create", json!({"title": title, "description": "", "privacyStatus": "PRIVATE"}), "")?;
+        resp["playlistId"].as_str().map(str::to_string).ok_or_else(|| ApiError::Other("no playlist id returned".into()))
+    }
+
+    pub fn delete_playlist(&self, id: &str) -> Result<()> {
+        self.post("playlist/delete", json!({"playlistId": id}), "").map(|_| ())
+    }
+
+    pub fn add_to_playlist(&self, id: &str, video_id: &str) -> Result<()> {
+        self.edit_playlist(id, json!({"action": "ACTION_ADD_VIDEO", "addedVideoId": video_id, "dedupeOption": "DEDUPE_OPTION_SKIP"}))
+    }
+
+    /// Moves an entry to just before `before` (another entry), or to the end.
+    pub fn move_in_playlist(&self, id: &str, set_video_id: &str, before: Option<&str>) -> Result<()> {
+        let mut action = json!({"action": "ACTION_MOVE_VIDEO_BEFORE", "setVideoId": set_video_id});
+        if let Some(before) = before {
+            action["movedSetVideoIdSuccessor"] = json!(before);
+        }
+        self.edit_playlist(id, action)
+    }
+
+    fn edit_playlist(&self, id: &str, action: Value) -> Result<()> {
+        let resp = self.post("browse/edit_playlist", json!({"playlistId": id, "actions": [action]}), "")?;
+        if parse::edit_succeeded(&resp) { Ok(()) } else { Err(ApiError::Other("YouTube rejected the change".into())) }
     }
 
     /// Radio / up-next queue seeded from a track.

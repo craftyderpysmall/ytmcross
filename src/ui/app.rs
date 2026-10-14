@@ -15,7 +15,7 @@ use super::{bar, views};
 use crate::api::client;
 use crate::api::models::{Playlist, Track};
 use crate::auth;
-use crate::config::{BarPosition, Config};
+use crate::config::{BarPosition, Config, EqualizerConfig};
 use crate::player::{Player, PlayerEvent};
 use crate::stream::{Hint, Resolver};
 use crate::trace;
@@ -72,6 +72,15 @@ pub struct PlaylistState {
     pub meta: Playlist,
     pub tracks: Vec<Track>,
     pub loading: bool,
+    /// The user's own playlist: rows can be dragged to reorder.
+    pub editable: bool,
+    /// Start playing once the first page arrives ("Play" from the library).
+    autoplay: bool,
+}
+
+/// Playlists that can't be edited or deleted: Liked Music, Episodes for Later.
+pub fn is_special_playlist(id: &str) -> bool {
+    matches!(id, "LM" | "SE")
 }
 
 pub struct Playback {
@@ -134,10 +143,21 @@ pub struct App {
     pub notice: Option<(String, Instant)>,
     pub signed_out: bool,
     pub signing_in: bool,
+
+    /// Theme names for the Theme menu.
+    pub themes: Vec<String>,
+    /// Live equalizer settings (saved to config.toml on release).
+    pub eq: EqualizerConfig,
+    /// Playlist row being dragged: (from index, current drop index).
+    pub drag: Option<(usize, usize)>,
+    /// Title being typed for a new playlist.
+    pub new_playlist: Option<String>,
+    /// Playlist waiting for delete confirmation.
+    pub confirm_delete: Option<Playlist>,
 }
 
 impl App {
-    pub fn new(ctx: &egui::Context, config: Config, loaded: theme::Loaded, config_error: Option<String>) -> App {
+    pub fn new(ctx: &egui::Context, config: Config, loaded: theme::Loaded, config_error: Option<String>, signed_in: bool) -> App {
         theme::install_fonts(ctx, loaded.font);
         loaded.theme.apply(ctx);
 
@@ -149,7 +169,7 @@ impl App {
         let player_notifier = notifier.clone();
         // Shares the agent (and its kept-alive connection to YouTube Music) with the API worker.
         let resolver = Resolver::new(&config.player.ytdlp, notifier.clone(), agent.clone());
-        let player = match Player::spawn(&config.player, agent, move |e| player_notifier.send(Response::Player(e))) {
+        let player = match Player::spawn(&config.player, &config.equalizer, agent, move |e| player_notifier.send(Response::Player(e))) {
             Ok(p) => Some(p),
             Err(e) => {
                 notice = Some(format!("Couldn't start the audio engine ({e})."));
@@ -158,9 +178,13 @@ impl App {
         };
 
         let view = config.layout.sidebar_items.iter().find_map(|n| View::from_name(n)).unwrap_or(View::Library);
-        let _ = requests.send(Request::Library);
+        if signed_in {
+            let _ = requests.send(Request::Library);
+        }
+        let _ = requests.send(Request::ListThemes);
         App {
             font_file: loaded.theme.font_file.clone(),
+            eq: config.equalizer.clone(),
             playback: Playback {
                 loading: false,
                 paused: false,
@@ -185,7 +209,7 @@ impl App {
             view_since: 0.0,
             search: SearchState { focus: view == View::Search, ..Default::default() },
             library: None,
-            library_loading: true,
+            library_loading: signed_in,
             playlist: None,
             queue: Vec::new(),
             pos: None,
@@ -193,8 +217,12 @@ impl App {
             radio_seed: None,
             advance_on_radio: false,
             notice: notice.map(|n| (n, Instant::now())),
-            signed_out: false,
+            signed_out: !signed_in,
             signing_in: false,
+            themes: Vec::new(),
+            drag: None,
+            new_playlist: None,
+            confirm_delete: None,
         }
     }
 
@@ -208,16 +236,126 @@ impl App {
         if view == View::Search {
             self.search.focus = true;
         }
-        if view == View::Library && self.library.is_none() && !self.library_loading {
-            self.library_loading = true;
-            let _ = self.requests.send(Request::Library);
+        if view == View::Library && self.library.is_none() && !self.library_loading && !self.signed_out {
+            self.refresh_library();
         }
     }
 
-    pub fn open_playlist(&mut self, ctx: &egui::Context, meta: Playlist) {
+    fn refresh_library(&mut self) {
+        self.library_loading = true;
+        let _ = self.requests.send(Request::Library);
+    }
+
+    pub fn open_playlist(&mut self, ctx: &egui::Context, meta: Playlist, autoplay: bool) {
         let _ = self.requests.send(Request::Playlist(meta.id.clone()));
-        self.playlist = Some(PlaylistState { meta, tracks: Vec::new(), loading: true });
+        self.playlist = Some(PlaylistState { meta, tracks: Vec::new(), loading: true, editable: false, autoplay });
+        self.drag = None;
         self.go(ctx, View::Playlist);
+    }
+
+    fn reload_open_playlist(&mut self) {
+        if let Some(pl) = &mut self.playlist {
+            pl.tracks.clear();
+            pl.loading = true;
+            self.drag = None;
+            let _ = self.requests.send(Request::Playlist(pl.meta.id.clone()));
+        }
+    }
+
+    // ---- menus ------------------------------------------------------------
+
+    pub fn sign_out(&mut self) {
+        let _ = self.requests.send(Request::SignOut);
+    }
+
+    pub fn list_themes(&self) {
+        let _ = self.requests.send(Request::ListThemes);
+    }
+
+    pub fn set_theme(&self, name: &str) {
+        let _ = self.requests.send(Request::SetTheme(name.to_string()));
+    }
+
+    /// Applies equalizer settings at once; `save` also writes config.toml
+    /// (done when a slider is released, not on every drag step).
+    pub fn set_equalizer(&mut self, eq: EqualizerConfig, save: bool) {
+        if let Some(player) = &self.player {
+            player.set_equalizer(&eq);
+        }
+        if save {
+            let _ = self.requests.send(Request::SaveEqualizer(eq.clone()));
+        }
+        self.eq = eq;
+    }
+
+    // ---- library edits ----------------------------------------------------
+
+    pub fn create_playlist(&mut self, title: &str) {
+        let title = title.trim();
+        if !title.is_empty() {
+            let _ = self.requests.send(Request::CreatePlaylist(title.to_string()));
+        }
+        self.new_playlist = None;
+    }
+
+    pub fn delete_playlist(&mut self, playlist: Playlist) {
+        // Optimistic: it disappears now; a failure brings the library back.
+        if let Some(list) = &mut self.library {
+            list.retain(|p| p.id != playlist.id);
+        }
+        if self.playlist.as_ref().is_some_and(|p| p.meta.id == playlist.id) {
+            self.playlist = None;
+            self.view = View::Library;
+        }
+        let _ = self.requests.send(Request::DeletePlaylist { id: playlist.id, title: playlist.title });
+    }
+
+    pub fn add_to_playlist(&self, playlist: &Playlist, track: &Track) {
+        let _ = self.requests.send(Request::AddToPlaylist {
+            id: playlist.id.clone(),
+            title: playlist.title.clone(),
+            video_id: track.video_id.clone(),
+        });
+    }
+
+    /// Finishes a drag in the open playlist: moves locally at once, then
+    /// tells YouTube (a failure reloads the real order).
+    pub fn move_in_playlist(&mut self, from: usize, to: usize) {
+        let Some(pl) = &mut self.playlist else { return };
+        if from >= pl.tracks.len() || to == from || to == from + 1 {
+            return;
+        }
+        let track = pl.tracks.remove(from);
+        let at = if to > from { to - 1 } else { to }.min(pl.tracks.len());
+        let Some(set_video_id) = track.set_video_id.clone() else {
+            pl.tracks.insert(from, track);
+            return;
+        };
+        pl.tracks.insert(at, track);
+        let before = pl.tracks.get(at + 1).and_then(|t| t.set_video_id.clone());
+        let _ = self.requests.send(Request::MoveInPlaylist { id: pl.meta.id.clone(), set_video_id, before });
+    }
+
+    // ---- queue ------------------------------------------------------------
+
+    pub fn add_to_queue(&mut self, track: Track) {
+        let idle = self.pos.is_none();
+        self.queue.push(track);
+        if idle {
+            self.start(self.queue.len() - 1);
+        } else {
+            self.prefetch_ahead();
+        }
+    }
+
+    pub fn play_next(&mut self, track: Track) {
+        match self.pos {
+            Some(pos) => {
+                self.queue.insert(pos + 1, track);
+                self.prefetch_ahead();
+            }
+            None => self.add_to_queue(track),
+        }
     }
 
     pub fn submit_search(&mut self) {
@@ -232,7 +370,7 @@ impl App {
         let _ = self.requests.send(Request::Reload);
     }
 
-    pub fn sign_in_again(&mut self) {
+    pub fn sign_in(&mut self) {
         if self.signing_in {
             return;
         }
@@ -433,10 +571,17 @@ impl App {
                     Err(e) => self.notify(format!("Couldn't load library: {e}")),
                 }
             }
-            Response::PlaylistPage { id, tracks, done } => {
+            Response::PlaylistPage { id, tracks, done, editable } => {
                 if let Some(pl) = self.playlist.as_mut().filter(|p| p.meta.id == id) {
                     pl.tracks.extend(tracks);
                     pl.loading = !done;
+                    if let Some(editable) = editable {
+                        pl.editable = editable;
+                    }
+                    if !pl.tracks.is_empty() && std::mem::take(&mut pl.autoplay) {
+                        let tracks = pl.tracks.clone();
+                        self.play_list(tracks, 0, false);
+                    }
                 }
             }
             Response::PlaylistFailed { id, error } => {
@@ -472,23 +617,58 @@ impl App {
                 }
                 loaded.theme.apply(ctx);
                 self.theme = loaded.theme;
-                self.config = config;
+                if config.equalizer != self.config.equalizer {
+                    self.set_equalizer(config.equalizer.clone(), false);
+                }
+                self.config = *config;
+                self.list_themes();
                 match config_error.or(loaded.error) {
                     Some(e) => self.notify(e),
-                    None => self.notify("Theme and config reloaded"),
+                    None => self.notify(format!("Theme: {}", self.config.theme)),
                 }
             }
             Response::LoggedOut => self.signed_out = true,
+            Response::SignedOut => {
+                self.signed_out = true;
+                self.library = None;
+                self.library_loading = false;
+                if self.view == View::Playlist {
+                    self.view = View::Library;
+                }
+                self.playlist = None;
+                self.resolver.reset();
+                self.notify("Signed out");
+            }
             Response::SignInFinished(ok) => {
                 self.signing_in = false;
                 if ok {
                     self.signed_out = false;
                     let _ = self.requests.send(Request::ReloadSession);
-                    self.library_loading = true;
-                    let _ = self.requests.send(Request::Library);
+                    // Streams resolved for the previous account (or none) are stale.
+                    self.resolver.reset();
+                    self.library = None;
+                    self.refresh_library();
                     self.notify("Signed in");
                 } else {
                     self.notify("Sign-in was cancelled");
+                }
+            }
+            Response::Themes(names) => self.themes = names,
+            Response::Edited { message, refresh_library, refresh_playlist } => {
+                self.notify(message);
+                if refresh_library {
+                    self.refresh_library();
+                }
+                if refresh_playlist.is_some() && self.playlist.as_ref().map(|p| &p.meta.id) == refresh_playlist.as_ref() {
+                    self.reload_open_playlist();
+                }
+            }
+            Response::Created(playlist) => {
+                self.notify(format!("Created \u{201c}{}\u{201d}", playlist.title));
+                if let Some(list) = &mut self.library {
+                    // Newest first, after Liked Music like on YouTube Music.
+                    let at = list.iter().take_while(|p| is_special_playlist(&p.id)).count();
+                    list.insert(at, playlist);
                 }
             }
             Response::Player(event) => self.handle_player(event),

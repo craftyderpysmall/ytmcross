@@ -49,7 +49,7 @@ The first launch opens the sign-in window. To sign in again later, delete `cooki
 accent = "#ff5555"
 ```
 
-The full set of tokens (`colors`, `font`, `shape`, `art`) is documented in `themes/default.toml`, and `themes/rose-pine.toml` is a worked example. Layout options (bar position, sidebar and its entries) live in `config.toml`.
+The full set of tokens (`colors`, `font`, `shape`, `art`) is documented in `themes/default.toml`, and `themes/scarf-dark.toml` is a worked example. Layout options (bar position, sidebar and its entries) live in `config.toml`.
 
 ## Keys
 

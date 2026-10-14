@@ -19,5 +19,9 @@ pub fn sign_in_blocking() -> bool {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    ok && session::Session::load(&paths::cookies_file()).is_signed_in()
+    let signed_in = ok && session::Session::load(&paths::cookies_file()).is_signed_in();
+    if signed_in {
+        let _ = std::fs::remove_file(paths::signed_out_marker());
+    }
+    signed_in
 }

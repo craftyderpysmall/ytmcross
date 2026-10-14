@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use crate::api::client::{ApiError, Client};
 use crate::api::models::{Continuation, Playlist, Track};
 use crate::auth::session::Session;
-use crate::config::Config;
+use crate::config::{self, Config, EqualizerConfig};
 use crate::paths;
 use crate::player::PlayerEvent;
 use crate::theme::{self, Theme};
@@ -22,26 +22,46 @@ pub enum Request {
     Radio { video_id: String, autoplay: bool },
     /// Re-read config.toml and the theme it names.
     Reload,
-    /// Re-read cookies.txt after signing in again.
+    /// Re-read cookies.txt after signing in.
     ReloadSession,
+    /// Forget the local session (cookies.txt).
+    SignOut,
+    ListThemes,
+    /// Save the theme choice to config.toml, then reload.
+    SetTheme(String),
+    SaveEqualizer(EqualizerConfig),
+    CreatePlaylist(String),
+    DeletePlaylist { id: String, title: String },
+    AddToPlaylist { id: String, title: String, video_id: String },
+    /// Move an entry to just before `before` (or to the end).
+    MoveInPlaylist { id: String, set_video_id: String, before: Option<String> },
 }
 
 pub enum Response {
     Search { query: String, result: Result<Vec<Track>, String> },
     Library(Result<Vec<Playlist>, String>),
-    PlaylistPage { id: String, tracks: Vec<Track>, done: bool },
+    /// `editable` is set on the first page only.
+    PlaylistPage { id: String, tracks: Vec<Track>, done: bool, editable: Option<bool> },
     PlaylistFailed { id: String, error: String },
     Radio { seed: String, tracks: Vec<Track>, autoplay: bool },
-    Reloaded { config: Config, theme: theme::Loaded, config_error: Option<String> },
+    Reloaded { config: Box<Config>, theme: Box<theme::Loaded>, config_error: Option<String> },
     LoggedOut,
+    SignedOut,
+    Themes(Vec<String>),
+    /// A library edit finished: a message for the user, and whether the
+    /// library (or the open playlist) should be fetched again.
+    Edited { message: String, refresh_library: bool, refresh_playlist: Option<String> },
+    /// A playlist was created. The library listing lags behind edits, so the
+    /// UI adds it locally instead of fetching the library again.
+    Created(Playlist),
     Player(PlayerEvent),
-    /// A stream URL lookup finished (see resolver.rs).
+    /// A stream URL lookup finished (see stream/mod.rs).
     Resolved { video_id: String, result: Result<String, String> },
     SignInFinished(bool),
 }
 
-/// Sends a response and wakes the UI. While the window is hidden eframe only
-/// runs `App::logic` for this (no layout, no painting).
+/// Sends a response and wakes the UI. While the window is hidden only
+/// `App::logic` runs for it (no layout, no painting).
 #[derive(Clone)]
 pub struct Notifier {
     tx: Sender<Response>,
@@ -81,6 +101,9 @@ fn run(requests: Receiver<Request>, requeue: Sender<Request>, out: Notifier, age
             ApiError::Other(msg) => msg,
         }
     };
+    let edited = |message: String, refresh_library: bool, refresh_playlist: Option<String>| {
+        out.send(Response::Edited { message, refresh_library, refresh_playlist });
+    };
 
     for request in requests {
         match request {
@@ -95,14 +118,51 @@ fn run(requests: Receiver<Request>, requeue: Sender<Request>, out: Notifier, age
                 let tracks = client.radio(&video_id).map_err(err).unwrap_or_default();
                 out.send(Response::Radio { seed: video_id, tracks, autoplay });
             }
-            Request::Reload => {
-                let (config, config_error) = Config::load();
-                let theme = Theme::load(&config.theme);
-                out.send(Response::Reloaded { config, theme, config_error });
-            }
+            Request::Reload => reload(&out),
             Request::ReloadSession => client.set_session(Session::load(&paths::cookies_file())),
+            Request::SignOut => {
+                let _ = std::fs::remove_file(paths::cookies_file());
+                let _ = std::fs::write(paths::signed_out_marker(), "");
+                client.set_session(Session::default());
+                out.send(Response::SignedOut);
+            }
+            Request::ListThemes => out.send(Response::Themes(config::list_themes())),
+            Request::SetTheme(name) => match config::save_theme(&name) {
+                Ok(()) => reload(&out),
+                Err(e) => edited(format!("Couldn't save theme: {e}"), false, None),
+            },
+            Request::SaveEqualizer(eq) => {
+                if let Err(e) = config::save_equalizer(&eq) {
+                    edited(format!("Couldn't save equalizer: {e}"), false, None);
+                }
+            }
+            Request::CreatePlaylist(title) => match client.create_playlist(&title) {
+                Ok(id) => out.send(Response::Created(Playlist { id, title, subtitle: "Private".into(), thumb: None })),
+                Err(e) => edited(format!("Couldn't create playlist: {}", err(e)), false, None),
+            },
+            Request::DeletePlaylist { id, title } => match client.delete_playlist(&id) {
+                Ok(()) => edited(format!("Deleted \u{201c}{title}\u{201d}"), false, None),
+                // The UI already removed it: bring the real library back.
+                Err(e) => edited(format!("Couldn't delete playlist: {}", err(e)), true, None),
+            },
+            Request::AddToPlaylist { id, title, video_id } => match client.add_to_playlist(&id, &video_id) {
+                Ok(()) => edited(format!("Added to \u{201c}{title}\u{201d}"), false, Some(id)),
+                Err(e) => edited(format!("Couldn't add to playlist: {}", err(e)), false, None),
+            },
+            Request::MoveInPlaylist { id, set_video_id, before } => {
+                if let Err(e) = client.move_in_playlist(&id, &set_video_id, before.as_deref()) {
+                    // The local order is now wrong: show the real one again.
+                    edited(format!("Couldn't reorder: {}", err(e)), false, Some(id));
+                }
+            }
         }
     }
+}
+
+fn reload(out: &Notifier) {
+    let (config, config_error) = Config::load();
+    let theme = Theme::load(&config.theme);
+    out.send(Response::Reloaded { config: Box::new(config), theme: Box::new(theme), config_error });
 }
 
 fn playlist_page(
@@ -114,14 +174,14 @@ fn playlist_page(
     err: impl Fn(ApiError) -> String,
 ) {
     match client.playlist_page(&id, cont.as_ref()) {
-        Ok((tracks, next)) => {
+        Ok(page) => {
             // Stop if a page comes back empty, so a bad token can't loop forever.
-            let next = next.filter(|_| !tracks.is_empty());
+            let next = page.next.filter(|_| !page.tracks.is_empty());
             let done = next.is_none();
             if let Some(next) = next {
                 let _ = requeue.send(Request::PlaylistMore(id.clone(), next));
             }
-            out.send(Response::PlaylistPage { id, tracks, done });
+            out.send(Response::PlaylistPage { id, tracks: page.tracks, done, editable: page.editable });
         }
         Err(e) => {
             let error = err(e);

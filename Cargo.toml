@@ -37,6 +37,27 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# Code that runs only in the short-lived helper processes (solver build,
+# sign-in window): optimise for size, the main app never executes it.
+[profile.release.package.ytdlp-ejs]
+opt-level = "s"
+[profile.release.package.swc_ecma_parser]
+opt-level = "s"
+[profile.release.package.swc_ecma_ast]
+opt-level = "s"
+[profile.release.package.swc_ecma_codegen]
+opt-level = "s"
+[profile.release.package.swc_ecma_utils]
+opt-level = "s"
+[profile.release.package.swc_ecma_visit]
+opt-level = "s"
+[profile.release.package.swc_common]
+opt-level = "s"
+[profile.release.package.wry]
+opt-level = "s"
+[profile.release.package.tao]
+opt-level = "s"
+
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 

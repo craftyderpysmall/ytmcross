@@ -45,6 +45,7 @@ struct Shell {
     frame_interval: Duration,
     /// `YTMCROSS_STATS=1`: average frame time shown in the window title.
     stats: Option<(Duration, u32)>,
+    first_frame: bool,
 }
 
 pub fn run(
@@ -57,7 +58,9 @@ pub fn run(
     ctx.set_request_repaint_callback(move |info| {
         let _ = proxy.send_event(Wake(info.delay));
     });
+    crate::trace!("shell: event loop ready");
     let app = make_app(&ctx);
+    crate::trace!("shell: app created");
     let mut shell = Shell {
         softbuffer: softbuffer::Context::new(event_loop.owned_display_handle())?,
         // Measured: the per-primitive cache doubles our RAM (22 vs 12 MB) and is
@@ -65,6 +68,7 @@ pub fn run(
         // invalidates it every frame anyway.
         renderer: EguiSoftwareRender::new(ColorFieldOrder::Bgra).with_caching(false),
         stats: std::env::var_os("YTMCROSS_STATS").map(|_| (Duration::ZERO, 0)),
+        first_frame: true,
         ctx,
         app,
         viewport,
@@ -105,6 +109,10 @@ impl Shell {
         let target = &mut BufferMutRef::new(bytemuck::cast_slice_mut(&mut buffer), w as usize, h as usize);
         self.renderer.render(target, &primitives, &out.textures_delta, out.pixels_per_point);
         buffer.present()?;
+        if self.first_frame {
+            self.first_frame = false;
+            crate::trace!("shell: first frame on screen ({w}x{h}, drawn in {:?})", started.elapsed());
+        }
 
         if let Some((total, frames)) = &mut self.stats {
             *total += started.elapsed();

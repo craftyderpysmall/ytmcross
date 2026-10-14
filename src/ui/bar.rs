@@ -51,10 +51,8 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         if show_volume {
             let r = Rect::from_min_size(pos2(rect.right() - 120.0, rect.center().y - 8.0), vec2(120.0, 16.0));
             let s = slim_slider(ui, theme, r, Id::new("volume"), pb.volume);
-            if s.dragging || s.committed {
-                if (s.value - pb.volume).abs() >= 0.01 || s.committed {
-                    action = Some(Action::Volume(s.value));
-                }
+            if s.committed || (s.dragging && (s.value - pb.volume).abs() >= 0.01) {
+                action = Some(Action::Volume(s.value));
             }
             ui.painter().text(pos2(r.left() - 10.0, r.center().y), Align2::RIGHT_CENTER, "Vol", widgets::small(theme), c.text_dim);
         }

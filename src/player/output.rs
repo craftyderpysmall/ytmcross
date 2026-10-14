@@ -1,15 +1,19 @@
 //! Audio output: a cpal stream fed from a small sample buffer.
 //!
 //! The audio callback is the only real-time code. It never blocks: it
-//! `try_lock`s the buffer and plays silence if it can't get it. Volume is
-//! applied here, and it counts the frames actually played, which is where
-//! the position clock comes from.
+//! `try_lock`s the buffer and plays silence if it can't get it. Volume and
+//! the equalizer are applied here (so changes are heard at once), and it
+//! counts the frames actually played, which is where the position clock
+//! comes from.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+use super::eq::{EqShared, EqState};
+use crate::config::EqualizerConfig;
 
 /// Seconds of decoded audio kept ahead of the speakers. Covers network
 /// hiccups between 256 KiB fetches without holding much memory (~700 KB).
@@ -21,14 +25,16 @@ pub struct Shared {
     gain: AtomicU32,
     /// Frames handed to the device since the last reset.
     played: AtomicU64,
+    pub eq: EqShared,
 }
 
 impl Shared {
-    pub fn new() -> Arc<Shared> {
+    pub fn new(eq: &EqualizerConfig) -> Arc<Shared> {
         Arc::new(Shared {
             samples: Mutex::new(VecDeque::new()),
             gain: AtomicU32::new(1.0f32.to_bits()),
             played: AtomicU64::new(0),
+            eq: EqShared::new(eq),
         })
     }
 
@@ -163,9 +169,10 @@ fn map_channel(frame: &[f32], c: usize) -> f32 {
 fn build(device: &cpal::Device, config: &cpal::StreamConfig, shared: &Arc<Shared>) -> Result<cpal::Stream, String> {
     let channels = config.channels as usize;
     let shared = shared.clone();
+    let mut eq = EqState::new(config.sample_rate, config.channels);
     device
         .build_output_stream(
-            config.clone(),
+            *config,
             move |out: &mut [f32], _| {
                 let gain = f32::from_bits(shared.gain.load(Ordering::Relaxed));
                 let mut written = 0;
@@ -176,6 +183,7 @@ fn build(device: &cpal::Device, config: &cpal::StreamConfig, shared: &Arc<Shared
                     }
                     written = n;
                 }
+                eq.process(&shared.eq, &mut out[..written]);
                 out[written..].fill(0.0);
                 shared.played.fetch_add((written / channels) as u64, Ordering::Relaxed);
             },

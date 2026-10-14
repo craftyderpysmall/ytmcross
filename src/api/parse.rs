@@ -111,7 +111,15 @@ fn list_item(r: &Value) -> Option<Track> {
     // Search rows carry the album in column 1; playlist rows in column 2.
     let album = groups.get(1).cloned().or_else(|| text(col(2)));
 
-    Some(Track { video_id, title, artists, album, duration, thumb: thumb(&r["thumbnail"]) })
+    Some(Track {
+        video_id,
+        title,
+        artists,
+        album,
+        duration,
+        thumb: thumb(&r["thumbnail"]),
+        set_video_id: r["playlistItemData"]["playlistSetVideoId"].as_str().map(str::to_string),
+    })
 }
 
 fn panel_item(r: &Value) -> Option<Track> {
@@ -123,7 +131,18 @@ fn panel_item(r: &Value) -> Option<Track> {
         album: groups.get(1).cloned(),
         duration: text(&r["lengthText"]),
         thumb: thumb(&r["thumbnail"]),
+        set_video_id: None,
     })
+}
+
+/// True on the first page of a playlist the user can edit (their own).
+pub fn playlist_editable(resp: &Value) -> bool {
+    find(resp, "musicEditablePlaylistDetailHeaderRenderer").is_some()
+}
+
+/// Whether a playlist edit (add/move) went through.
+pub fn edit_succeeded(resp: &Value) -> bool {
+    resp["status"].as_str() == Some("STATUS_SUCCEEDED")
 }
 
 /// Playlist cards from the library page.

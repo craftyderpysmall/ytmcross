@@ -1,6 +1,6 @@
-# Example theme: Rosé Pine.
+# Example theme: Scarf Dark.
 # Only colors are set; font, shape and art come from the default theme.
-# Activate it with  theme = "rose-pine"  in config.toml, then press F5.
+# Activate it with  theme = "scarf-dark"  in config.toml, then press F5.
 
 [colors]
 background = "#090B0F"

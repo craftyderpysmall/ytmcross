@@ -29,6 +29,11 @@ enum Slot {
 static PRELOADED: Mutex<VecDeque<(String, Slot)>> = Mutex::new(VecDeque::new());
 static PRELOAD_DONE: Condvar = Condvar::new();
 
+/// Drops every preloaded start (e.g. after switching accounts).
+pub fn clear_preloaded() {
+    PRELOADED.lock().unwrap().retain(|(_, slot)| matches!(slot, Slot::Loading));
+}
+
 pub fn is_preloaded(url: &str) -> bool {
     PRELOADED.lock().unwrap().iter().any(|(u, _)| u == url)
 }

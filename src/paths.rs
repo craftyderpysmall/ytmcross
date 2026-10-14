@@ -33,6 +33,12 @@ pub fn cookies_file() -> PathBuf {
     data_dir().join("cookies.txt")
 }
 
+/// Present after the user signed out on purpose: start signed out instead
+/// of opening the sign-in window.
+pub fn signed_out_marker() -> PathBuf {
+    data_dir().join("signed-out")
+}
+
 /// Throwaway webview profile used only during `--login`; deleted afterwards.
 pub fn login_webview_dir() -> PathBuf {
     data_dir().join("login-webview")

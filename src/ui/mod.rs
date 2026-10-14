@@ -1,6 +1,7 @@
 mod app;
 mod bar;
 mod images;
+mod menus;
 mod shell;
 mod views;
 mod widgets;

@@ -18,6 +18,7 @@ use config::Config;
 use theme::Theme;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    trace!("main: start");
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--login") {
         auth::login::run();
@@ -29,9 +30,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     config::write_defaults();
-    if !Session::load(&paths::cookies_file()).is_signed_in() && !auth::sign_in_blocking() {
-        eprintln!("ytmcross: sign-in was cancelled");
-        return Ok(());
+    // First run: offer sign-in right away. After signing out on purpose (or
+    // cancelling), the app opens signed out; the Account menu signs in.
+    let mut signed_in = Session::load(&paths::cookies_file()).is_signed_in();
+    if !signed_in && !paths::signed_out_marker().exists() {
+        signed_in = auth::sign_in_blocking();
     }
 
     let (config, config_error) = Config::load();
@@ -41,5 +44,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_app_id("ytmcross")
         .with_inner_size([config.window.width, config.window.height])
         .with_min_inner_size([520.0, 360.0]);
-    ui::run(viewport, move |ctx| ui::App::new(ctx, config, theme, config_error))
+    ui::run(viewport, move |ctx| ui::App::new(ctx, config, theme, config_error, signed_in))
 }

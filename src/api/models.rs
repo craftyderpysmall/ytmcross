@@ -6,6 +6,8 @@ pub struct Track {
     pub album: Option<String>,
     pub duration: Option<String>,
     pub thumb: Option<String>,
+    /// Identifies this entry within a playlist (needed to move it).
+    pub set_video_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
