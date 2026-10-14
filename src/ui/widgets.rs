@@ -230,6 +230,12 @@ pub fn track_row(ui: &mut Ui, images: &Images, theme: &Theme, track: &Track, loo
         }
         clicks.like = like.clicked();
     }
+    // Downloaded: always shown, left of the like button.
+    if look.downloaded {
+        let size = 16.0;
+        downloaded_icon(ui.painter(), pos2(right - size / 2.0, rect.center().y), size, theme);
+        right -= size + 10.0;
+    }
 
     let row_id = resp.id;
     let max_w = (right - x).max(0.0);
@@ -262,6 +268,17 @@ pub struct RowLook {
     pub draggable: bool,
     pub can_like: bool,
     pub liked: bool,
+    pub downloaded: bool,
+}
+
+/// "Downloaded" badge: an arrow down in an accent circle, `size` across.
+pub fn downloaded_icon(p: &egui::Painter, center: Pos2, size: f32, theme: &Theme) {
+    let r = size / 2.0;
+    p.circle_filled(center, r, theme.colors.accent);
+    let stroke = Stroke::new(1.5_f32, theme.colors.text);
+    let pt = |x: f32, y: f32| center + vec2(x, y) * r;
+    p.line_segment([pt(0.0, -0.5), pt(0.0, 0.45)], stroke);
+    p.add(Shape::line(vec![pt(-0.4, 0.05), pt(0.0, 0.45), pt(0.4, 0.05)], stroke));
 }
 
 /// Thumbs-up icon in a `size` box: outlined, or filled when `filled`.
@@ -294,8 +311,18 @@ pub fn thumbs_up(p: &egui::Painter, center: Pos2, size: f32, color: Color32, fil
     }
 }
 
-/// Album/playlist tile: square art with title and subtitle under it.
-pub fn card(ui: &mut Ui, images: &Images, theme: &Theme, title: &str, subtitle: &str, thumb: Option<&str>, size: f32) -> Response {
+/// What a playlist row or card shows.
+pub struct ListLook<'a> {
+    pub title: &'a str,
+    pub subtitle: &'a str,
+    pub thumb: Option<&'a str>,
+    pub downloaded: bool,
+}
+
+/// Album/playlist tile: square art with title and subtitle under it (the
+/// subtitle after the downloaded badge, if downloaded).
+pub fn card(ui: &mut Ui, images: &Images, theme: &Theme, look: ListLook, size: f32) -> Response {
+    let ListLook { title, subtitle, thumb, downloaded } = look;
     let text_h = theme.font_size * 2.6;
     let (rect, resp) = ui.allocate_exact_size(vec2(size, size + text_h + 6.0), Sense::click());
     if ui.is_rect_visible(rect) {
@@ -307,8 +334,14 @@ pub fn card(ui: &mut Ui, images: &Images, theme: &Theme, title: &str, subtitle: 
         let y = rect.top() + size + 6.0;
         let h = title_g.size().y;
         ui.painter().galley(pos2(rect.left(), y), title_g, c.text);
-        let sub = line(ui, subtitle, small(theme), c.text_dim, size);
-        ui.painter().galley(pos2(rect.left(), y + h + 1.0), sub, c.text_dim);
+        let sub_y = y + h + 1.0;
+        let badge = theme.font_size;
+        let x = if downloaded { rect.left() + badge + 5.0 } else { rect.left() };
+        let sub = line(ui, subtitle, small(theme), c.text_dim, rect.right() - x);
+        if downloaded {
+            downloaded_icon(ui.painter(), pos2(rect.left() + badge / 2.0, sub_y + sub.size().y / 2.0), badge, theme);
+        }
+        ui.painter().galley(pos2(x, sub_y), sub, c.text_dim);
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -328,8 +361,10 @@ pub fn ghost_pill(ui: &mut Ui, theme: &Theme, label: &str) -> Response {
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// Playlist/album row: art with title and subtitle.
-pub fn playlist_row(ui: &mut Ui, images: &Images, theme: &Theme, title: &str, subtitle: &str, thumb: Option<&str>) -> Response {
+/// Playlist/album row: art with title and subtitle, the downloaded badge
+/// on the right.
+pub fn playlist_row(ui: &mut Ui, images: &Images, theme: &Theme, look: ListLook) -> Response {
+    let ListLook { title, subtitle, thumb, downloaded } = look;
     let (rect, resp) = row_frame(ui, theme, false, Sense::click());
     if ui.is_rect_visible(rect) {
         let pad = 8.0;
@@ -340,7 +375,13 @@ pub fn playlist_row(ui: &mut Ui, images: &Images, theme: &Theme, title: &str, su
             x += s + 12.0;
         }
         let c = &theme.colors;
-        let max_w = rect.right() - pad - x;
+        let mut right = rect.right() - pad;
+        if downloaded {
+            let size = 16.0;
+            downloaded_icon(ui.painter(), pos2(right - size / 2.0, rect.center().y), size, theme);
+            right -= size + 10.0;
+        }
+        let max_w = right - x;
         let title = line(ui, title, title_font(theme), c.text, max_w);
         let sub = line(ui, subtitle, small(theme), c.text_dim, max_w);
         let total = title.size().y + 2.0 + sub.size().y;

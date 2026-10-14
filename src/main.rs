@@ -4,6 +4,7 @@
 mod api;
 mod auth;
 mod config;
+mod download;
 mod paths;
 mod player;
 mod pool;

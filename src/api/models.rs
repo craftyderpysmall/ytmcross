@@ -17,6 +17,14 @@ pub struct Track {
     pub plays: Option<String>,
 }
 
+impl Track {
+    /// The listed duration in seconds ("3:45", "1:02:03"), 0 if unknown.
+    pub fn seconds(&self) -> f64 {
+        let clock = self.duration.as_deref().unwrap_or_default();
+        clock.split(':').try_fold(0.0, |acc, part| part.trim().parse::<f64>().map(|v| acc * 60.0 + v)).unwrap_or(0.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Playlist,

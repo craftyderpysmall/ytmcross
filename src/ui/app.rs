@@ -13,12 +13,14 @@ use std::time::{Duration, Instant};
 use egui::{CentralPanel, FontData, Frame, Margin, Panel, Ui};
 
 use super::images::Images;
+use super::menus::Download;
 use super::{bar, views};
 use crate::api::client;
 use crate::api::models::{Artist, Header, Kind, Playlist, Track};
 use crate::auth;
 use crate::config::{BarPosition, Config, EqualizerConfig};
-use crate::paths;
+use crate::download::Downloads;
+use crate::{paths, proc};
 use crate::player::{Player, PlayerEvent};
 use crate::pool::Pool;
 use crate::stream::{Hint, Resolver};
@@ -182,6 +184,7 @@ pub struct App {
     notifier: Notifier,
     player: Player,
     resolver: Resolver,
+    pub downloads: Downloads,
     /// Track we're waiting on a stream URL for, and where to start it.
     pending_play: Option<(String, f64)>,
     /// The track restored at startup isn't loaded yet: play starts it here.
@@ -254,6 +257,8 @@ impl App {
         let player_notifier = notifier.clone();
         // Shares the agent (and its kept-alive connection to YouTube Music) with the API worker.
         let resolver = Resolver::new(notifier.clone(), agent.clone());
+        let downloads =
+            Downloads::new(paths::downloads_dir(&config.downloads.folder), resolver.clone(), agent.clone(), notifier.clone());
         let player = Player::new(&config.player, &config.equalizer, config.pitch.semitones, agent, move |e| {
             player_notifier.send(Response::Player(e))
         });
@@ -277,7 +282,7 @@ impl App {
         };
         if let Some((track, at)) = last {
             playback.paused = true;
-            playback.duration = track.duration.as_deref().map_or(0.0, parse_clock);
+            playback.duration = track.seconds();
             playback.set_position(at);
             queue.context = vec![track.clone()];
             queue.ctx_pos = Some(0);
@@ -299,6 +304,7 @@ impl App {
             notifier,
             player,
             resolver,
+            downloads,
             pending_play: None,
             resume_at,
             hover: None,
@@ -568,6 +574,64 @@ impl App {
         }
     }
 
+    // ---- downloads --------------------------------------------------------
+
+    pub fn song_download(&self, video_id: &str) -> Download {
+        if self.downloads.has(video_id) {
+            Download::Done
+        } else if self.downloads.progress(video_id).is_some() {
+            Download::Running
+        } else {
+            Download::No
+        }
+    }
+
+    pub fn list_download(&self, id: &str) -> Download {
+        if self.downloads.progress(id).is_some() {
+            Download::Running
+        } else if self.downloads.has_list(id) {
+            Download::Done
+        } else {
+            Download::No
+        }
+    }
+
+    pub fn download_song(&self, track: Track) {
+        self.downloads.song(track);
+    }
+
+    /// Downloads a playlist or album; the open page's tracks are used if
+    /// they are all loaded.
+    pub fn download_list(&mut self, list: Playlist) {
+        if self.downloads.progress(&list.id).is_some() {
+            return;
+        }
+        let tracks = self.playlist.as_ref().filter(|p| p.meta.id == list.id && !p.loading).map(|p| p.tracks.clone());
+        self.notify(format!("Downloading \u{201c}{}\u{201d}", list.title));
+        self.downloads.list(list, tracks);
+    }
+
+    pub fn download_page(&mut self) {
+        if let Some(meta) = self.playlist.as_ref().map(|p| p.meta.clone()) {
+            self.download_list(meta);
+        }
+    }
+
+    pub fn open_folder(&mut self, dir: &std::path::Path) {
+        if let Err(e) = proc::open_folder(dir) {
+            self.notify(format!("Couldn't open {}: {e}", dir.display()));
+        }
+    }
+
+    /// From Preferences: empty goes back to the default folder.
+    pub fn set_download_folder(&mut self, folder: String) {
+        let folder = folder.trim().to_string();
+        self.downloads.set_dir(paths::downloads_dir(&folder));
+        self.notify(format!("Downloads go to {}", self.downloads.dir().display()));
+        self.config.downloads.folder = folder.clone();
+        self.requests.push(Request::SaveDownloadFolder(folder));
+    }
+
     pub fn add_to_playlist(&self, playlist: &Playlist, track: &Track) {
         self.requests.push(Request::AddToPlaylist {
             id: playlist.id.clone(),
@@ -723,18 +787,25 @@ impl App {
     fn start(&mut self, at: f64) {
         let Some(track) = &self.queue.current else { return };
         self.resume_at = None;
-        let duration = track.duration.as_deref().map_or(0.0, parse_clock);
+        let duration = track.seconds();
         let id = track.video_id.clone();
-        let ready = self.resolver.ready(&id);
-        trace!("app: play {id} ({})", if ready.is_some() { "url ready" } else { "resolving" });
-        match ready {
-            Some(url) => {
+        // Downloaded (and still there): no network at all.
+        let file = self.downloads.file(&id).filter(|f| f.is_file());
+        let ready = if file.is_some() { None } else { self.resolver.ready(&id) };
+        trace!("app: play {id} ({})", if file.is_some() { "file" } else if ready.is_some() { "url ready" } else { "resolving" });
+        match (file, ready) {
+            (Some(file), _) => {
+                self.player.load_file(file, at);
+                self.player.set_paused(false);
+                self.pending_play = None;
+            }
+            (None, Some(url)) => {
                 self.resolver.playing(&url);
                 self.player.load(&url, at);
                 self.player.set_paused(false);
                 self.pending_play = None;
             }
-            None => {
+            (None, None) => {
                 // Silence the previous track while the new one resolves.
                 self.player.stop();
                 self.pending_play = Some((id.clone(), at));
@@ -752,7 +823,7 @@ impl App {
     /// and its start preloaded), the ones after resolved.
     fn prefetch_ahead(&self) {
         for (i, t) in self.queue.upcoming().take(LOOKAHEAD).enumerate() {
-            self.resolver.hint(&t.video_id, if i == 0 { Hint::Likely } else { Hint::Visible });
+            hint(&self.resolver, &self.downloads, &t.video_id, if i == 0 { Hint::Likely } else { Hint::Visible });
         }
     }
 
@@ -765,7 +836,7 @@ impl App {
         } else if !self.visible.2 && self.visible.1.elapsed() >= VISIBLE_SETTLE {
             self.visible.2 = true;
             for id in self.visible.0.iter().take(MAX_VISIBLE) {
-                self.resolver.hint(id, Hint::Visible);
+                hint(&self.resolver, &self.downloads, id, Hint::Visible);
             }
         }
     }
@@ -775,7 +846,7 @@ impl App {
         if let Some(id) = video_id
             && self.pressed.as_deref() != Some(id)
         {
-            self.resolver.hint(id, Hint::Likely);
+            hint(&self.resolver, &self.downloads, id, Hint::Likely);
         }
         self.pressed = video_id.map(str::to_string);
     }
@@ -790,7 +861,7 @@ impl App {
             Some((current, since, fired)) if current == id => {
                 if !*fired && since.elapsed() >= HOVER_PREFETCH {
                     *fired = true;
-                    self.resolver.hint(id, Hint::Likely);
+                    hint(&self.resolver, &self.downloads, id, Hint::Likely);
                 }
             }
             _ => {
@@ -861,7 +932,7 @@ impl App {
     /// user never presses play.)
     pub fn warm_resume(&mut self) {
         if let (Some(_), Some(t)) = (self.resume_at, &self.queue.current) {
-            self.resolver.hint(&t.video_id, Hint::Likely);
+            hint(&self.resolver, &self.downloads, &t.video_id, Hint::Likely);
         }
     }
 
@@ -919,7 +990,7 @@ impl App {
                         Ok(tracks) => {
                             // The top result is the most likely click: get it ready.
                             if let Some(top) = tracks.first() {
-                                self.resolver.hint(&top.video_id, Hint::Likely);
+                                hint(&self.resolver, &self.downloads, &top.video_id, Hint::Likely);
                             }
                             self.search.results = tracks;
                         }
@@ -1011,6 +1082,7 @@ impl App {
                 if config.pitch != self.config.pitch {
                     self.set_pitch(config.pitch.semitones, false);
                 }
+                self.downloads.set_dir(paths::downloads_dir(&config.downloads.folder));
                 self.config = *config;
                 self.list_themes();
                 match config_error.or(loaded.error) {
@@ -1070,6 +1142,12 @@ impl App {
                 self.notify(format!("Couldn't update likes: {error}"));
             }
             Response::Player(event) => self.handle_player(event),
+            // Progress needs only the repaint that came with it.
+            Response::Download(message) => {
+                if let Some(m) = message {
+                    self.notify(m);
+                }
+            }
             Response::Resolved { video_id, result } => {
                 let Some((_, at)) = self.pending_play.take_if(|(id, _)| *id == video_id) else {
                     return; // a background prefetch; it's cached in the resolver
@@ -1244,9 +1322,12 @@ fn response_needs_fallback(response: &Response) -> bool {
     }
 }
 
-/// "3:45" / "1:02:03" -> seconds.
-fn parse_clock(s: &str) -> f64 {
-    s.split(':').try_fold(0.0, |acc, part| part.trim().parse::<f64>().map(|v| acc * 60.0 + v)).unwrap_or(0.0)
+/// Tells the resolver about a likely play, unless it is downloaded (it
+/// plays from disk then, nothing to fetch).
+fn hint(resolver: &Resolver, downloads: &Downloads, id: &str, hint: Hint) {
+    if !downloads.has(id) {
+        resolver.hint(id, hint);
+    }
 }
 
 /// Fisher–Yates with a time-seeded xorshift (no RNG crate needed).
@@ -1314,30 +1395,33 @@ fn load_last_played() -> Option<(Track, f64)> {
 mod tests {
     use super::*;
 
+    fn track(id: usize, duration: Option<&str>) -> Track {
+        Track {
+            video_id: id.to_string(),
+            title: String::new(),
+            artists: String::new(),
+            album: None,
+            duration: duration.map(str::to_string),
+            thumb: None,
+            set_video_id: None,
+            artist_id: None,
+            album_id: None,
+            liked: None,
+            plays: None,
+        }
+    }
+
     #[test]
     fn clock_strings_parse() {
-        assert_eq!(parse_clock("3:45"), 225.0);
-        assert_eq!(parse_clock("1:02:03"), 3723.0);
-        assert_eq!(parse_clock("live"), 0.0);
+        assert_eq!(track(0, Some("3:45")).seconds(), 225.0);
+        assert_eq!(track(0, Some("1:02:03")).seconds(), 3723.0);
+        assert_eq!(track(0, Some("live")).seconds(), 0.0);
+        assert_eq!(track(0, None).seconds(), 0.0);
     }
 
     #[test]
     fn shuffle_keeps_every_track() {
-        let mut tracks: Vec<Track> = (0..50)
-            .map(|i| Track {
-                video_id: i.to_string(),
-                title: String::new(),
-                artists: String::new(),
-                album: None,
-                duration: None,
-                thumb: None,
-                set_video_id: None,
-                artist_id: None,
-                album_id: None,
-                liked: None,
-                plays: None,
-            })
-            .collect();
+        let mut tracks: Vec<Track> = (0..50).map(|i| track(i, None)).collect();
         shuffle_tracks(&mut tracks);
         let mut ids: Vec<usize> = tracks.iter().map(|t| t.video_id.parse().unwrap()).collect();
         ids.sort();

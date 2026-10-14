@@ -19,3 +19,8 @@ sidebar_items = ["search", "library", "queue"]
 [player]
 # Starting volume, 0-100.
 volume = 80
+
+[downloads]
+# Folder for downloaded songs and playlists. Empty: downloads, next to this file.
+# Also set from Preferences in the app.
+folder = ""

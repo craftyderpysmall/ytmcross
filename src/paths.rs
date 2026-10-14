@@ -56,6 +56,19 @@ pub fn last_played_file() -> PathBuf {
     data_dir().join("last-played")
 }
 
+/// Where downloads go: the folder set in Preferences ("~" is the home
+/// folder), or "downloads" next to config.toml.
+pub fn downloads_dir(configured: &str) -> PathBuf {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return config_dir().join("downloads");
+    }
+    match configured.strip_prefix('~').filter(|rest| rest.is_empty() || rest.starts_with(['/', '\\'])) {
+        Some(rest) => dirs::home_dir().unwrap_or_default().join(rest.trim_start_matches(['/', '\\'])),
+        None => PathBuf::from(configured),
+    }
+}
+
 /// Throwaway webview profile used only during `--login`; deleted afterwards.
 pub fn login_webview_dir() -> PathBuf {
     data_dir().join("login-webview")

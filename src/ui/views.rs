@@ -6,8 +6,8 @@ use std::ops::Range;
 use egui::{Align, CornerRadius, CursorIcon, FontId, Id, Layout, Rect, RichText, ScrollArea, TextEdit, Ui, pos2, vec2};
 
 use super::app::{App, View};
-use super::menus::{self, MenuAction, PlaylistChoice, TrackChoice};
-use super::widgets::{self, RowLook, card, ghost_pill, nav_item, pill, playlist_row, text_button, track_row};
+use super::menus::{self, Download, MenuAction, PlaylistChoice, TrackChoice};
+use super::widgets::{self, ListLook, RowLook, card, ghost_pill, nav_item, pill, playlist_row, text_button, track_row};
 use crate::api::models::{Kind, Playlist, Track};
 use crate::api::parse;
 use crate::theme::{self, Theme};
@@ -77,6 +77,9 @@ enum Action {
     Open(Playlist),
     /// Open and start playing as soon as it loads.
     PlayCollection(Playlist),
+    DownloadList(Playlist),
+    /// The Download button of the open playlist/album.
+    DownloadPage,
     OpenArtist(String),
     OpenAlbum(Track),
     PlayQueue(QueueRow),
@@ -220,6 +223,8 @@ fn apply(app: &mut App, ui: &Ui, action: Option<Action>) {
         Action::ToggleSaved => app.toggle_saved(),
         Action::Open(list) => app.open_playlist(ctx, list, false),
         Action::PlayCollection(list) => app.open_playlist(ctx, list, true),
+        Action::DownloadList(list) => app.download_list(list),
+        Action::DownloadPage => app.download_page(),
         Action::OpenArtist(id) => app.open_artist(ctx, &id),
         Action::OpenAlbum(track) => app.open_album(ctx, &track),
         Action::PlayQueue(row) => match row {
@@ -241,6 +246,7 @@ fn apply(app: &mut App, ui: &Ui, action: Option<Action>) {
                     app.add_to_playlist(playlist, &track);
                 }
             }
+            TrackChoice::Download => app.download_song(track),
         },
         Action::Like(track) => app.toggle_like(&track),
         Action::AskDelete(list) => app.confirm_delete = Some(list),
@@ -314,12 +320,14 @@ fn rows(ui: &mut Ui, app: &App, spec: &ListSpec, range: Range<usize>, out: &mut 
                 continue;
             }
         };
+        let download = app.song_download(&t.video_id);
         let look = RowLook {
             playing: spec.playing == Some(t.video_id.as_str()),
             active: spec.active == Some(i),
             draggable: spec.reorder.is_some(),
             can_like: app.can_like(),
             liked: app.is_liked(t),
+            downloaded: download == Download::Done,
         };
         let (resp, clicks) = track_row(ui, &app.images, theme, t, look);
         rects.push((i, resp.rect));
@@ -341,7 +349,7 @@ fn rows(ui: &mut Ui, app: &App, spec: &ListSpec, range: Range<usize>, out: &mut 
         if resp.drag_started() && spec.reorder.is_some() {
             out.drag_start = Some(i);
         }
-        if let Some(choice) = menus::track_menu(&resp, playlists) {
+        if let Some(choice) = menus::track_menu(&resp, playlists, download) {
             out.menu = Some((i, choice));
         }
         out.on_screen.push(t.video_id.clone());
@@ -408,17 +416,25 @@ fn drop_indicator(ui: &Ui, theme: &Theme, rows: &[(usize, Rect)], from: usize, y
     }
 }
 
+fn list_look(p: &Playlist, download: Download) -> ListLook<'_> {
+    ListLook { title: &p.title, subtitle: &p.subtitle, thumb: p.thumb.as_deref(), downloaded: download == Download::Done }
+}
+
 /// A horizontal strip (or wrapped grid) of album/playlist tiles.
 fn cards(ui: &mut Ui, app: &App, items: &[Playlist], wrap: bool) -> Option<Action> {
     let mut action = None;
     let mut draw = |ui: &mut Ui| {
         for item in items {
-            let resp = card(ui, &app.images, &app.theme, &item.title, &item.subtitle, item.thumb.as_deref(), CARD);
+            let download = app.list_download(&item.id);
+            let look = list_look(item, download);
+            let resp = card(ui, &app.images, &app.theme, look, CARD);
             if resp.clicked() {
                 action = Some(Action::Open(item.clone()));
             }
-            if let Some(PlaylistChoice::Play) = menus::playlist_menu(&resp, item, app.signed_out) {
-                action = Some(Action::PlayCollection(item.clone()));
+            match menus::playlist_menu(&resp, item, app.signed_out, download) {
+                Some(PlaylistChoice::Play) => action = Some(Action::PlayCollection(item.clone())),
+                Some(PlaylistChoice::Download) => action = Some(Action::DownloadList(item.clone())),
+                _ => {}
             }
         }
     };
@@ -542,12 +558,14 @@ fn library(app: &mut App, ui: &mut Ui) -> Option<Action> {
     }
     ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, widgets::row_height(theme), items.len(), |ui, range| {
         for p in &items[range] {
-            let resp = playlist_row(ui, &app.images, theme, &p.title, &p.subtitle, p.thumb.as_deref());
+            let download = app.list_download(&p.id);
+            let resp = playlist_row(ui, &app.images, theme, list_look(p, download));
             if resp.clicked() {
                 action = Some(Action::Open(p.clone()));
             }
-            match menus::playlist_menu(&resp, p, app.signed_out) {
+            match menus::playlist_menu(&resp, p, app.signed_out, download) {
                 Some(PlaylistChoice::Play) => action = Some(Action::PlayCollection(p.clone())),
+                Some(PlaylistChoice::Download) => action = Some(Action::DownloadList(p.clone())),
                 Some(PlaylistChoice::Delete) => action = Some(Action::AskDelete(p.clone())),
                 Some(PlaylistChoice::Remove) => action = Some(Action::Remove(p.clone())),
                 None => {}
@@ -617,6 +635,20 @@ fn playlist(app: &mut App, ui: &mut Ui, list: &mut ListResult) -> Option<Action>
                     let label = if *saved { "Saved" } else { "Save" };
                     if ghost_pill(ui, theme, label).on_hover_text(if *saved { "Remove from library" } else { "Save to library" }).clicked() {
                         action = Some(Action::ToggleSaved);
+                    }
+                }
+                if !pl.tracks.is_empty() {
+                    let (label, tip) = match app.downloads.progress(&pl.meta.id) {
+                        Some((done, total)) if total > 0 => (format!("Downloading {done}/{total}"), None),
+                        Some(_) => ("Downloading\u{2026}".to_string(), None),
+                        None if app.downloads.has_list(&pl.meta.id) => ("Downloaded".to_string(), Some("Download songs added since")),
+                        None => ("Download".to_string(), Some("Save every song to the downloads folder")),
+                    };
+                    let resp = ghost_pill(ui, theme, &label);
+                    if let Some(tip) = tip
+                        && resp.on_hover_text(tip).clicked()
+                    {
+                        action = Some(Action::DownloadPage);
                     }
                 }
                 if pl.reorderable() {

@@ -85,6 +85,8 @@ struct Shared {
     refresh_failures: AtomicU32,
 }
 
+/// Cheap to clone: clones share one cache and one set of workers.
+#[derive(Clone)]
 pub struct Resolver {
     shared: Arc<Shared>,
 }
@@ -148,6 +150,20 @@ impl Resolver {
         *self.shared.session.lock().unwrap() = Session::load(&paths::cookies_file());
         player::clear_preloaded();
         self.shared.refresh_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Resolves `ids` on the calling thread (downloads), with one solver
+    /// load for all of them; builds the solver first if there is none.
+    pub fn resolve_now(&self, ids: &[String]) -> Vec<(String, Result<String, String>)> {
+        if let Err(e) = self.shared.solver.refresh(false) {
+            return ids.iter().map(|id| (id.clone(), Err(e.clone()))).collect();
+        }
+        self.shared.resolve(ids)
+    }
+
+    /// YouTube refused a URL we unscrambled: the next lookup rebuilds the solver.
+    pub fn refused(&self) {
+        self.shared.solver.invalidate();
     }
 
     /// The player is about to stream `url` itself: a queued preload of it

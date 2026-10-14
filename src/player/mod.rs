@@ -24,7 +24,7 @@ use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
-use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{Time, TimeBase};
 
@@ -33,7 +33,7 @@ use crate::{pool, trace};
 use index::FragmentIndex;
 use output::{Output, Shared};
 use source::HttpSource;
-pub use source::{clear_preloaded, is_preloaded, preload_first_chunk};
+pub use source::{clear_preloaded, is_preloaded, preload_first_chunk, stream_len};
 
 /// How often the engine tops up the buffer while playing.
 const REFILL_EVERY: Duration = Duration::from_millis(250);
@@ -55,9 +55,18 @@ pub enum PlayerEvent {
     Released(f64),
 }
 
+/// What to play.
+#[derive(Clone)]
+enum Media {
+    /// A stream URL from the resolver.
+    Url(String),
+    /// A downloaded file.
+    File(std::path::PathBuf),
+}
+
 enum Command {
-    /// Stream URL and the position to start at.
-    Load(String, f64),
+    /// What to play and the position to start at.
+    Load(Media, f64),
     Pause(bool),
     Seek(f64),
     Stop,
@@ -106,7 +115,12 @@ impl Player {
 
     /// Plays a direct stream URL (from the resolver) from `start` seconds.
     pub fn load(&self, url: &str, start: f64) {
-        self.send(Command::Load(url.to_string(), start));
+        self.send(Command::Load(Media::Url(url.to_string()), start));
+    }
+
+    /// Plays a downloaded file from `start` seconds.
+    pub fn load_file(&self, path: std::path::PathBuf, start: f64) {
+        self.send(Command::Load(Media::File(path), start));
     }
 
     pub fn stop(&self) {
@@ -139,8 +153,9 @@ impl Player {
 
 /// The track being played.
 struct Current {
-    url: String,
-    /// Where its fragments start, to seek straight to the right one.
+    media: Media,
+    /// Where its fragments start, to seek straight to the right one
+    /// (streams only: a file seeks fast enough without).
     index: Option<Arc<FragmentIndex>>,
     format: Box<dyn FormatReader>,
     decoder: Box<dyn AudioDecoder>,
@@ -216,13 +231,13 @@ impl Engine {
 
     fn handle(&mut self, cmd: Command) {
         match cmd {
-            Command::Load(url, start) => {
+            Command::Load(media, start) => {
                 trace!("engine: load");
                 self.stop();
                 (self.notify)(PlayerEvent::Loading);
                 self.paused = false;
                 let t = std::time::Instant::now();
-                let opened = self.open(&url, start, None);
+                let opened = self.open(&media, start, None);
                 trace!("engine: opened in {:?}", t.elapsed());
                 match opened {
                     Ok(current) => {
@@ -272,21 +287,27 @@ impl Engine {
         self.scratch = Vec::new();
     }
 
-    /// Opens `url` at `start` seconds and prepares the decoder and an output
-    /// that fits it. `index` is the file's, if already known.
-    fn open(&mut self, url: &str, start: f64, index: Option<Arc<FragmentIndex>>) -> Result<Current, String> {
-        let mut source = HttpSource::open(self.agent.clone(), url).map_err(|e| e.to_string())?;
-        let index = index.or_else(|| source.fragment_index().map(Arc::new));
-        // Starting later: the demuxer sees the file's head, then the fragment
-        // holding `start`, so it never fetches the fragments before it.
+    /// Opens `media` at `start` seconds and prepares the decoder and an
+    /// output that fits it. `index` is the stream's, if already known.
+    fn open(&mut self, media: &Media, start: f64, index: Option<Arc<FragmentIndex>>) -> Result<Current, String> {
         let mut skipped = 0.0;
-        if let Some(ix) = &index
-            && let Some((at, from)) = ix.fragment_at(start).filter(|f| f.1 > 0.0)
-        {
-            source.splice(ix.head.clone(), at);
-            skipped = from;
-        }
-        let stream = MediaSourceStream::new(Box::new(source), MediaSourceStreamOptions::default());
+        let (source, index): (Box<dyn MediaSource>, _) = match media {
+            Media::File(path) => (Box::new(std::fs::File::open(path).map_err(|e| e.to_string())?), None),
+            Media::Url(url) => {
+                let mut source = HttpSource::open(self.agent.clone(), url).map_err(|e| e.to_string())?;
+                let index = index.or_else(|| source.fragment_index().map(Arc::new));
+                // Starting later: the demuxer sees the file's head, then the fragment
+                // holding `start`, so it never fetches the fragments before it.
+                if let Some(ix) = &index
+                    && let Some((at, from)) = ix.fragment_at(start).filter(|f| f.1 > 0.0)
+                {
+                    source.splice(ix.head.clone(), at);
+                    skipped = from;
+                }
+                (Box::new(source), index)
+            }
+        };
+        let stream = MediaSourceStream::new(source, MediaSourceStreamOptions::default());
         let mut hint = Hint::new();
         hint.with_extension("m4a");
         let format = symphonia::default::get_probe()
@@ -307,7 +328,7 @@ impl Engine {
         }
         self.shared.reset();
         let mut current = Current {
-            url: url.to_string(),
+            media: media.clone(),
             index,
             format,
             decoder,
@@ -338,9 +359,9 @@ impl Engine {
         }
         // With one, reopening starts right at the target's fragment (and
         // reopening also recovers a reader that hit the end of the stream).
-        let (url, index) = (current.url.clone(), current.index.clone());
+        let (media, index) = (current.media.clone(), current.index.clone());
         let t = std::time::Instant::now();
-        match self.open(&url, seconds, index) {
+        match self.open(&media, seconds, index) {
             Ok(reopened) => self.current = Some(reopened),
             Err(e) => {
                 self.stop();

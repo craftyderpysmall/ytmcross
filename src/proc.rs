@@ -22,6 +22,30 @@ pub fn command(program: &str) -> Command {
     cmd
 }
 
+/// Shows `dir` in the system file manager, creating it if needed. Runs the
+/// OS's own opener (nothing gets loaded into our process); unlike `command`,
+/// the file manager it starts may outlive us.
+pub fn open_folder(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let opener = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let child = Command::new(opener).arg(dir).spawn()?;
+    // Unix: reap it once it exits (openers return quickly), leaving no zombie.
+    #[cfg(unix)]
+    {
+        let mut child = child;
+        let _ = std::thread::Builder::new().name("open-folder".into()).stack_size(64 * 1024).spawn(move || child.wait());
+    }
+    #[cfg(not(unix))]
+    drop(child);
+    Ok(())
+}
+
 /// Windows: puts the child (and anything it spawns) in a job object that the
 /// OS kills when our process exits, even after a crash.
 #[cfg(windows)]

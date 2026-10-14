@@ -1,4 +1,4 @@
-//! Menus: Account / Equalizer / Pitch / Theme popups, right-click menus
+//! Menus: Account / Equalizer / Pitch / Theme / Preferences popups, right-click menus
 //! for songs and playlists, and the delete confirmation. All of them are
 //! drawn only while open, so they cost nothing otherwise.
 //!
@@ -6,22 +6,27 @@
 //! chose; the caller applies it.
 
 use egui::containers::menu::SubMenuButton;
-use egui::{Align, Frame, Id, Modal, Popup, PopupCloseBehavior, RectAlign, Response, RichText, Slider, Ui};
+use egui::{Align, Button, Frame, Id, Modal, Popup, PopupCloseBehavior, RectAlign, Response, RichText, Slider, TextEdit, Ui};
 
 use super::app::{App, is_special_playlist};
 use super::widgets::{self, nav_item, pill, text_button};
 use crate::api::models::Playlist;
 use crate::config::{EQ_BANDS, EqualizerConfig};
+use crate::paths;
 use crate::player::eq::{BANDS, MAX_GAIN_DB};
 
 /// Buttons `menus` draws (the sidebar reserves room for them).
-pub const MENU_COUNT: usize = 4;
+pub const MENU_COUNT: usize = 6;
 
 pub enum MenuAction {
     SignIn,
     SignOut,
     ListThemes,
     SetTheme(String),
+    OpenThemes,
+    OpenDownloads,
+    /// A new download folder (empty: the default).
+    DownloadFolder(String),
     /// New settings, and whether to save them (on release, not every step).
     Equalizer(EqualizerConfig, bool),
     /// Semitones, and whether to save.
@@ -35,7 +40,8 @@ const EQ_PRESETS: &[(&str, [f32; EQ_BANDS])] = &[
     ("Treble", [0.0, 0.0, 0.0, 3.0, 6.0]),
 ];
 
-/// The Account, Equalizer, Pitch and Theme buttons with their popups.
+/// The Account, Equalizer, Pitch, Theme, Downloads and Preferences buttons
+/// with their popups.
 /// `compact` lays them out as small text buttons (layout without a sidebar).
 pub fn menus(app: &App, ui: &mut Ui, compact: bool) -> Option<MenuAction> {
     let theme = &app.theme;
@@ -89,10 +95,56 @@ pub fn menus(app: &App, ui: &mut Ui, compact: bool) -> Option<MenuAction> {
                 ui.close();
             }
         }
-        ui.add_space(4.0);
-        ui.label(RichText::new("Theme files live in the themes folder next to config.toml.").font(widgets::small(theme)).color(theme.colors.text_dim));
+        ui.add_space(6.0);
+        if ui.button("Open themes folder").clicked() {
+            action = Some(MenuAction::OpenThemes);
+            ui.close();
+        }
     });
+
+    if trigger(ui, "Downloads").on_hover_text("Open the downloads folder").clicked() {
+        action = Some(MenuAction::OpenDownloads);
+    }
+
+    let prefs = trigger(ui, "Preferences");
+    if prefs.clicked() {
+        ui.data_mut(|d| d.remove::<String>(Id::new(FOLDER_FIELD))); // start from the saved value
+    }
+    popup(&prefs).show(|ui| action = preferences(app, ui).or(action.take()));
     action
+}
+
+/// Text being typed in Preferences, kept in egui's memory while it is open.
+const FOLDER_FIELD: &str = "download-folder";
+
+fn preferences(app: &App, ui: &mut Ui) -> Option<MenuAction> {
+    let theme = &app.theme;
+    ui.set_width(340.0);
+    ui.label(RichText::new("Download folder").color(theme.colors.text_dim));
+    ui.add_space(4.0);
+    let field = Id::new(FOLDER_FIELD);
+    let mut folder = ui.data(|d| d.get_temp::<String>(field)).unwrap_or_else(|| app.config.downloads.folder.clone());
+    let default = paths::downloads_dir("").display().to_string();
+    let edit = ui.add(TextEdit::singleline(&mut folder).hint_text(default).desired_width(f32::INFINITY));
+    let mut chosen = (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))).then(|| folder.clone());
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if pill(ui, theme, "Save").clicked() {
+            chosen = Some(folder.clone());
+        }
+        if ui.button("Default").on_hover_text("Downloads next to config.toml").clicked() {
+            chosen = Some(String::new());
+        }
+    });
+    ui.data_mut(|d| d.insert_temp(field, folder));
+    ui.add_space(6.0);
+    let small = |text: String| RichText::new(text).font(widgets::small(theme)).color(theme.colors.text_dim);
+    ui.label(small("Downloads go to:".into()));
+    ui.add(egui::Label::new(small(app.downloads.dir().display().to_string())).truncate());
+    if chosen.is_some() {
+        ui.close();
+    }
+    chosen.map(MenuAction::DownloadFolder)
 }
 
 /// Widgets default to the panel colour, which is also the popup's: lift
@@ -185,15 +237,24 @@ fn pitch(app: &App, ui: &mut Ui) -> Option<MenuAction> {
     (semitones != app.pitch || save).then_some(MenuAction::Pitch(semitones, save))
 }
 
+/// Where a song, playlist or album stands with downloads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Download {
+    No,
+    Running,
+    Done,
+}
+
 pub enum TrackChoice {
     PlayNext,
     AddToQueue,
     /// Index into the library list.
     AddToPlaylist(usize),
+    Download,
 }
 
 /// Right-click menu on a song row. `playlists` is None when signed out.
-pub fn track_menu(resp: &Response, playlists: Option<&[Playlist]>) -> Option<TrackChoice> {
+pub fn track_menu(resp: &Response, playlists: Option<&[Playlist]>, download: Download) -> Option<TrackChoice> {
     let mut choice = None;
     resp.context_menu(|ui| {
         ui.set_min_width(170.0);
@@ -227,24 +288,46 @@ pub fn track_menu(resp: &Response, playlists: Option<&[Playlist]>) -> Option<Tra
                 }
             }
         });
+        match download {
+            Download::No => {
+                if ui.button("Download").clicked() {
+                    choice = Some(TrackChoice::Download);
+                }
+            }
+            Download::Running => {
+                ui.add_enabled(false, Button::new("Downloading\u{2026}"));
+            }
+            Download::Done => {
+                ui.add_enabled(false, Button::new("Downloaded"));
+            }
+        }
     });
     choice
 }
 
 pub enum PlaylistChoice {
     Play,
+    Download,
     Delete,
     Remove,
 }
 
-/// Right-click menu on a playlist or album: own playlists can be deleted,
-/// saved ones removed from the library.
-pub fn playlist_menu(resp: &Response, playlist: &Playlist, signed_out: bool) -> Option<PlaylistChoice> {
+/// Right-click menu on a playlist or album: download it (again, for songs
+/// added since), own playlists can be deleted, saved ones removed from the library.
+pub fn playlist_menu(resp: &Response, playlist: &Playlist, signed_out: bool, download: Download) -> Option<PlaylistChoice> {
     let mut choice = None;
     resp.context_menu(|ui| {
         ui.set_min_width(170.0);
         if ui.button("Play").clicked() {
             choice = Some(PlaylistChoice::Play);
+        }
+        let label = match download {
+            Download::No => "Download",
+            Download::Running => "Downloading\u{2026}",
+            Download::Done => "Update download",
+        };
+        if ui.add_enabled(download != Download::Running, Button::new(label)).clicked() {
+            choice = Some(PlaylistChoice::Download);
         }
         if signed_out || is_special_playlist(&playlist.id) {
             return;
@@ -292,6 +375,12 @@ pub fn apply(app: &mut App, action: MenuAction) {
         MenuAction::SignOut => app.sign_out(),
         MenuAction::ListThemes => app.list_themes(),
         MenuAction::SetTheme(name) => app.set_theme(&name),
+        MenuAction::OpenThemes => app.open_folder(&paths::themes_dir()),
+        MenuAction::OpenDownloads => {
+            let dir = app.downloads.dir();
+            app.open_folder(&dir);
+        }
+        MenuAction::DownloadFolder(folder) => app.set_download_folder(folder),
         MenuAction::Equalizer(eq, save) => app.set_equalizer(eq, save),
         MenuAction::Pitch(semitones, save) => app.set_pitch(semitones, save),
     }

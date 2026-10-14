@@ -47,6 +47,9 @@ struct State {
 pub struct SolverStore {
     agent: ureq::Agent,
     state: Mutex<State>,
+    /// Held while checking the version and building: downloads refresh too,
+    /// and two threads must not build the same solver at once.
+    refreshing: Mutex<()>,
 }
 
 /// A loaded solver. Drop it when the batch is done: all its memory goes back.
@@ -67,7 +70,7 @@ impl Drop for Solver {
 
 impl SolverStore {
     pub fn new(agent: ureq::Agent) -> SolverStore {
-        SolverStore { agent, state: Mutex::default() }
+        SolverStore { agent, state: Mutex::default(), refreshing: Mutex::new(()) }
     }
 
     /// Solver for the current player, if one is ready (never blocks on work).
@@ -79,11 +82,17 @@ impl SolverStore {
     /// one if YouTube shipped a new player. Slow on a new version: call it
     /// from a background thread.
     pub fn refresh(&self, force: bool) -> Result<(), String> {
-        {
+        let fresh = || {
             let s = self.state.lock().unwrap();
-            if !force && s.ready.is_some() && s.checked_at.is_some_and(|t| t.elapsed() < VERSION_TTL) {
-                return Ok(());
-            }
+            s.ready.is_some() && s.checked_at.is_some_and(|t| t.elapsed() < VERSION_TTL)
+        };
+        if !force && fresh() {
+            return Ok(());
+        }
+        let _one_at_a_time = self.refreshing.lock().unwrap();
+        // Another thread may have just done it.
+        if !force && fresh() {
+            return Ok(());
         }
         let version = player_version(&self.agent)?;
         let (bytecode, sts_file) = files(&version);

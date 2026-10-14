@@ -145,10 +145,7 @@ pub struct HttpSource {
 
 impl HttpSource {
     pub fn open(agent: ureq::Agent, url: &str) -> io::Result<HttpSource> {
-        let len = match content_length_from_url(url) {
-            Some(len) => len,
-            None => content_length_from_server(&agent, url)?,
-        };
+        let len = stream_len(&agent, url)?;
         let chunk = take_preloaded(url).unwrap_or_default();
         crate::trace!("source: open, {} preloaded bytes", chunk.len());
         Ok(HttpSource { agent, url: url.to_string(), len, pos: 0, chunk, chunk_start: 0, splice: None })
@@ -182,6 +179,14 @@ impl HttpSource {
         self.chunk_start = at;
         crate::trace!("source: fetched {} bytes at {at} in {:?}", self.chunk.len(), t.elapsed());
         Ok(())
+    }
+}
+
+/// Size of the file behind a stream URL (usually written in the URL itself).
+pub fn stream_len(agent: &ureq::Agent, url: &str) -> io::Result<u64> {
+    match content_length_from_url(url) {
+        Some(len) => Ok(len),
+        None => content_length_from_server(agent, url),
     }
 }
 

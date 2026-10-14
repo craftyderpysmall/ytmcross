@@ -19,6 +19,14 @@ pub struct Config {
     pub player: PlayerConfig,
     pub equalizer: EqualizerConfig,
     pub pitch: PitchConfig,
+    pub downloads: DownloadsConfig,
+}
+
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct DownloadsConfig {
+    /// Where downloads go; empty: "ytmcross" in the user's music folder.
+    pub folder: String,
 }
 
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
@@ -82,6 +90,7 @@ impl Default for Config {
             player: PlayerConfig::default(),
             equalizer: EqualizerConfig::default(),
             pitch: PitchConfig::default(),
+            downloads: DownloadsConfig::default(),
         }
     }
 }
@@ -159,6 +168,31 @@ pub fn save_equalizer(eq: &EqualizerConfig) -> std::io::Result<()> {
 pub fn save_pitch(semitones: i32) -> std::io::Result<()> {
     let body = format!("# Managed by the Pitch menu. Semitones, -12 to 12.\nsemitones = {semitones}\n");
     edit_config(|text| set_section(text, "pitch", &body))
+}
+
+/// Rewrites the `[downloads]` section of config.toml (set in Preferences).
+pub fn save_download_folder(folder: &str) -> std::io::Result<()> {
+    let body = format!(
+        "# Folder for downloaded songs and playlists. Empty: downloads, next to this file.\n# Also set from Preferences in the app.\nfolder = {}\n",
+        toml_string(folder.trim())
+    );
+    edit_config(|text| set_section(text, "downloads", &body))
+}
+
+/// A TOML basic string (`{:?}` would write Rust escapes TOML lacks).
+fn toml_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn edit_config(edit: impl FnOnce(&str) -> String) -> std::io::Result<()> {
@@ -280,6 +314,13 @@ mod tests {
         let cfg: Config = toml::from_str(&out).unwrap();
         assert_eq!(cfg.theme, "x");
         assert_eq!(cfg.window.width, 900.0);
+    }
+
+    #[test]
+    fn download_folder_round_trips() {
+        let path = r#"C:\Users\Me\Music "x""#;
+        let out = set_section(SAMPLE, "downloads", &format!("folder = {}\n", toml_string(path)));
+        assert_eq!(toml::from_str::<Config>(&out).unwrap().downloads.folder, path);
     }
 
     #[test]

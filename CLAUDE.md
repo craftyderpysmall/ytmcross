@@ -42,12 +42,13 @@ $env:RUSTUP_HOME = "$env:USERPROFILE\scoop\persist\rustup\.rustup"
 - `ui/app.rs`: all state. Spotify-style `Queue` (current, user `manual` queue first, then `context`; radio appended at the end). Back history of pages. `likes` overrides like status. `last-played` restores the track paused; its stream is prefetched only when the pointer hovers play. System fallback fonts are installed on first need.
 - `ui/views.rs`: views return an `Action` applied afterwards; virtualized `track_list`; queue rows via `QueueRow`.
 - `ui/widgets.rs`: custom widgets. `track_row`: title (plain), `byline` (Artist and Album links, plays), like button (hover only, filled if liked) left of a fixed-width duration slot.
-- `ui/menus.rs`: Account/Equalizer/Pitch/Theme popups, context menus (Delete owned playlists, Remove saved ones), delete modal. `ui/bar.rs`: now-playing bar.
+- `ui/menus.rs`: Account/Equalizer/Pitch/Theme (with "Open themes folder")/Preferences (download folder) popups, Downloads button (opens the folder via `proc::open_folder`: explorer/open/xdg-open, nothing loaded in-process), context menus (Download, Delete owned playlists, Remove saved ones), delete modal. `ui/bar.rs`: now-playing bar.
 - `pool.rs`: worker threads that exit after 5 idle s; used by `worker.rs` (API, one thread), album art (4), and the resolver/engine threads follow the same rule. Idle app: 6 threads.
 - `worker.rs`: API requests (`Request`/`Response`).
 - `api/`: InnerTube WEB_REMIX client, parser (searches leaf renderers), models (`Track`, `Playlist` with `kind`/`owned`/`save_id`, `Header`, `Artist`).
 - `stream/`: native stream resolving: `player` endpoint + unscrambling in QuickJS (`solver.rs`, bytecode cached, built by the `--build-solver` helper process). A 403 rebuilds the solver. yt-dlp is intentionally not used. Only likely plays (hovered/pressed row, next in queue) get their first 128 KiB preloaded.
-- `player/`: symphonia + cpal. Callback applies volume, `pitch.rs` (WSOLA + resampler, bypassed at 0, buffers allocated on first use) and `eq.rs`. `index.rs` reads the sidx: seeks/resumes splice the stream (head + target fragment) for one request. After 30 s paused the engine releases track and device (`PlayerEvent::Released`) and its thread exits.
+- `player/`: symphonia + cpal. Callback applies volume, `pitch.rs` (WSOLA + resampler, bypassed at 0, buffers allocated on first use) and `eq.rs`. `index.rs` reads the sidx: seeks/resumes splice the stream (head + target fragment) for one request. After 30 s paused the engine releases track and device (`PlayerEvent::Released`) and its thread exits. Downloaded songs play from the file (`load_file`, no index, no network); the app skips resolver hints for them.
+- `download.rs`: one `download` pool thread. Songs: the AAC stream as-is, tags appended to moov/udta/meta/ilst (YouTube's files already have one with `©too`), written as `.part` then renamed, `Artist - Title [videoId].m4a`. Playlists/albums: `Title [id].m3u8` of those files. The folder is the record (scanned at startup only if it exists). Default folder `downloads` in the config dir, `[downloads] folder` in config.toml.
 - `theme.rs`: themes, subset Inter fonts, memory-mapped system fallback fonts. `config.rs`: line-based `config.toml` edits.
 
 ## YouTube Music API facts
@@ -68,8 +69,8 @@ $env:RUSTUP_HOME = "$env:USERPROFILE\scoop\persist\rustup\.rustup"
 
 ## Baselines
 
-Main exe 10.31 MB, login exe 0.72 MB. Process creation to main ~30 ms (OS; a trivial exe is the same), main to first frame ~34 ms (~20 ms of it is winit window creation). Idle 3.5 MB private, 6 threads. memtest settles ~8.5 MB. Playing ~13 Mcycles/s visible, ~9.7 minimized; true idle ~0. Seek ~30 ms.
+Main exe 10.41 MB, login exe 0.72 MB. Process creation to main ~30 ms (OS; a trivial exe is the same), main to first frame ~34 ms (~20 ms of it is winit window creation). Idle 3.5 MB private, 6 threads. memtest settles ~8.5 MB. Playing ~13 Mcycles/s visible, ~9.7 minimized; true idle ~0. Seek ~30 ms.
 
 ## Data
 
-Config and themes: `%APPDATA%\ytmcross`. `cookies.txt` (never print or publish), `last-played`, solver cache, `trace.log`: `%LOCALAPPDATA%\ytmcross`.
+Config, themes and downloads: `%APPDATA%\ytmcross`. `cookies.txt` (never print or publish), `last-played`, solver cache, `trace.log`: `%LOCALAPPDATA%\ytmcross`.

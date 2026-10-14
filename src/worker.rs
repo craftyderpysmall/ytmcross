@@ -37,6 +37,7 @@ pub enum Request {
     SetTheme(String),
     SaveEqualizer(EqualizerConfig),
     SavePitch(i32),
+    SaveDownloadFolder(String),
     CreatePlaylist(String),
     DeletePlaylist(Playlist),
     AddToPlaylist { id: String, title: String, video_id: String },
@@ -71,6 +72,8 @@ pub enum Response {
     Player(PlayerEvent),
     /// A stream URL lookup finished (see stream/mod.rs).
     Resolved { video_id: String, result: Result<String, String> },
+    /// Downloads moved on (download.rs); a message for the user when one finished.
+    Download(Option<String>),
     SignInFinished(bool),
 }
 
@@ -159,6 +162,11 @@ fn handle(client: &mut Client, requeue: &Pool<Request>, out: &Notifier, request:
         Request::SavePitch(semitones) => {
             if let Err(e) = config::save_pitch(semitones) {
                 edited(format!("Couldn't save pitch: {e}"), false, None);
+            }
+        }
+        Request::SaveDownloadFolder(folder) => {
+            if let Err(e) = config::save_download_folder(&folder) {
+                edited(format!("Couldn't save download folder: {e}"), false, None);
             }
         }
         Request::CreatePlaylist(title) => match client.create_playlist(&title) {
