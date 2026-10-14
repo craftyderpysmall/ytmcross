@@ -35,6 +35,9 @@ const MAX_VISIBLE: usize = 12;
 const LOOKAHEAD: usize = 3;
 /// Pages remembered for Back.
 const MAX_HISTORY: usize = 16;
+/// Like Windows' caret timeout: a text cursor stops blinking (and waking
+/// the app twice a second) after this long without input.
+const CARET_TIMEOUT: f64 = 5.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
@@ -193,6 +196,8 @@ pub struct App {
     pub view: View,
     /// egui time the current view appeared, for its entrance animation.
     pub view_since: f64,
+    /// egui time of the last input event.
+    last_input: f64,
     history: Vec<Page>,
     pub search: SearchState,
     /// Saved playlists and saved albums (None until loaded).
@@ -307,6 +312,7 @@ impl App {
             images,
             view,
             view_since: 0.0,
+            last_input: 0.0,
             history: Vec::new(),
             search: SearchState { focus: view == View::Search, ..Default::default() },
             library: None,
@@ -1171,6 +1177,14 @@ impl App {
         self.logic(&ui.ctx().clone());
         let ctx = ui.ctx().clone();
         self.handle_keys(&ctx);
+        let (now, input) = ctx.input(|i| (i.time, !i.events.is_empty()));
+        if input {
+            self.last_input = now;
+        }
+        let blink = now - self.last_input < CARET_TIMEOUT;
+        if ctx.global_style().visuals.text_cursor.blink != blink {
+            ctx.all_styles_mut(|s| s.visuals.text_cursor.blink = blink);
+        }
         // Typed or pasted text in another script: get its fonts right away.
         if !self.fallback_fonts && theme::needs_fallback(&self.search.query) {
             self.use_fallback_fonts(&ctx);

@@ -7,14 +7,12 @@ license = "MIT"
 default-run = "ytmcross"
 
 [dependencies]
-bytemuck = "1"
 dirs = "7.0.0"
-# egui is drawn on the CPU (softbuffer) instead of the GPU: the UI redraws rarely,
+# egui is drawn on the CPU instead of the GPU: the UI redraws rarely,
 # and not loading a GPU driver saves ~80 MB of RAM. No bundled egui fonts: we ship Inter.
 egui = { version = "0.34.3", default-features = false }
 egui-winit = { version = "0.34.3", default-features = false, features = ["clipboard", "wayland", "x11"] }
 egui_software_backend = { version = "0.0.3", default-features = false, features = ["std"] }
-softbuffer = "0.4.8"
 winit = "0.30.13"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 # No logger is installed: compile every dependency's log/tracing call out.
@@ -67,7 +65,12 @@ opt-level = "s"
 opt-level = "s"
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+# Windows presents frames itself (ui/present.rs).
+[target.'cfg(not(windows))'.dependencies]
+bytemuck = "1"
+softbuffer = "0.4.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.190"
