@@ -13,12 +13,14 @@ jobs:
     outputs:
       hash: ${{ steps.package.outputs.hash }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: msys2/setup-msys2@v2
         id: msys2
         with:
           msystem: MINGW64
           install: mingw-w64-x86_64-gcc
+          # msvcrt-based like Rust's windows-gnu target; UCRT64 would mix C runtimes.
+          suppress-deprecation-warnings: msystem-mingw64
       - name: Build
         shell: pwsh
         run: |
@@ -46,7 +48,7 @@ jobs:
     needs: windows
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: master
       - name: Update the manifest
