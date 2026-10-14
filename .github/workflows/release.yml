@@ -1,0 +1,64 @@
+# Push a tag vX.Y.Z (matching Cargo.toml) to release: builds the Windows zip,
+# publishes it, then points the Scoop manifest (bucket/ytmcross.json) at it.
+# Fedora packages build on COPR from .copr/Makefile.
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-latest
+    outputs:
+      hash: ${{ steps.package.outputs.hash }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+      - name: Build
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:GITHUB_REF_NAME) { throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version" }
+          $env:Path = "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin;$env:Path"
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          cargo +stable-x86_64-pc-windows-gnu build --release --locked
+          # The player must never load the webview.
+          if (objdump -p target\release\ytmcross.exe | Select-String WebView2Loader) { throw "ytmcross.exe imports WebView2Loader.dll" }
+      - name: Package and publish
+        id: package
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+          $dll = Get-ChildItem "$cargoHome\registry\src\*\webview2-com-sys-*\x64\WebView2Loader.dll" | Select-Object -First 1
+          if (-not $dll) { throw "WebView2Loader.dll not found" }
+          $zip = "ytmcross-$env:GITHUB_REF_NAME-windows-x64.zip"
+          Compress-Archive -Path target\release\ytmcross.exe, target\release\ytmcross-login.exe, $dll.FullName -DestinationPath $zip
+          "hash=$((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower())" >> $env:GITHUB_OUTPUT
+          gh release create $env:GITHUB_REF_NAME $zip --title "ytmcross $env:GITHUB_REF_NAME" --generate-notes
+  scoop:
+    needs: windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+      - name: Update the manifest
+        env:
+          HASH: ${{ needs.windows.outputs.hash }}
+        run: |
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/ytmcross-$GITHUB_REF_NAME-windows-x64.zip"
+          jq --indent 4 --arg v "${GITHUB_REF_NAME#v}" --arg u "$url" --arg h "$HASH" \
+            '.version = $v | .architecture."64bit".url = $u | .architecture."64bit".hash = $h' \
+            bucket/ytmcross.json > manifest.json
+          mv manifest.json bucket/ytmcross.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -am "Scoop: ytmcross ${GITHUB_REF_NAME#v}"
+          git push

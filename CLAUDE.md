@@ -26,6 +26,11 @@ $env:RUSTUP_HOME = "$env:USERPROFILE\scoop\persist\rustup\.rustup"
 - `build.rs` deflates `assets/ejs/*.js` into the binary and embeds `assets/ytmcross.manifest` (segment heap) via `windres`.
 - Per-crate `opt-level = "s"` in Cargo.toml is only for helper-only or cold crates; measure CPU before adding more.
 
+## Releases
+
+- Bump `version` in Cargo.toml, commit, push tag `vX.Y.Z`. `.github/workflows/release.yml` builds the Windows zip (GNU toolchain via MSYS2; exe, login exe, `WebView2Loader.dll`), publishes the GitHub release, and commits the new url/hash to `bucket/ytmcross.json` (this repo is the Scoop bucket).
+- COPR (`craftyderpysmall/ytmcross`) builds from SCM with `make_srpm`: `.copr/Makefile` vendors all crates into the SRPM and stamps Version/Release into `.copr/ytmcross.spec` (Release 1 on the version tag, snapshots otherwise). New system libraries need a `BuildRequires` there.
+
 ## Pitfalls
 
 - PowerShell 5.1. Many files are CRLF: multi-line `.Replace()` silently fails. Prefer the Edit tool, or normalize CRLF first, and verify replacements happened.

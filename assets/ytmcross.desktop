@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ytmcross
+GenericName=Music Player
+Comment=A minimal, fast, native YouTube Music client
+Exec=ytmcross
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupWMClass=ytmcross

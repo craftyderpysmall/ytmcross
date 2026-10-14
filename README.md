@@ -9,6 +9,22 @@ A minimal, fast, native YouTube Music client written in Rust. No Electron and no
 - **Footprint:** about 8 MB of RAM idle and about 18 MB while playing, in a single process.
 - **Ricing:** readable TOML theme files, reloaded live with **F5**.
 
+## Install
+
+Windows ([Scoop](https://scoop.sh)):
+
+```powershell
+scoop bucket add ytmcross https://github.com/craftyderpysmall/ytmcross
+scoop install ytmcross/ytmcross
+```
+
+Fedora ([COPR](https://copr.fedorainfracloud.org/coprs/craftyderpysmall/ytmcross/)):
+
+```sh
+sudo dnf copr enable craftyderpysmall/ytmcross
+sudo dnf install ytmcross
+```
+
 ## Requirements
 
 None: no external programs are needed to play music.
