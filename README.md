@@ -40,8 +40,6 @@ cargo build --release
 
 This builds two programs that belong in the same folder: `ytmcross` and the small `ytmcross-login`, which shows the sign-in window (on Windows, with `WebView2Loader.dll` beside it). Keeping the webview in its own program means the player itself never loads any browser code.
 
-The first launch opens the sign-in window. Sign out or in again from the **Account** menu. The **Equalizer** and **Pitch** menus apply instantly and are saved to `config.toml`.
-
 ## Files
 
 | | Windows | Linux | macOS |
@@ -75,10 +73,6 @@ The full set of tokens (`colors`, `font`, `shape`, `art`) is documented in `them
 ## Troubleshooting
 
 Run with `YTMCROSS_TRACE=1` to log millisecond timings (click, stream lookup, preload, first audio) to `trace.log` in the session folder above. `YTMCROSS_STATS=1` shows the time per drawn frame in the window title.
-
-## Credits
-
-Stream unlocking uses [yt-dlp/ejs](https://github.com/yt-dlp/ejs) (public domain; bundles meriyah, ISC, and astring, MIT) and [anenasa/ytdlp-ejs](https://github.com/anenasa/ytdlp-ejs) (MIT).
 
 ## Disclaimer
 
