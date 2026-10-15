@@ -6,7 +6,7 @@ A minimal, fast, native YouTube Music client written in Rust. No Electron and no
 - **Interface:** native egui, drawn on the CPU, so no GPU driver is loaded. It only draws when something changes: nothing at all when idle or minimized, and one frame per second while music plays.
 - **Playback:** done inside the app, with no external player. Audio streams over HTTP and is decoded in pure Rust (symphonia, AAC 256 kbps with Premium).
 - **Instant start:** stream addresses are resolved natively (YouTube's scrambled URLs are unlocked in an embedded QuickJS), and the start of every song on screen is preloaded, so a click plays in a few milliseconds.
-- **Footprint:** about 8 MB of RAM idle and about 18 MB while playing, in a single process.
+- **Footprint:** about 4 MB of RAM idle and about 8 MB while playing (highly optimized for Windows).
 - **Ricing:** readable TOML theme files, reloaded live with **F5**.
 
 ## Install
