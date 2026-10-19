@@ -1,6 +1,6 @@
 [package]
 name = "ytmcross"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "A minimal, fast, native YouTube Music client"
 license = "MIT"
