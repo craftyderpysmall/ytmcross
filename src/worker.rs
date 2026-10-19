@@ -4,14 +4,14 @@
 //! playlists are fetched one page per request, so a search typed meanwhile
 //! is never stuck behind a 5,000-track download.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::api::client::{ApiError, Client};
 use crate::pool::Pool;
 use crate::api::models::{Artist, Continuation, Header, Kind, Playlist, Track};
 use crate::auth::session::Session;
-use crate::config::{self, Config, EqualizerConfig};
+use crate::config::{self, Config, DownloadsConfig, EqualizerConfig};
 use crate::paths;
 use crate::player::PlayerEvent;
 use crate::theme::{self, Theme};
@@ -37,7 +37,8 @@ pub enum Request {
     SetTheme(String),
     SaveEqualizer(EqualizerConfig),
     SavePitch(i32),
-    SaveDownloadFolder(String),
+    SaveVolume(u32),
+    SaveDownloads(DownloadsConfig),
     CreatePlaylist(String),
     DeletePlaylist(Playlist),
     AddToPlaylist { id: String, title: String, video_id: String },
@@ -77,25 +78,34 @@ pub enum Response {
     SignInFinished(bool),
 }
 
+/// Wakes the event loop (shell.rs).
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
 /// Sends a response and wakes the UI. While the window is hidden only
 /// `App::logic` runs for it (no layout, no painting).
+///
+/// It wakes the event loop directly, not with `ctx.request_repaint()`: egui
+/// passes a request on only when it's sooner than the one already pending,
+/// and only a frame clears that. Hidden, no frame runs, so after the first
+/// one the rest (a track finishing, the next one's stream) would be lost
+/// until the window is shown again.
 #[derive(Clone)]
 pub struct Notifier {
     tx: Sender<Response>,
-    ctx: egui::Context,
+    wake: Waker,
 }
 
 impl Notifier {
     pub fn send(&self, response: Response) {
         if self.tx.send(response).is_ok() {
-            self.ctx.request_repaint();
+            (self.wake)();
         }
     }
 }
 
-pub fn spawn(ctx: egui::Context, agent: ureq::Agent) -> (Pool<Request>, Receiver<Response>, Notifier) {
+pub fn spawn(wake: Waker, agent: ureq::Agent) -> (Pool<Request>, Receiver<Response>, Notifier) {
     let (resp_tx, resp_rx) = mpsc::channel();
-    let notifier = Notifier { tx: resp_tx, ctx };
+    let notifier = Notifier { tx: resp_tx, wake };
     let out = notifier.clone();
     let client = Mutex::new(Client::new(agent, Session::load(&paths::cookies_file())));
     // One thread: requests are answered in the order they were made.
@@ -164,9 +174,14 @@ fn handle(client: &mut Client, requeue: &Pool<Request>, out: &Notifier, request:
                 edited(format!("Couldn't save pitch: {e}"), false, None);
             }
         }
-        Request::SaveDownloadFolder(folder) => {
-            if let Err(e) = config::save_download_folder(&folder) {
-                edited(format!("Couldn't save download folder: {e}"), false, None);
+        Request::SaveVolume(volume) => {
+            if let Err(e) = config::save_volume(volume) {
+                edited(format!("Couldn't save volume: {e}"), false, None);
+            }
+        }
+        Request::SaveDownloads(downloads) => {
+            if let Err(e) = config::save_downloads(&downloads) {
+                edited(format!("Couldn't save preferences: {e}"), false, None);
             }
         }
         Request::CreatePlaylist(title) => match client.create_playlist(&title) {

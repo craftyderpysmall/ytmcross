@@ -125,17 +125,25 @@ fn row_frame(ui: &mut Ui, theme: &Theme, active: bool, sense: Sense) -> (Rect, R
 #[derive(Default)]
 pub struct RowClicks {
     pub like: bool,
-    pub artist: bool,
+    /// Browse id of the artist clicked.
+    pub artist: Option<String>,
     pub album: bool,
 }
 
-/// A piece of text that acts as a link: underlined and pointing-hand on
-/// hover. Returns whether it was clicked; its response is merged into
-/// `row`, so right-clicking the text still opens the row's menu.
-/// "Artist • Album • 388M plays" in one line of `max_w`, artist and album
-/// as links. The album name gives way first, so the play count always fits.
-/// Returns the artist and album link responses (None when not links).
-pub fn byline(ui: &Ui, id: Id, pos: Pos2, max_w: f32, track: &Track, theme: &Theme, plays: bool) -> [Option<Response>; 2] {
+/// The links of a byline.
+pub struct Byline {
+    /// All link responses merged (None when there are no links), so
+    /// right-clicking the text still opens the row's menu.
+    pub links: Option<Response>,
+    /// Browse id of the artist clicked.
+    pub artist: Option<String>,
+    pub album: bool,
+}
+
+/// "Artist, Artist • Album • 388M plays" in one line of `max_w`, each
+/// artist and the album as links. The album name gives way first, so the
+/// play count always fits.
+pub fn byline(ui: &Ui, id: Id, pos: Pos2, max_w: f32, track: &Track, theme: &Theme, plays: bool) -> Byline {
     let (font, color) = (small(theme), theme.colors.text_dim);
     let right = pos.x + max_w;
     let sep = |ui: &Ui, x: f32| {
@@ -144,18 +152,54 @@ pub fn byline(ui: &Ui, id: Id, pos: Pos2, max_w: f32, track: &Track, theme: &The
         ui.painter().galley(pos2(x, pos.y), g, color);
         x + w
     };
+    let (mut links, mut artist, mut album_clicked) = (None::<Response>, None, false);
+    let mut add = |link: Option<Response>| {
+        let clicked = link.as_ref().is_some_and(Response::clicked);
+        if let Some(link) = link {
+            links = Some(match links.take() {
+                Some(all) => all.union(link),
+                None => link,
+            });
+        }
+        clicked
+    };
     let plays = track.plays.as_ref().filter(|_| plays).map(|p| line(ui, p, font.clone(), color, max_w));
     let reserve = plays.as_ref().map_or(0.0, |g| g.size().x + 14.0);
-    let artist = line(ui, &track.artists, font.clone(), color, (max_w - reserve).max(0.0));
-    let mut x = pos.x + artist.size().x;
-    let artist = text_link(ui, id.with("artist"), pos, artist, color, track.artist_id.is_some());
-    let mut album_link = None;
+    // The artists text in pieces: plain text between the linked names.
+    let text = track.artists.as_str();
+    let mut pieces = Vec::with_capacity(track.artist_links.len() * 2 + 1);
+    let mut at = 0;
+    for (range, artist_id) in &track.artist_links {
+        if range.start < at || text.get(range.clone()).is_none() {
+            continue;
+        }
+        pieces.push((at..range.start, None));
+        pieces.push((range.clone(), Some(artist_id)));
+        at = range.end;
+    }
+    pieces.push((at..text.len(), None));
+    let mut x = pos.x;
+    for (i, (range, artist_id)) in pieces.into_iter().filter(|(r, _)| !r.is_empty()).enumerate() {
+        let room = right - reserve - x;
+        if room <= 0.0 {
+            break;
+        }
+        let g = line(ui, &text[range], font.clone(), color, room);
+        let (w, cut) = (g.size().x, g.elided);
+        if add(text_link(ui, id.with(("artist", i)), pos2(x, pos.y), g, color, artist_id.is_some())) {
+            artist = artist_id.cloned();
+        }
+        x += w;
+        if cut {
+            break;
+        }
+    }
     if let Some(album) = &track.album {
         let ax = if track.artists.is_empty() { x } else { sep(ui, x) };
         if right - reserve - ax > 24.0 {
             let g = line(ui, album, font.clone(), color, right - reserve - ax);
             x = ax + g.size().x;
-            album_link = text_link(ui, id.with("album"), pos2(ax, pos.y), g, color, track.album_id.is_some());
+            album_clicked = add(text_link(ui, id.with("album"), pos2(ax, pos.y), g, color, track.album_id.is_some()));
         }
     }
     if let Some(g) = plays {
@@ -164,7 +208,7 @@ pub fn byline(ui: &Ui, id: Id, pos: Pos2, max_w: f32, track: &Track, theme: &The
             ui.painter().galley(pos2(px, pos.y), g, color);
         }
     }
-    [artist, album_link]
+    Byline { links, artist, album: album_clicked }
 }
 
 /// Draws `galley` at `pos`; when `enabled` it's clickable, underlined on hover.
@@ -246,12 +290,10 @@ pub fn track_row(ui: &mut Ui, images: &Images, theme: &Theme, track: &Track, loo
     let top = rect.center().y - total / 2.0;
     let sub_y = top + title.size().y + 2.0;
     ui.painter().galley(pos2(x, top), title, title_color);
-    let [artist, album] = byline(ui, row_id, pos2(x, sub_y), max_w, track, theme, true);
-    for (link, clicked) in [(artist, &mut clicks.artist), (album, &mut clicks.album)] {
-        if let Some(link) = link {
-            *clicked = link.clicked();
-            resp = resp.union(link);
-        }
+    let links = byline(ui, row_id, pos2(x, sub_y), max_w, track, theme, true);
+    (clicks.artist, clicks.album) = (links.artist, links.album);
+    if let Some(links) = links.links {
+        resp = resp.union(links);
     }
     if look.playing {
         let bar = Rect::from_center_size(pos2(rect.left() + 2.0, rect.center().y), vec2(3.0, rect.height() * 0.5));
@@ -503,6 +545,7 @@ pub struct SliderResult {
     /// Value under the pointer while dragging, else the given value.
     pub value: f32,
     pub dragging: bool,
+    pub hovered: bool,
     /// Pointer released (or clicked) this frame: commit `value`.
     pub committed: bool,
 }
@@ -511,11 +554,13 @@ pub struct SliderResult {
 pub fn slim_slider(ui: &Ui, theme: &Theme, rect: Rect, id: Id, value: f32) -> SliderResult {
     let resp = ui.interact(rect, id, Sense::click_and_drag());
     let dragging = resp.dragged() || resp.is_pointer_button_down_on();
+    let committed = resp.drag_stopped() || resp.clicked();
     let mut v = value.clamp(0.0, 1.0);
-    if let Some(pos) = resp.interact_pointer_pos().filter(|_| dragging || resp.clicked()) {
+    // On the release frame the drag is over: the value is where it ended.
+    let pointer = resp.interact_pointer_pos().or_else(|| ui.ctx().pointer_interact_pos());
+    if let Some(pos) = pointer.filter(|_| dragging || committed) {
         v = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
     }
-    let committed = resp.drag_stopped() || resp.clicked();
     let t = ease(ui, id.with("hover"), resp.hovered() || dragging);
     let c = &theme.colors;
     let h = 3.0 + 2.0 * t;
@@ -530,7 +575,7 @@ pub fn slim_slider(ui: &Ui, theme: &Theme, rect: Rect, id: Id, value: f32) -> Sl
     if resp.hovered() || dragging {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    SliderResult { value: v, dragging, committed }
+    SliderResult { value: v, dragging, hovered: resp.hovered(), committed }
 }
 
 /// "3:07" / "1:02:03".

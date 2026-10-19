@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Track {
     pub video_id: String,
@@ -8,8 +10,9 @@ pub struct Track {
     pub thumb: Option<String>,
     /// Identifies this entry within a playlist (needed to move it).
     pub set_video_id: Option<String>,
-    /// Browse ids of the (first) artist and the album, for their pages.
-    pub artist_id: Option<String>,
+    /// Each linked artist: where its name is in `artists`, and its browse id.
+    pub artist_links: Vec<(Range<usize>, String)>,
+    /// Browse id of the album, for its page.
     pub album_id: Option<String>,
     /// Whether it's in Liked Music, when the response said.
     pub liked: Option<bool>,

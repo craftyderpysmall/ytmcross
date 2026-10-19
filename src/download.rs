@@ -523,7 +523,7 @@ mod tests {
             duration: Some("9:22".into()),
             thumb: None,
             set_video_id: None,
-            artist_id: None,
+            artist_links: Vec::new(),
             album_id: None,
             liked: None,
             plays: None,

@@ -79,16 +79,17 @@ struct Stats {
 
 pub fn run(
     viewport: egui::ViewportBuilder,
-    make_app: impl FnOnce(&egui::Context) -> App,
+    make_app: impl FnOnce(&egui::Context, crate::worker::Waker) -> App,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::<Wake>::with_user_event().build()?;
     let ctx = egui::Context::default();
     let proxy = event_loop.create_proxy();
+    let waker = proxy.clone();
     ctx.set_request_repaint_callback(move |info| {
         let _ = proxy.send_event(Wake(info.delay));
     });
     crate::trace!("shell: event loop ready");
-    let app = make_app(&ctx);
+    let app = make_app(&ctx, Arc::new(move || drop(waker.send_event(Wake(Duration::ZERO)))));
     crate::trace!("shell: app created");
     let mut shell = Shell {
         // Measured: the per-primitive cache doubles our RAM (22 vs 12 MB) and is

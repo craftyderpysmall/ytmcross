@@ -24,17 +24,22 @@ pub fn command(program: &str) -> Command {
 
 /// Shows `dir` in the system file manager, creating it if needed. Runs the
 /// OS's own opener (nothing gets loaded into our process); unlike `command`,
-/// the file manager it starts may outlive us.
-pub fn open_folder(dir: &std::path::Path) -> std::io::Result<()> {
+/// the file manager it starts may outlive us. Linux: `file_manager` (a
+/// program name) instead of xdg-open when set.
+pub fn open_folder(dir: &std::path::Path, file_manager: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let opener = if cfg!(windows) {
-        "explorer"
+    let file_manager = file_manager.trim();
+    let child = if cfg!(windows) {
+        Command::new("explorer").arg(dir).spawn()?
     } else if cfg!(target_os = "macos") {
-        "open"
+        Command::new("open").arg(dir).spawn()?
+    } else if file_manager.is_empty() {
+        Command::new("xdg-open").arg(dir).spawn()?
     } else {
-        "xdg-open"
+        // Started in the background by a shell that exits at once, so no
+        // thread of ours waits for the file manager to be closed.
+        Command::new("sh").args(["-c", "\"$0\" \"$1\" >/dev/null 2>&1 &", file_manager]).arg(dir).spawn()?
     };
-    let child = Command::new(opener).arg(dir).spawn()?;
     // Unix: reap it once it exits (openers return quickly), leaving no zombie.
     #[cfg(unix)]
     {
@@ -44,6 +49,29 @@ pub fn open_folder(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
     drop(child);
     Ok(())
+}
+
+/// Linux file managers, by program name.
+const FILE_MANAGERS: &[&str] = &[
+    "nautilus",
+    "dolphin",
+    "thunar",
+    "nemo",
+    "caja",
+    "pcmanfm-qt",
+    "pcmanfm",
+    "cosmic-files",
+    "io.elementary.files",
+    "krusader",
+    "doublecmd",
+    "spacefm",
+];
+
+/// The known file managers installed (found on PATH).
+pub fn installed_file_managers() -> Vec<&'static str> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<_> = std::env::split_paths(&path).collect();
+    FILE_MANAGERS.iter().copied().filter(|fm| dirs.iter().any(|d| d.join(fm).is_file())).collect()
 }
 
 /// Windows: puts the child (and anything it spawns) in a job object that the

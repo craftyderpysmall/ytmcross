@@ -54,5 +54,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Nothing is dropped on the window. On Windows this also skips OLE
         // setup: 3 threads fewer, -0.2 MB, a 4 ms faster first frame.
         .with_drag_and_drop(false);
-    ui::run(viewport, move |ctx| ui::App::new(ctx, config, theme, config_error, signed_in))
+    ui::run(viewport, move |ctx, wake| ui::App::new(ctx, wake, config, theme, config_error, signed_in))
 }

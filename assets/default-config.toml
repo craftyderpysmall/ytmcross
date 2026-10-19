@@ -17,10 +17,12 @@ sidebar = true
 sidebar_items = ["search", "library", "queue"]
 
 [player]
-# Starting volume, 0-100.
+# Volume, 0-100. Kept from the volume slider.
 volume = 80
 
 [downloads]
 # Folder for downloaded songs and playlists. Empty: downloads, next to this file.
 # Also set from Preferences in the app.
 folder = ""
+# Linux: program that opens folders (Downloads button). Empty: xdg-open.
+file_manager = ""

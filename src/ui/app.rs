@@ -241,7 +241,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(ctx: &egui::Context, config: Config, loaded: theme::Loaded, config_error: Option<String>, signed_in: bool) -> App {
+    pub fn new(
+        ctx: &egui::Context,
+        wake: worker::Waker,
+        config: Config,
+        loaded: theme::Loaded,
+        config_error: Option<String>,
+        signed_in: bool,
+    ) -> App {
         // The track restored from the last session may need the fallback fonts.
         let last = load_last_played();
         let fallback_fonts = last.as_ref().is_some_and(|(t, _)| track_needs_fallback(t));
@@ -250,7 +257,7 @@ impl App {
         loaded.theme.apply(ctx);
 
         let agent = client::agent();
-        let (requests, responses, notifier) = worker::spawn(ctx.clone(), agent.clone());
+        let (requests, responses, notifier) = worker::spawn(wake, agent.clone());
         let images = Images::new(ctx, agent.clone());
 
         let notice = config_error.or(loaded.error);
@@ -621,7 +628,7 @@ impl App {
     }
 
     pub fn open_folder(&mut self, dir: &std::path::Path) {
-        if let Err(e) = proc::open_folder(dir) {
+        if let Err(e) = proc::open_folder(dir, &self.config.downloads.file_manager) {
             self.notify(format!("Couldn't open {}: {e}", dir.display()));
         }
     }
@@ -631,8 +638,15 @@ impl App {
         let folder = folder.trim().to_string();
         self.downloads.set_dir(paths::downloads_dir(&folder));
         self.notify(format!("Downloads go to {}", self.downloads.dir().display()));
-        self.config.downloads.folder = folder.clone();
-        self.requests.push(Request::SaveDownloadFolder(folder));
+        self.config.downloads.folder = folder;
+        self.requests.push(Request::SaveDownloads(self.config.downloads.clone()));
+    }
+
+    /// From Preferences (Linux): the program that opens folders, empty for
+    /// the system default.
+    pub fn set_file_manager(&mut self, program: String) {
+        self.config.downloads.file_manager = program;
+        self.requests.push(Request::SaveDownloads(self.config.downloads.clone()));
     }
 
     pub fn add_to_playlist(&self, playlist: &Playlist, track: &Track) {
@@ -965,9 +979,15 @@ impl App {
         self.playback.set_position(seconds);
     }
 
-    pub fn set_volume(&mut self, volume: f32) {
+    /// Heard at once; `save` also writes config.toml (on release).
+    pub fn set_volume(&mut self, volume: f32, save: bool) {
         self.playback.volume = volume;
-        self.player.set_volume((volume * 100.0).round() as f64);
+        let percent = (volume * 100.0).round() as u32;
+        self.player.set_volume(percent as f64);
+        if save && percent != self.config.player.volume {
+            self.config.player.volume = percent;
+            self.requests.push(Request::SaveVolume(percent));
+        }
     }
 
     // ---- messages ---------------------------------------------------------
@@ -1084,6 +1104,9 @@ impl App {
                 }
                 if config.pitch != self.config.pitch {
                     self.set_pitch(config.pitch.semitones, false);
+                }
+                if config.player.volume != self.config.player.volume {
+                    self.set_volume(config.player.volume.min(100) as f32 / 100.0, false);
                 }
                 self.downloads.set_dir(paths::downloads_dir(&config.downloads.folder));
                 self.config = *config;
@@ -1362,7 +1385,7 @@ fn save_last_played(track: Option<&Track>, position: f64) {
         opt(&t.album),
         opt(&t.duration),
         opt(&t.thumb),
-        opt(&t.artist_id),
+        t.artist_links.iter().map(|(r, id)| format!("{}:{}:{id}", r.start, r.end)).collect::<Vec<_>>().join(" "),
         opt(&t.album_id),
         t.liked.map_or(String::new(), |l| l.to_string()),
         format!("{position:.1}"),
@@ -1378,6 +1401,16 @@ fn load_last_played() -> Option<(Track, f64)> {
         return None;
     }
     let opt = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    // "start:end:id" per artist; older files hold one id for all the artists.
+    let artist_links = f[6]
+        .split(' ')
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| match l.splitn(3, ':').collect::<Vec<_>>()[..] {
+            [id] => Some((0..f[2].len(), id.to_string())),
+            [s, e, id] => Some((s.parse().ok()?..e.parse().ok()?, id.to_string())),
+            _ => None,
+        })
+        .collect();
     let track = Track {
         video_id: f[0].to_string(),
         title: f[1].to_string(),
@@ -1386,7 +1419,7 @@ fn load_last_played() -> Option<(Track, f64)> {
         duration: opt(f[4]),
         thumb: opt(f[5]),
         set_video_id: None,
-        artist_id: opt(f[6]),
+        artist_links,
         album_id: opt(f[7]),
         liked: f[8].parse().ok(),
         plays: None,
@@ -1407,7 +1440,7 @@ mod tests {
             duration: duration.map(str::to_string),
             thumb: None,
             set_video_id: None,
-            artist_id: None,
+            artist_links: Vec::new(),
             album_id: None,
             liked: None,
             plays: None,

@@ -25,8 +25,10 @@ pub struct Config {
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct DownloadsConfig {
-    /// Where downloads go; empty: "ytmcross" in the user's music folder.
+    /// Where downloads go; empty: "downloads" next to config.toml.
     pub folder: String,
+    /// Linux: program that opens folders; empty: xdg-open.
+    pub file_manager: String,
 }
 
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
@@ -170,11 +172,18 @@ pub fn save_pitch(semitones: i32) -> std::io::Result<()> {
     edit_config(|text| set_section(text, "pitch", &body))
 }
 
+/// Rewrites the `[player]` section of config.toml (the volume slider owns it).
+pub fn save_volume(volume: u32) -> std::io::Result<()> {
+    let body = format!("# Volume, 0-100. Kept from the volume slider.\nvolume = {volume}\n");
+    edit_config(|text| set_section(text, "player", &body))
+}
+
 /// Rewrites the `[downloads]` section of config.toml (set in Preferences).
-pub fn save_download_folder(folder: &str) -> std::io::Result<()> {
+pub fn save_downloads(d: &DownloadsConfig) -> std::io::Result<()> {
     let body = format!(
-        "# Folder for downloaded songs and playlists. Empty: downloads, next to this file.\n# Also set from Preferences in the app.\nfolder = {}\n",
-        toml_string(folder.trim())
+        "# Folder for downloaded songs and playlists. Empty: downloads, next to this file.\n# Also set from Preferences in the app.\nfolder = {}\n# Linux: program that opens folders (Downloads button). Empty: xdg-open.\nfile_manager = {}\n",
+        toml_string(d.folder.trim()),
+        toml_string(d.file_manager.trim())
     );
     edit_config(|text| set_section(text, "downloads", &body))
 }

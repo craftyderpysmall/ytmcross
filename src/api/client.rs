@@ -122,7 +122,7 @@ impl Client {
                     && let Some((name, id)) = &h.artist
                 {
                     t.artists = name.clone();
-                    t.artist_id = id.clone();
+                    t.artist_links = id.iter().map(|id| (0..name.len(), id.clone())).collect();
                 }
                 t.album.get_or_insert_with(|| list.title.clone());
                 t.album_id.get_or_insert_with(|| list.id.clone());

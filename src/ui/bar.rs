@@ -16,7 +16,8 @@ enum Action {
     Warm,
     Next,
     Seek(f64),
-    Volume(f32),
+    /// Level, and whether to save it (on release, not every drag step).
+    Volume(f32, bool),
     OpenAlbum(Box<crate::api::models::Track>),
     OpenArtist(String),
 }
@@ -46,13 +47,11 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         ui.painter().galley(pos2(text_x, top), g_title, c.text);
         // "Artist • Album": artist opens the artist page, album the album.
         if let Some(t) = track {
-            let [artist, album] = widgets::byline(ui, Id::new("bar"), pos2(text_x, sub_y), text_w, t, theme, false);
-            if artist.is_some_and(|r| r.clicked())
-                && let Some(id) = &t.artist_id
-            {
-                action = Some(Action::OpenArtist(id.clone()));
+            let links = widgets::byline(ui, Id::new("bar"), pos2(text_x, sub_y), text_w, t, theme, false);
+            if let Some(id) = links.artist {
+                action = Some(Action::OpenArtist(id));
             }
-            if album.is_some_and(|r| r.clicked()) {
+            if links.album {
                 action = Some(Action::OpenAlbum(Box::new(t.clone())));
             }
         }
@@ -64,9 +63,12 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             let r = Rect::from_min_size(pos2(rect.right() - 120.0, rect.center().y - 8.0), vec2(120.0, 16.0));
             let s = slim_slider(ui, theme, r, Id::new("volume"), pb.volume);
             if s.committed || (s.dragging && (s.value - pb.volume).abs() >= 0.01) {
-                action = Some(Action::Volume(s.value));
+                action = Some(Action::Volume(s.value, s.committed));
             }
-            ui.painter().text(pos2(r.left() - 10.0, r.center().y), Align2::RIGHT_CENTER, "Vol", widgets::small(theme), c.text_dim);
+            // The level while it's being set (or pointed at).
+            let label =
+                if s.dragging || s.hovered { format!("{}%", (s.value * 100.0).round()) } else { "Vol".to_string() };
+            ui.painter().text(pos2(r.left() - 10.0, r.center().y), Align2::RIGHT_CENTER, label, widgets::small(theme), c.text_dim);
         }
 
         // Centre: transport buttons and seek bar.
@@ -115,7 +117,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         Some(Action::Warm) => app.warm_resume(),
         Some(Action::Next) => app.next(),
         Some(Action::Seek(t)) => app.seek(t),
-        Some(Action::Volume(v)) => app.set_volume(v),
+        Some(Action::Volume(v, save)) => app.set_volume(v, save),
         Some(Action::OpenAlbum(t)) => app.open_album(ui.ctx(), &t),
         Some(Action::OpenArtist(id)) => app.open_artist(ui.ctx(), &id),
         None => {}

@@ -41,7 +41,8 @@ struct ListResult {
     menu: Option<(usize, TrackChoice)>,
     like: Option<usize>,
     album: Option<usize>,
-    artist: Option<usize>,
+    /// Browse id of an artist link clicked.
+    artist: Option<String>,
     drag_start: Option<usize>,
     /// Where a dragged row would land (insert before this index).
     drop_at: Option<usize>,
@@ -336,8 +337,8 @@ fn rows(ui: &mut Ui, app: &App, spec: &ListSpec, range: Range<usize>, out: &mut 
             out.like = Some(i);
         } else if clicks.album {
             out.album = Some(i);
-        } else if clicks.artist {
-            out.artist = Some(i);
+        } else if clicks.artist.is_some() {
+            out.artist = clicks.artist;
         } else if resp.clicked() {
             out.clicked = Some(i);
         }
@@ -386,7 +387,7 @@ fn row_action<'a>(list: &mut ListResult, track: impl Fn(usize) -> Option<&'a Tra
     if let Some(t) = cloned(list.album) {
         return Some(Action::OpenAlbum(t));
     }
-    cloned(list.artist).and_then(|t| t.artist_id).map(Action::OpenArtist)
+    list.artist.take().map(Action::OpenArtist)
 }
 
 /// Finds where a dragged row would land, draws the insertion line, dims the

@@ -5,6 +5,8 @@
 //! hard-coding paths we search the tree for the leaf renderers we know.
 //! Every lookup is optional: a layout change drops rows, it never panics.
 
+use std::ops::Range;
+
 use serde_json::Value;
 
 use super::models::{Artist, Continuation, Header, Kind, Playlist, Track};
@@ -98,6 +100,20 @@ fn link<'a>(runs: &[&'a Value], page: &str) -> Option<(&'a str, &'a str)> {
     })
 }
 
+/// Finds each linked name (in order) in `artists`: its byte range there and
+/// browse id. Names not found are left out.
+fn artist_links<'a>(artists: &str, links: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<(Range<usize>, String)> {
+    let mut from = 0;
+    links
+        .filter(|(name, _)| !name.trim().is_empty())
+        .filter_map(|(name, id)| {
+            let start = from + artists.get(from..)?.find(name)?;
+            from = start + name.len();
+            Some((start..from, id.to_string()))
+        })
+        .collect()
+}
+
 fn runs_of(v: &Value) -> impl Iterator<Item = &Value> {
     v["runs"].as_array().into_iter().flatten()
 }
@@ -153,16 +169,21 @@ fn list_item(r: &Value) -> Option<Track> {
     let album_link = link(&runs, ALBUM_PAGE);
     let plays = runs.iter().filter_map(|r| r["text"].as_str()).find(|t| is_play_count(t)).map(str::to_string);
     groups.retain(|g| !is_play_count(g));
+    let artists = groups.first().cloned().unwrap_or_default();
+    let artist_runs = runs.iter().filter_map(|run| {
+        let (id, page) = browse(run)?;
+        (page == ARTIST_PAGE).then(|| (run["text"].as_str().unwrap_or_default(), id))
+    });
 
     Some(Track {
         video_id,
         title,
-        artists: groups.first().cloned().unwrap_or_default(),
+        artist_links: artist_links(&artists, artist_runs),
+        artists,
         album: album_link.map(|(t, _)| t.to_string()).or_else(|| groups.get(1).cloned()),
         duration,
         thumb: thumb(&r["thumbnail"]),
         set_video_id: r["playlistItemData"]["playlistSetVideoId"].as_str().map(str::to_string),
-        artist_id: link(&runs, ARTIST_PAGE).map(|(_, id)| id.to_string()),
         album_id: album_link.map(|(_, id)| id.to_string()),
         liked: liked(&r["menu"]),
         plays,
@@ -173,16 +194,21 @@ fn panel_item(r: &Value) -> Option<Track> {
     let groups = run_groups(&r["longBylineText"]);
     let runs: Vec<&Value> = runs_of(&r["longBylineText"]).collect();
     let album_link = link(&runs, ALBUM_PAGE);
+    let artists = groups.first().cloned().unwrap_or_default();
+    // Panel links carry no page type: artists are channels (UC…).
+    let artist_runs = runs.iter().filter_map(|run| {
+        let (id, _) = browse(run).filter(|(id, _)| id.starts_with("UC"))?;
+        Some((run["text"].as_str().unwrap_or_default(), id))
+    });
     Some(Track {
         video_id: r["videoId"].as_str()?.to_string(),
         title: text(&r["title"])?,
-        artists: groups.first().cloned().unwrap_or_default(),
+        artist_links: artist_links(&artists, artist_runs),
+        artists,
         album: album_link.map(|(t, _)| t.to_string()).or_else(|| groups.get(1).cloned()),
         duration: text(&r["lengthText"]),
         thumb: thumb(&r["thumbnail"]),
         set_video_id: None,
-        // Panel links carry no page type: artists are channels (UC…).
-        artist_id: runs.iter().find_map(|run| browse(run).map(|(id, _)| id).filter(|id| id.starts_with("UC"))).map(str::to_string),
         album_id: album_link.or_else(|| runs.iter().find_map(|run| browse(run).filter(|(id, _)| id.starts_with("MPRE")).map(|(id, _)| ("", id)))).map(|(_, id)| id.to_string()),
         liked: liked(&r["menu"]),
         plays: None,
@@ -388,8 +414,26 @@ mod tests {
         assert_eq!(t.album.as_deref(), Some("Album"));
         assert_eq!(t.duration.as_deref(), Some("3:45"));
         assert_eq!(t.thumb.as_deref(), Some("big"));
-        assert_eq!((t.artist_id.as_deref(), t.album_id.as_deref()), (Some("UC1"), Some("MPREb_1")));
+        assert_eq!(t.artist_links, vec![(0..6, "UC1".to_string())]);
+        assert_eq!(t.album_id.as_deref(), Some("MPREb_1"));
         assert_eq!(t.liked, Some(true));
+    }
+
+    #[test]
+    fn links_every_artist() {
+        let resp = json!({"musicResponsiveListItemRenderer": {
+            "playlistItemData": {"videoId": "abc"},
+            "flexColumns": [
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Title"}]}}},
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [
+                    {"text": "Song"}, {"text": " • "}, link_run("A", "UC1", ARTIST_PAGE), {"text": ", "},
+                    link_run("B", "UC2", ARTIST_PAGE), {"text": " & "}, link_run("A B", "UC3", ARTIST_PAGE),
+                    {"text": " • "}, {"text": "3:45"}]}}}
+            ]}});
+        let t = &tracks(&resp)[0];
+        assert_eq!(t.artists, "A, B & A B");
+        let ids: Vec<_> = t.artist_links.iter().map(|(r, id)| (&t.artists[r.clone()], id.as_str())).collect();
+        assert_eq!(ids, [("A", "UC1"), ("B", "UC2"), ("A B", "UC3")]);
     }
 
     #[test]
