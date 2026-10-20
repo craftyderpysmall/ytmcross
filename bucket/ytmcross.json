@@ -1,12 +1,12 @@
 {
-    "version": "0.1.3",
+    "version": "0.1.4",
     "description": "A minimal, fast, native YouTube Music client",
     "homepage": "https://github.com/craftyderpysmall/ytmcross",
     "license": "MIT",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/craftyderpysmall/ytmcross/releases/download/v0.1.3/ytmcross-v0.1.3-windows-x64.zip",
-            "hash": "3c041c5fd72dbaa0264174ed7d976eba114b60f91e89f5afc895c741edadfa39"
+            "url": "https://github.com/craftyderpysmall/ytmcross/releases/download/v0.1.4/ytmcross-v0.1.4-windows-x64.zip",
+            "hash": "86e8281e68c1f962564b6a706e1566a2a50185abb80070fb42edf00e53337277"
         }
     },
     "bin": "ytmcross.exe",
