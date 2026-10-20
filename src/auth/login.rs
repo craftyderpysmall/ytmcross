@@ -35,7 +35,7 @@ pub fn run() -> ! {
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let window = WindowBuilder::new()
-        .with_title("ytmcross - sign in")
+        .with_title("YouTube Music - sign in")
         .with_inner_size(tao::dpi::LogicalSize::new(480.0, 700.0))
         .build(&event_loop)
         .expect("failed to create sign-in window");

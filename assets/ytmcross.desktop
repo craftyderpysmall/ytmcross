@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=ytmcross
+Name=YouTube Music
 GenericName=Music Player
 Comment=A minimal, fast, native YouTube Music client
 Exec=ytmcross

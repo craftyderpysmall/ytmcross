@@ -8,7 +8,7 @@ Native Rust YouTube Music client (no Electron, no browser at runtime).
 2. Minimal and clean: no feature creep, remove unused code.
 3. Disk size matters, but less than RAM/CPU.
 4. After each request, keep looking for startup/storage/CPU/RAM wins and unused code. Measure before and after with `dev/` scripts and report numbers.
-5. When done: commit, and push to `origin master` (github.com/craftyderpysmall/ytmcross) when asked.
+5. ONLY when explicitly asked: commit, and push to `origin master` (github.com/craftyderpysmall/ytmcross).
 
 ## Build (Windows, GNU toolchain via scoop)
 
@@ -47,7 +47,8 @@ $env:RUSTUP_HOME = "$env:USERPROFILE\scoop\persist\rustup\.rustup"
 - `ui/app.rs`: all state. Spotify-style `Queue` (current, user `manual` queue first, then `context`; radio appended at the end). Back history of pages. `likes` overrides like status. `last-played` restores the track paused; its stream is prefetched only when the pointer hovers play. System fallback fonts are installed on first need.
 - `ui/views.rs`: views return an `Action` applied afterwards; virtualized `track_list`; queue rows via `QueueRow`.
 - `ui/widgets.rs`: custom widgets. `track_row`: title (plain), `byline` (a link per artist via `Track::artist_links` byte ranges into `artists`, Album link, plays), like button (hover only, filled if liked) left of a fixed-width duration slot.
-- `ui/menus.rs`: Account/Equalizer/Pitch/Theme (with "Open themes folder")/Preferences (download folder; Linux: file manager picked from those on PATH) popups, Downloads button (opens the folder via `proc::open_folder`: explorer/open/xdg-open or the chosen file manager through a detached `sh`, nothing loaded in-process), context menus (Download, Delete owned playlists, Remove saved ones), delete modal. `ui/bar.rs`: now-playing bar.
+- `ui/menus.rs`: Account/Equalizer/Pitch/Preferences (theme with "Open themes folder", download folder, shortcuts; Linux: file manager picked from those on PATH) popups, Downloads button (opens the folder via `proc::open_folder`: explorer/open/xdg-open or the chosen file manager through a detached `sh`, nothing loaded in-process), context menus (Download, Delete owned playlists, Remove saved ones), delete modal. `ui/bar.rs`: now-playing bar. `ui/win32.rs` (Windows), via a wrapped window procedure: taskbar thumbnail buttons (prev/play-pause/next, added on "TaskbarButtonCreated") and the `[keys]` shortcuts as system-wide hotkeys (`RegisterHotKey`, WM_HOTKEY). Both come back as `Wake::Control` → `App::control`; button state and hotkeys are pushed from `about_to_wait` (hotkeys unregistered while Preferences records one). Elsewhere the shortcuts work in-window (`take_key` in app.rs, ahead of Alt+Left = back). `config::Bind` parses/prints "Ctrl+Alt+Left" with egui key names.
+- Naming: the package, binaries, paths and app id stay `ytmcross`; everything users see (window and sign-in titles, sidebar title, `.desktop` Name, Scoop shortcut, exe FileDescription from build.rs) says "YouTube Music".
 - `pool.rs`: worker threads that exit after 5 idle s; used by `worker.rs` (API, one thread), album art (4), and the resolver/engine threads follow the same rule. Idle app: 6 threads.
 - `worker.rs`: API requests (`Request`/`Response`). `Notifier` wakes the event loop directly (shell's `Waker`), never via `ctx.request_repaint()`: egui drops requests while one is pending and only a frame clears that, so a hidden window would stop advancing the queue.
 - `api/`: InnerTube WEB_REMIX client, parser (searches leaf renderers), models (`Track`, `Playlist` with `kind`/`owned`/`save_id`, `Header`, `Artist`).
@@ -75,7 +76,7 @@ $env:RUSTUP_HOME = "$env:USERPROFILE\scoop\persist\rustup\.rustup"
 
 ## Baselines
 
-Main exe 10.46 MB, login exe 0.72 MB. Process creation to main ~30 ms (OS; a trivial exe is the same), main to first frame ~34 ms (~20 ms of it is winit window creation). Idle 3.5 MB private, 6 threads. memtest settles ~8.5 MB. Playing ~13 Mcycles/s visible, ~9.7 minimized; true idle ~0. Seek ~30 ms. (Windows.)
+Main exe 9.99 MB, login exe 0.72 MB. Process creation to main ~30 ms (OS; a trivial exe is the same), main to first frame ~34 ms (~20 ms of it is winit window creation). Idle 3.5 MB private, 6 threads. memtest settles ~8.5 MB. Playing ~13 Mcycles/s visible, ~9.7 minimized; true idle ~0. Seek ~30 ms. (Windows.)
 
 Linux (Fedora 44, Hyprland 0.56, Ryzen AI 7 350, 2026-10-14): main exe 12.43 MB, login exe 0.79 MB. Wayland: launch to first frame ~21 ms wall (main to first frame ~12 ms, event loop ready ~4 ms); idle 11.0 MB private, 3.1 MB anon, 1 thread, 0 ms/s CPU once settled. X11 (XWayland): ~22-29 ms wall (event loop ready ~10-15 ms); settled 11.6 MB private, 3.6 MB anon, 1 thread, ~3 ms/s CPU. The first launch blocks on sign-in and then builds the solver, so measure from the second run on. memtest (X11, `WINIT_X11_SCALE_FACTOR=1`, window floated at 1100x720): 11.4 MB at start, 21.8 after four searches, settles ~25.8 MB private / 16.1 anon while playing; playing ~28 ms/s CPU. Hyprland has no minimize, so the "minimized" line equals the visible one. Search now shows an Albums shelf above Songs, so memtest's "track 1" click (y 150) opens an album and "track 2" plays from it.
 

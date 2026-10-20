@@ -32,13 +32,30 @@ fn embed_manifest(out: &std::path::Path) {
         println!("cargo:rustc-link-arg-bin=ytmcross=/MANIFESTINPUT:{}", manifest.display());
         return;
     }
-    // GNU: compile a resource script naming the manifest (RT_MANIFEST = 24)
-    // and the icon (ICON 1: Explorer, shortcuts, and the window via ui/shell.rs).
+    // GNU: compile a resource script naming the manifest (RT_MANIFEST = 24),
+    // the icon (ICON 1: Explorer, shortcuts, and the window via ui/shell.rs)
+    // and the version info, whose description is the name Windows shows
+    // (Task Manager, volume mixer, "Open with").
     let icon = manifest.with_file_name("ytmcross.ico");
     println!("cargo:rerun-if-changed=assets/ytmcross.ico");
     let path = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let numbers = version.replace('.', ",");
     let rc = out.join("manifest.rc");
-    std::fs::write(&rc, format!("1 24 \"{}\"\n1 ICON \"{}\"\n", path(&manifest), path(&icon))).unwrap();
+    std::fs::write(
+        &rc,
+        format!(
+            "1 24 \"{}\"\n1 ICON \"{}\"\n1 VERSIONINFO\nFILEVERSION {numbers},0\nPRODUCTVERSION {numbers},0\n\
+             BEGIN\n BLOCK \"StringFileInfo\"\n BEGIN\n  BLOCK \"040904B0\"\n  BEGIN\n\
+             \x20  VALUE \"FileDescription\", \"YouTube Music\"\n   VALUE \"ProductName\", \"YouTube Music\"\n\
+             \x20  VALUE \"FileVersion\", \"{version}\"\n   VALUE \"ProductVersion\", \"{version}\"\n\
+             \x20  VALUE \"OriginalFilename\", \"ytmcross.exe\"\n  END\n END\n\
+             \x20BLOCK \"VarFileInfo\"\n BEGIN\n  VALUE \"Translation\", 0x409, 1200\n END\nEND\n",
+            path(&manifest),
+            path(&icon)
+        ),
+    )
+    .unwrap();
     let obj = out.join("manifest.o");
     let windres = std::env::var("WINDRES").unwrap_or_else(|_| "windres".into());
     match std::process::Command::new(&windres).arg(&rc).arg("-O").arg("coff").arg("-o").arg(&obj).status() {

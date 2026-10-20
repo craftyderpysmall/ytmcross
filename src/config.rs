@@ -20,6 +20,119 @@ pub struct Config {
     pub equalizer: EqualizerConfig,
     pub pitch: PitchConfig,
     pub downloads: DownloadsConfig,
+    pub keys: KeysConfig,
+}
+
+/// What a shortcut (or a taskbar button) does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Control {
+    Previous,
+    PlayPause,
+    Next,
+}
+
+pub const CONTROLS: [Control; 3] = [Control::Previous, Control::PlayPause, Control::Next];
+
+impl Control {
+    pub fn label(self) -> &'static str {
+        match self {
+            Control::Previous => "Previous",
+            Control::PlayPause => "Play / pause",
+            Control::Next => "Next",
+        }
+    }
+}
+
+/// A key with modifiers, written like "Alt+Left" (egui's key names).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Bind {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    /// Win on Windows, Cmd on macOS, Super elsewhere.
+    pub logo: bool,
+    pub key: egui::Key,
+}
+
+/// Name of the logo modifier here.
+const LOGO: &str = if cfg!(windows) {
+    "Win"
+} else if cfg!(target_os = "macos") {
+    "Cmd"
+} else {
+    "Super"
+};
+
+impl Bind {
+    pub fn parse(text: &str) -> Option<Bind> {
+        let mut parts: Vec<&str> = text.split('+').map(str::trim).collect();
+        let key = parts.pop()?;
+        // Key names are case-sensitive: also try "left" as "Left".
+        let capitalized = key.get(..1).map(|c| c.to_uppercase() + &key[1..]);
+        let key = egui::Key::from_name(key).or_else(|| egui::Key::from_name(&capitalized?))?;
+        let mut b = Bind { ctrl: false, alt: false, shift: false, logo: false, key };
+        for m in parts {
+            match m.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => b.ctrl = true,
+                "alt" | "option" => b.alt = true,
+                "shift" => b.shift = true,
+                "win" | "super" | "cmd" | "command" | "meta" => b.logo = true,
+                _ => return None,
+            }
+        }
+        Some(b)
+    }
+
+    /// The pressed key, as egui reports it (the logo key only on macOS).
+    pub fn pressed(key: egui::Key, m: egui::Modifiers) -> Bind {
+        Bind { ctrl: m.ctrl, alt: m.alt, shift: m.shift, logo: m.mac_cmd, key }
+    }
+}
+
+impl std::fmt::Display for Bind {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        for (on, name) in [(self.ctrl, "Ctrl"), (self.alt, "Alt"), (self.shift, "Shift"), (self.logo, LOGO)] {
+            if on {
+                write!(f, "{name}+")?;
+            }
+        }
+        f.write_str(self.key.name())
+    }
+}
+
+/// Shortcuts, by `Control`. On Windows they work from any program.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KeysConfig(pub [Option<Bind>; 3]);
+
+impl Default for KeysConfig {
+    fn default() -> Self {
+        let alt = |key| Some(Bind { ctrl: false, alt: true, shift: false, logo: false, key });
+        KeysConfig([alt(egui::Key::ArrowLeft), alt(egui::Key::ArrowDown), alt(egui::Key::ArrowRight)])
+    }
+}
+
+impl<'de> Deserialize<'de> for KeysConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Raw {
+            previous: Option<String>,
+            play_pause: Option<String>,
+            next: Option<String>,
+        }
+        let raw = Raw::deserialize(d)?;
+        let mut keys = KeysConfig::default();
+        for (slot, text) in keys.0.iter_mut().zip([raw.previous, raw.play_pause, raw.next]) {
+            // Missing: the default. Empty: no shortcut.
+            if let Some(text) = text {
+                *slot = match text.trim() {
+                    "" => None,
+                    t => Some(Bind::parse(t).ok_or_else(|| serde::de::Error::custom(format!("unknown shortcut {t:?}")))?),
+                };
+            }
+        }
+        Ok(keys)
+    }
 }
 
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
@@ -93,6 +206,7 @@ impl Default for Config {
             equalizer: EqualizerConfig::default(),
             pitch: PitchConfig::default(),
             downloads: DownloadsConfig::default(),
+            keys: KeysConfig::default(),
         }
     }
 }
@@ -187,6 +301,17 @@ pub fn save_downloads(d: &DownloadsConfig) -> std::io::Result<()> {
     );
     edit_config(|text| set_section(text, "downloads", &body))
 }
+
+/// Rewrites the `[keys]` section of config.toml (set in Preferences).
+pub fn save_keys(keys: &KeysConfig) -> std::io::Result<()> {
+    let [previous, play_pause, next] = keys.0.map(|b| toml_string(&b.map(|b| b.to_string()).unwrap_or_default()));
+    let body = format!(
+        "{KEYS_COMMENT}previous = {previous}\nplay_pause = {play_pause}\nnext = {next}\n"
+    );
+    edit_config(|text| set_section(text, "keys", &body))
+}
+
+const KEYS_COMMENT: &str = "# Player shortcuts, like \"Ctrl+Shift+Right\". On Windows they work from any app.\n# Empty: none. Also set from Preferences in the app.\n";
 
 /// A TOML basic string (`{:?}` would write Rust escapes TOML lacks).
 fn toml_string(s: &str) -> String {
@@ -330,6 +455,21 @@ mod tests {
         let path = r#"C:\Users\Me\Music "x""#;
         let out = set_section(SAMPLE, "downloads", &format!("folder = {}\n", toml_string(path)));
         assert_eq!(toml::from_str::<Config>(&out).unwrap().downloads.folder, path);
+    }
+
+    #[test]
+    fn keys_parse_print_and_default() {
+        let b = Bind::parse("ctrl+shift+left").unwrap();
+        assert!(b.ctrl && b.shift && !b.alt && b.key == egui::Key::ArrowLeft);
+        assert_eq!(b.to_string(), "Ctrl+Shift+Left");
+        assert_eq!(Bind::parse("Alt+F7").unwrap().to_string(), "Alt+F7");
+        assert!(Bind::parse("Hyper+Left").is_none() && Bind::parse("Alt+").is_none());
+        let cfg: Config = toml::from_str("[keys]\nnext = \"\"\nprevious = \"Alt+P\"\n").unwrap();
+        assert_eq!(cfg.keys.0[2], None);
+        assert_eq!(cfg.keys.0[0], Bind::parse("Alt+P"));
+        assert_eq!(cfg.keys.0[1], KeysConfig::default().0[1]);
+        assert_eq!(toml::from_str::<Config>("").unwrap().keys, KeysConfig::default());
+        assert!(toml::from_str::<Config>("[keys]\nnext = \"Alt+Nope\"\n").is_err());
     }
 
     #[test]

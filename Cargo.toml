@@ -1,6 +1,6 @@
 [package]
 name = "ytmcross"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "A minimal, fast, native YouTube Music client"
 license = "MIT"
@@ -93,7 +93,7 @@ opt-level = "s"
 opt-level = "s"
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_DataExchange", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 # Windows presents frames itself (ui/present.rs).
 [target.'cfg(not(windows))'.dependencies]

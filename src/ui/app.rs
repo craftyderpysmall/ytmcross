@@ -18,7 +18,7 @@ use super::{bar, views};
 use crate::api::client;
 use crate::api::models::{Artist, Header, Kind, Playlist, Track};
 use crate::auth;
-use crate::config::{BarPosition, Config, EqualizerConfig};
+use crate::config::{BarPosition, Bind, CONTROLS, Config, Control, EqualizerConfig};
 use crate::download::Downloads;
 use crate::{paths, proc};
 use crate::player::{Player, PlayerEvent};
@@ -226,7 +226,7 @@ pub struct App {
     pub signed_out: bool,
     pub signing_in: bool,
 
-    /// Theme names for the Theme menu.
+    /// Theme names for Preferences.
     pub themes: Vec<String>,
     /// Live equalizer settings (saved to config.toml on release).
     pub eq: EqualizerConfig,
@@ -238,6 +238,8 @@ pub struct App {
     pub new_playlist: Option<String>,
     /// Playlist waiting for delete confirmation.
     pub confirm_delete: Option<Playlist>,
+    /// Shortcut waiting for its new keys in Preferences.
+    pub recording: Option<Control>,
 }
 
 impl App {
@@ -342,6 +344,7 @@ impl App {
             drag: None,
             new_playlist: None,
             confirm_delete: None,
+            recording: None,
         }
     }
 
@@ -649,6 +652,20 @@ impl App {
         self.requests.push(Request::SaveDownloads(self.config.downloads.clone()));
     }
 
+    /// From Preferences: a shortcut's new keys (None: no shortcut). Keys
+    /// another shortcut had move here.
+    pub fn set_key(&mut self, control: Control, bind: Option<Bind>) {
+        self.recording = None;
+        let keys = &mut self.config.keys.0;
+        if bind.is_some() {
+            for k in keys.iter_mut().filter(|k| **k == bind) {
+                *k = None;
+            }
+        }
+        keys[control as usize] = bind;
+        self.requests.push(Request::SaveKeys(self.config.keys));
+    }
+
     pub fn add_to_playlist(&self, playlist: &Playlist, track: &Track) {
         self.requests.push(Request::AddToPlaylist {
             id: playlist.id.clone(),
@@ -953,6 +970,15 @@ impl App {
         }
     }
 
+    /// A shortcut or taskbar button.
+    pub fn control(&mut self, control: Control) {
+        match control {
+            Control::Previous => self.prev(),
+            Control::PlayPause => self.toggle_pause(),
+            Control::Next => self.next(),
+        }
+    }
+
     pub fn toggle_pause(&mut self) {
         if self.queue.current.is_none() {
             return;
@@ -1227,7 +1253,20 @@ impl App {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        // Preferences takes the next key press.
+        if self.recording.is_some() {
+            return;
+        }
         let typing = ctx.egui_wants_keyboard_input();
+        // The shortcuts first: they win over the keys below (Alt+Left).
+        // On Windows they usually never get here (win32.rs takes them).
+        let keys = self.config.keys.0;
+        let hits = ctx.input_mut(|i| keys.map(|bind| bind.is_some_and(|b| take_key(i, b, typing))));
+        for (control, hit) in CONTROLS.into_iter().zip(hits) {
+            if hit {
+                self.control(control);
+            }
+        }
         let (reload, space, find, nav, back) = ctx.input(|i| {
             let nav = [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3]
                 .iter()
@@ -1327,6 +1366,23 @@ impl App {
             ctx.request_repaint_after(Duration::from_secs_f64((1.0 - frac).max(0.05)));
         }
     }
+}
+
+/// Removes the presses of `bind` (repeats too, firing only on the first).
+/// While typing, only shortcuts with Ctrl, Alt or the logo key count.
+fn take_key(input: &mut egui::InputState, bind: Bind, typing: bool) -> bool {
+    if typing && !(bind.ctrl || bind.alt || bind.logo) {
+        return false;
+    }
+    let mut hit = false;
+    input.events.retain(|e| match e {
+        egui::Event::Key { key, pressed: true, repeat, modifiers, .. } if Bind::pressed(*key, *modifiers) == bind => {
+            hit |= !repeat;
+            false
+        }
+        _ => true,
+    });
+    hit
 }
 
 fn track_needs_fallback(t: &Track) -> bool {

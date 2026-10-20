@@ -31,8 +31,14 @@ use super::present::{Pixels, Presenter};
 /// The frame buffer is kept when the next frame is due sooner than this.
 const KEEP_BUFFER: Duration = Duration::from_millis(100);
 
-/// Sent from any thread to wake the event loop. Carries the requested delay.
-struct Wake(Duration);
+/// Sent from any thread to wake the event loop.
+enum Wake {
+    /// Run the app's logic, then draw after this delay.
+    After(Duration),
+    /// A taskbar thumbnail button or a system-wide shortcut.
+    #[cfg(windows)]
+    Control(crate::config::Control),
+}
 
 struct Surface {
     /// Dropped first: on Wayland it holds the window's display.
@@ -66,6 +72,8 @@ struct Shell {
     /// `YTMCROSS_STATS=1`: frame time and share of pixels drawn, in the title.
     stats: Option<Stats>,
     first_frame: bool,
+    #[cfg(windows)]
+    proxy: winit::event_loop::EventLoopProxy<Wake>,
 }
 
 #[derive(Default)]
@@ -85,11 +93,13 @@ pub fn run(
     let ctx = egui::Context::default();
     let proxy = event_loop.create_proxy();
     let waker = proxy.clone();
+    #[cfg(windows)]
+    let thumbs = proxy.clone();
     ctx.set_request_repaint_callback(move |info| {
-        let _ = proxy.send_event(Wake(info.delay));
+        let _ = proxy.send_event(Wake::After(info.delay));
     });
     crate::trace!("shell: event loop ready");
-    let app = make_app(&ctx, Arc::new(move || drop(waker.send_event(Wake(Duration::ZERO)))));
+    let app = make_app(&ctx, Arc::new(move || drop(waker.send_event(Wake::After(Duration::ZERO)))));
     crate::trace!("shell: app created");
     let mut shell = Shell {
         // Measured: the per-primitive cache doubles our RAM (22 vs 12 MB) and is
@@ -98,6 +108,8 @@ pub fn run(
         renderer: EguiSoftwareRender::new(ColorFieldOrder::Bgra).with_caching(false),
         stats: std::env::var_os("YTMCROSS_STATS").map(|_| Stats::default()),
         first_frame: true,
+        #[cfg(windows)]
+        proxy: thumbs,
         ctx,
         app,
         viewport,
@@ -212,7 +224,7 @@ impl Shell {
                 let ms = s.phases.map(|p| p.as_secs_f64() * 1000.0 / 30.0);
                 let share = s.drawn as f64 * 100.0 / s.total as f64;
                 win.window.set_title(&format!(
-                    "ytmcross - {:.2} ms/frame: ui {:.2}, diff {:.2}, tessellate {:.2}, raster {:.2}; {share:.0}% drawn",
+                    "YouTube Music - {:.2} ms/frame: ui {:.2}, diff {:.2}, tessellate {:.2}, raster {:.2}; {share:.0}% drawn",
                     ms.iter().sum::<f64>(),
                     ms[0],
                     ms[1],
@@ -285,6 +297,11 @@ impl ApplicationHandler<Wake> for Shell {
             let icon = winit::window::Icon::from_resource(1, None).ok();
             window.set_window_icon(icon.clone());
             window.set_taskbar_icon(icon);
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(RawWindowHandle::Win32(h)) = window.window_handle().map(|h| h.as_raw()) {
+                let proxy = self.proxy.clone();
+                super::win32::install(h.hwnd.get() as _, move |c| drop(proxy.send_event(Wake::Control(c))));
+            }
         }
         if let Some(mhz) = window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).filter(|&m| m > 0) {
             self.frame_interval = Duration::from_secs_f64(1000.0 / mhz as f64);
@@ -309,7 +326,15 @@ impl ApplicationHandler<Wake> for Shell {
         self.schedule(Instant::now());
     }
 
-    fn user_event(&mut self, _el: &ActiveEventLoop, Wake(delay): Wake) {
+    fn user_event(&mut self, _el: &ActiveEventLoop, wake: Wake) {
+        let delay = match wake {
+            Wake::After(delay) => delay,
+            #[cfg(windows)]
+            Wake::Control(c) => {
+                self.app.control(c);
+                Duration::ZERO
+            }
+        };
         self.app.logic(&self.ctx);
         self.schedule(Instant::now() + delay);
     }
@@ -352,6 +377,19 @@ impl ApplicationHandler<Wake> for Shell {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        #[cfg(windows)]
+        {
+            let loaded = self.app.now_playing().is_some();
+            super::win32::update(loaded, loaded && !self.app.playback.paused);
+            // Let go while one is being set in Preferences, so its keys reach us.
+            let keys = if self.app.recording.is_some() { [None; 3] } else { self.app.config.keys.0 };
+            let taken = super::win32::set_hotkeys(keys);
+            if !taken.is_empty() {
+                let names: Vec<String> = taken.iter().map(|b| b.to_string()).collect();
+                self.app.notify(format!("{} can't be used system-wide (another app has it): only in this window", names.join(", ")));
+                self.schedule(Instant::now());
+            }
+        }
         if let Some(when) = self.next_frame {
             let when = when.max(self.ready_at);
             if Instant::now() >= when {

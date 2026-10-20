@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (config, config_error) = Config::load();
     let theme = Theme::load(&config.theme);
     let viewport = egui::ViewportBuilder::default()
-        .with_title("ytmcross")
+        .with_title("YouTube Music")
         .with_app_id("ytmcross")
         .with_inner_size([config.window.width, config.window.height])
         .with_min_inner_size([520.0, 360.0])

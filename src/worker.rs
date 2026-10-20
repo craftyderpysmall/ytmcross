@@ -11,7 +11,7 @@ use crate::api::client::{ApiError, Client};
 use crate::pool::Pool;
 use crate::api::models::{Artist, Continuation, Header, Kind, Playlist, Track};
 use crate::auth::session::Session;
-use crate::config::{self, Config, DownloadsConfig, EqualizerConfig};
+use crate::config::{self, Config, DownloadsConfig, EqualizerConfig, KeysConfig};
 use crate::paths;
 use crate::player::PlayerEvent;
 use crate::theme::{self, Theme};
@@ -39,6 +39,7 @@ pub enum Request {
     SavePitch(i32),
     SaveVolume(u32),
     SaveDownloads(DownloadsConfig),
+    SaveKeys(KeysConfig),
     CreatePlaylist(String),
     DeletePlaylist(Playlist),
     AddToPlaylist { id: String, title: String, video_id: String },
@@ -182,6 +183,11 @@ fn handle(client: &mut Client, requeue: &Pool<Request>, out: &Notifier, request:
         Request::SaveDownloads(downloads) => {
             if let Err(e) = config::save_downloads(&downloads) {
                 edited(format!("Couldn't save preferences: {e}"), false, None);
+            }
+        }
+        Request::SaveKeys(keys) => {
+            if let Err(e) = config::save_keys(&keys) {
+                edited(format!("Couldn't save shortcuts: {e}"), false, None);
             }
         }
         Request::CreatePlaylist(title) => match client.create_playlist(&title) {

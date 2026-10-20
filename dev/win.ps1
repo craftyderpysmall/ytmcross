@@ -13,7 +13,7 @@ public static class W {
   [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint x, uint y, uint d, UIntPtr e);
 }
 "@
-$p = Get-Process ytmcross -ErrorAction Stop | Where-Object { $_.MainWindowTitle -like 'ytmcross*' -and $_.MainWindowTitle -notlike '*sign in*' } | Select-Object -First 1
+$p = Get-Process ytmcross -ErrorAction Stop | Where-Object { $_.MainWindowTitle -like 'YouTube Music*' -and $_.MainWindowTitle -notlike '*sign in*' } | Select-Object -First 1
 $h = $p.MainWindowHandle
 [W]::SetForegroundWindow($h) | Out-Null
 Start-Sleep -Milliseconds 150

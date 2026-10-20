@@ -103,7 +103,7 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
     {
         let theme = &app.theme;
         ui.add_space(6.0);
-        ui.label(RichText::new("ytmcross").font(FontId::new(theme.font_size * 1.25, theme::bold())).color(theme.colors.accent));
+        ui.label(RichText::new("YouTube Music").font(FontId::new(theme.font_size * 1.25, theme::bold())).color(theme.colors.accent));
         ui.add_space(14.0);
         for view in app.config.layout.sidebar_items.iter().filter_map(|n| View::from_name(n)) {
             let selected = app.section() == view;

@@ -1,4 +1,4 @@
-//! Menus: Account / Equalizer / Pitch / Theme / Preferences popups, right-click menus
+//! Menus: Account / Equalizer / Pitch / Preferences (theme, downloads, shortcuts) popups, right-click menus
 //! for songs and playlists, and the delete confirmation. All of them are
 //! drawn only while open, so they cost nothing otherwise.
 //!
@@ -11,12 +11,12 @@ use egui::{Align, Button, Frame, Id, Modal, Popup, PopupCloseBehavior, RectAlign
 use super::app::{App, is_special_playlist};
 use super::widgets::{self, nav_item, pill, text_button};
 use crate::api::models::Playlist;
-use crate::config::{EQ_BANDS, EqualizerConfig};
+use crate::config::{Bind, CONTROLS, Control, EQ_BANDS, EqualizerConfig};
 use crate::{paths, proc};
 use crate::player::eq::{BANDS, MAX_GAIN_DB};
 
 /// Buttons `menus` draws (the sidebar reserves room for them).
-pub const MENU_COUNT: usize = 6;
+pub const MENU_COUNT: usize = 5;
 
 pub enum MenuAction {
     SignIn,
@@ -33,6 +33,10 @@ pub enum MenuAction {
     Equalizer(EqualizerConfig, bool),
     /// Semitones, and whether to save.
     Pitch(i32, bool),
+    /// Wait for a shortcut's new keys (None: stop waiting).
+    RecordKey(Option<Control>),
+    /// A shortcut's new keys (None: no shortcut).
+    SetKey(Control, Option<Bind>),
 }
 
 const EQ_PRESETS: &[(&str, [f32; EQ_BANDS])] = &[
@@ -42,7 +46,7 @@ const EQ_PRESETS: &[(&str, [f32; EQ_BANDS])] = &[
     ("Treble", [0.0, 0.0, 0.0, 3.0, 6.0]),
 ];
 
-/// The Account, Equalizer, Pitch, Theme, Downloads and Preferences buttons
+/// The Account, Equalizer, Pitch, Downloads and Preferences buttons
 /// with their popups.
 /// `compact` lays them out as small text buttons (layout without a sidebar).
 pub fn menus(app: &App, ui: &mut Ui, compact: bool) -> Option<MenuAction> {
@@ -83,40 +87,23 @@ pub fn menus(app: &App, ui: &mut Ui, compact: bool) -> Option<MenuAction> {
     let pitch_button = trigger(ui, "Pitch");
     popup(&pitch_button).show(|ui| action = pitch(app, ui).or(action.take()));
 
-    let theme_button = trigger(ui, "Theme");
-    if theme_button.clicked() {
-        action = Some(MenuAction::ListThemes); // pick up theme files added since
-    }
-    popup(&theme_button).show(|ui| {
-        ui.set_min_width(180.0);
-        ui.label(RichText::new("Theme").color(theme.colors.text_dim));
-        ui.add_space(4.0);
-        for name in &app.themes {
-            if ui.selectable_label(*name == app.config.theme, name).clicked() {
-                action = Some(MenuAction::SetTheme(name.clone()));
-                ui.close();
-            }
-        }
-        ui.add_space(6.0);
-        if ui.button("Open themes folder").clicked() {
-            action = Some(MenuAction::OpenThemes);
-            ui.close();
-        }
-    });
-
     if trigger(ui, "Downloads").on_hover_text("Open the downloads folder").clicked() {
         action = Some(MenuAction::OpenDownloads);
     }
 
     let prefs = trigger(ui, "Preferences");
     if prefs.clicked() {
+        action = Some(MenuAction::ListThemes); // pick up theme files added since
         ui.data_mut(|d| d.remove::<String>(Id::new(FOLDER_FIELD))); // start from the saved value
         if CHOOSE_FILE_MANAGER {
             let found = proc::installed_file_managers();
             ui.data_mut(|d| d.insert_temp(Id::new(FILE_MANAGERS), found));
         }
     }
-    popup(&prefs).show(|ui| action = preferences(app, ui).or(action.take()));
+    let open = popup(&prefs).show(|ui| action = preferences(app, ui).or(action.take())).is_some();
+    if !open && app.recording.is_some() {
+        action = Some(MenuAction::RecordKey(None));
+    }
     action
 }
 
@@ -130,6 +117,22 @@ const CHOOSE_FILE_MANAGER: bool = cfg!(not(any(windows, target_os = "macos")));
 fn preferences(app: &App, ui: &mut Ui) -> Option<MenuAction> {
     let theme = &app.theme;
     ui.set_width(340.0);
+    let mut theme_action = None;
+    ui.label(RichText::new("Theme").color(theme.colors.text_dim));
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        for name in &app.themes {
+            if ui.selectable_label(*name == app.config.theme, name).clicked() {
+                theme_action = Some(MenuAction::SetTheme(name.clone()));
+            }
+        }
+    });
+    ui.add_space(4.0);
+    if ui.button("Open themes folder").clicked() {
+        theme_action = Some(MenuAction::OpenThemes);
+        ui.close();
+    }
+    ui.add_space(10.0);
     ui.label(RichText::new("Download folder").color(theme.colors.text_dim));
     ui.add_space(4.0);
     let field = Id::new(FOLDER_FIELD);
@@ -174,10 +177,54 @@ fn preferences(app: &App, ui: &mut Ui) -> Option<MenuAction> {
         ui.add_space(4.0);
         ui.label(small("Opens the downloads and themes folders.".into()));
     }
+    let keys = shortcuts(app, ui);
     if chosen.is_some() {
         ui.close();
     }
-    chosen.map(MenuAction::DownloadFolder).or(file_manager.map(MenuAction::FileManager))
+    chosen.map(MenuAction::DownloadFolder).or(file_manager.map(MenuAction::FileManager)).or(keys).or(theme_action)
+}
+
+/// The player shortcuts: click one, then press its new keys.
+fn shortcuts(app: &App, ui: &mut Ui) -> Option<MenuAction> {
+    let theme = &app.theme;
+    let mut action = None;
+    if let Some(control) = app.recording {
+        let pressed = ui.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } => Some(Bind::pressed(*key, *modifiers)),
+                _ => None,
+            })
+        });
+        action = pressed.map(|b| {
+            if b.key == egui::Key::Escape { MenuAction::RecordKey(None) } else { MenuAction::SetKey(control, Some(b)) }
+        });
+    }
+    ui.add_space(10.0);
+    ui.label(RichText::new("Shortcuts").color(theme.colors.text_dim));
+    ui.add_space(4.0);
+    egui::Grid::new("shortcuts").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+        for control in CONTROLS {
+            let bind = app.config.keys.0[control as usize];
+            ui.label(control.label());
+            let text = if app.recording == Some(control) {
+                "Press keys…".to_string()
+            } else {
+                bind.map_or("None".to_string(), |b| b.to_string())
+            };
+            // A key press that was taken above may also "click" the focused button.
+            if ui.add(Button::new(text).min_size(egui::vec2(140.0, 0.0))).clicked() && action.is_none() {
+                action = Some(MenuAction::RecordKey(Some(control)));
+            }
+            if bind.is_some() && ui.small_button("Clear").clicked() {
+                action = Some(MenuAction::SetKey(control, None));
+            }
+            ui.end_row();
+        }
+    });
+    ui.add_space(4.0);
+    let note = if cfg!(windows) { "They work from any app." } else { "They work while this window is focused." };
+    ui.label(RichText::new(note).font(widgets::small(theme)).color(theme.colors.text_dim));
+    action
 }
 
 /// Widgets default to the panel colour, which is also the popup's: lift
@@ -417,5 +464,7 @@ pub fn apply(app: &mut App, action: MenuAction) {
         MenuAction::FileManager(program) => app.set_file_manager(program),
         MenuAction::Equalizer(eq, save) => app.set_equalizer(eq, save),
         MenuAction::Pitch(semitones, save) => app.set_pitch(semitones, save),
+        MenuAction::RecordKey(control) => app.recording = control,
+        MenuAction::SetKey(control, bind) => app.set_key(control, bind),
     }
 }
