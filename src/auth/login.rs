@@ -18,11 +18,6 @@ use crate::paths;
 
 const LOGIN_URL: &str = "https://accounts.google.com/ServiceLogin?ltmpl=music&service=youtube&passive=true&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26next%3Dhttps%253A%252F%252Fmusic.youtube.com%252F";
 
-/// Google refuses sign-in from browsers it can't identify. WebView2 already
-/// reports a genuine Edge UA; WebKit-based webviews need a Safari one.
-#[cfg(not(windows))]
-const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
-
 enum UserEvent {
     PageLoaded(String),
 }
@@ -49,17 +44,7 @@ pub fn run() -> ! {
                 let _ = proxy.send_event(UserEvent::PageLoaded(url));
             }
         });
-    #[cfg(not(windows))]
-    let builder = builder.with_user_agent(USER_AGENT);
-
-    #[cfg(any(windows, target_os = "macos"))]
     let webview = builder.build(&window).expect("failed to create webview");
-    #[cfg(not(any(windows, target_os = "macos")))]
-    let webview = {
-        use tao::platform::unix::WindowExtUnix;
-        use wry::WebViewBuilderExtUnix;
-        builder.build_gtk(window.default_vbox().unwrap()).expect("failed to create webview")
-    };
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -108,10 +93,5 @@ fn write_cookies(cookies: &[wry::cookie::Cookie<'static>]) -> std::io::Result<()
     let mut file = fs::File::create(&tmp)?;
     file.write_all(out.as_bytes())?;
     drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    }
     fs::rename(&tmp, &path)
 }

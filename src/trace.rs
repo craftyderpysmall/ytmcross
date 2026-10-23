@@ -28,30 +28,16 @@ pub fn enabled() -> bool {
     tracer().is_some()
 }
 
-/// Private memory of this process in MB (Windows: private bytes; Linux:
-/// anonymous resident memory; 0 elsewhere). Trace-only.
+/// Private bytes of this process in MB. Trace-only.
 pub fn private_mb() -> f64 {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
-        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-        // SAFETY: plain Win32 query into a zeroed, correctly sized struct.
-        unsafe {
-            let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
-            c.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-            GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast(), c.cb);
-            c.PrivateUsage as f64 / 1_048_576.0
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-        let kb = status.lines().find_map(|l| l.strip_prefix("RssAnon:")?.trim().strip_suffix("kB")?.trim().parse::<f64>().ok());
-        kb.unwrap_or(0.0) / 1024.0
-    }
-    #[cfg(not(any(windows, target_os = "linux")))]
-    {
-        0.0
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: plain Win32 query into a zeroed, correctly sized struct.
+    unsafe {
+        let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+        c.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast(), c.cb);
+        c.PrivateUsage as f64 / 1_048_576.0
     }
 }
 

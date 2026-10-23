@@ -1,51 +1,44 @@
 # ytmcross
 
-A minimal, fast, native YouTube Music client written in Rust. No Electron and no bundled browser.
+A minimal, fast, native YouTube Music client for Windows, written in Rust. No Electron and no bundled browser.
 
 - **Sign-in:** a webview window opens once for Google sign-in, saves the session to `cookies.txt`, and exits, so no browser engine keeps running.
 - **Interface:** native egui, drawn on the CPU, so no GPU driver is loaded. It only draws when something changes: nothing at all when idle or minimized, and one frame per second while music plays.
 - **Playback:** done inside the app, with no external player. Audio streams over HTTP and is decoded in pure Rust (symphonia, AAC 256 kbps with Premium).
 - **Instant start:** stream addresses are resolved natively (YouTube's scrambled URLs are unlocked in an embedded QuickJS), and the start of every song on screen is preloaded, so a click plays in a few milliseconds.
-- **Footprint:** about 4 MB of RAM idle and about 8 MB while playing (highly optimized for Windows).
+- **Footprint:** about 4 MB of RAM idle and about 8 MB while playing.
+- **Taskbar and keys:** previous / play-pause / next buttons on the taskbar thumbnail, and system-wide shortcuts.
 - **Ricing:** readable TOML theme files, reloaded live with **F5**.
 
 ## Install
 
-Windows ([Scoop](https://scoop.sh)):
-
 ```powershell
-scoop bucket add ytmcross https://github.com/craftyderpysmall/ytmcross
-scoop install ytmcross/ytmcross
+winget install craftyderpysmall.ytmcross
 ```
 
-Fedora ([COPR](https://copr.fedorainfracloud.org/coprs/craftyderpysmall/ytmcross/)):
-
-```sh
-sudo dnf copr enable craftyderpysmall/ytmcross
-sudo dnf install ytmcross
-```
+Then run `ytmcross` (from Win+R or a terminal). Or download the zip from [Releases](https://github.com/craftyderpysmall/ytmcross/releases) and keep its three files together.
 
 ## Requirements
 
-None: no external programs are needed to play music.
-
-To build on Linux: `libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev` (Debian/Ubuntu) or `webkit2gtk4.1-devel gtk3-devel alsa-lib-devel` (Fedora).
+Windows 10 or 11, x64. The sign-in window uses the WebView2 runtime, which ships with Windows. No other programs are needed to play music.
 
 ## Build
 
-```sh
-cargo build --release
-./target/release/ytmcross
+Rust's `stable-x86_64-pc-windows-gnu` toolchain, and MinGW-w64 gcc on `PATH` (for example MSYS2's `mingw-w64-x86_64-gcc`, in `C:\msys64\mingw64\bin`):
+
+```powershell
+cargo +stable-x86_64-pc-windows-gnu build --release
+.\target\release\ytmcross.exe
 ```
 
-This builds two programs that belong in the same folder: `ytmcross` and the small `ytmcross-login`, which shows the sign-in window (on Windows, with `WebView2Loader.dll` beside it). Keeping the webview in its own program means the player itself never loads any browser code.
+This builds two programs that belong in the same folder: `ytmcross.exe` and the small `ytmcross-login.exe`, which shows the sign-in window and needs `WebView2Loader.dll` beside it (from the `webview2-com-sys` crate's `x64` folder). Keeping the webview in its own program means the player itself never loads any browser code.
 
 ## Files
 
-| | Windows | Linux | macOS |
-|---|---|---|---|
-| config + themes | `%APPDATA%\ytmcross` | `~/.config/ytmcross` | `~/Library/Application Support/ytmcross` |
-| session (`cookies.txt`) | `%LOCALAPPDATA%\ytmcross` | `~/.local/share/ytmcross` | `~/Library/Application Support/ytmcross` |
+| | |
+|---|---|
+| config, themes, downloads | `%APPDATA%\ytmcross` |
+| session (`cookies.txt`) | `%LOCALAPPDATA%\ytmcross` |
 
 `cookies.txt` is your Google session. Keep it private.
 
@@ -70,9 +63,15 @@ The full set of tokens (`colors`, `font`, `shape`, `art`) is documented in `them
 | Alt+Left / mouse back | Back (album and artist pages) |
 | F5 | Reload config and theme |
 
+The player shortcuts (previous, play / pause, next) work from any app; set them in Preferences.
+
 ## Troubleshooting
 
 Run with `YTMCROSS_TRACE=1` to log millisecond timings (click, stream lookup, preload, first audio) to `trace.log` in the session folder above. `YTMCROSS_STATS=1` shows the time per drawn frame in the window title.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ## Disclaimer
 

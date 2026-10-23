@@ -24,11 +24,9 @@ volume = 80
 # Folder for downloaded songs and playlists. Empty: downloads, next to this file.
 # Also set from Preferences in the app.
 folder = ""
-# Linux: program that opens folders (Downloads button). Empty: xdg-open.
-file_manager = ""
 
 [keys]
-# Player shortcuts, like "Ctrl+Shift+Right". On Windows they work from any app.
+# Player shortcuts, like "Ctrl+Shift+Right". They work from any app.
 # Empty: none. Also set from Preferences in the app.
 previous = "Alt+Left"
 play_pause = "Alt+Down"

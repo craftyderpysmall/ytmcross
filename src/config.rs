@@ -49,19 +49,10 @@ pub struct Bind {
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
-    /// Win on Windows, Cmd on macOS, Super elsewhere.
+    /// The Win key.
     pub logo: bool,
     pub key: egui::Key,
 }
-
-/// Name of the logo modifier here.
-const LOGO: &str = if cfg!(windows) {
-    "Win"
-} else if cfg!(target_os = "macos") {
-    "Cmd"
-} else {
-    "Super"
-};
 
 impl Bind {
     pub fn parse(text: &str) -> Option<Bind> {
@@ -74,24 +65,24 @@ impl Bind {
         for m in parts {
             match m.to_ascii_lowercase().as_str() {
                 "ctrl" | "control" => b.ctrl = true,
-                "alt" | "option" => b.alt = true,
+                "alt" => b.alt = true,
                 "shift" => b.shift = true,
-                "win" | "super" | "cmd" | "command" | "meta" => b.logo = true,
+                "win" | "super" | "meta" => b.logo = true,
                 _ => return None,
             }
         }
         Some(b)
     }
 
-    /// The pressed key, as egui reports it (the logo key only on macOS).
+    /// The pressed key, as egui reports it (without the Win key).
     pub fn pressed(key: egui::Key, m: egui::Modifiers) -> Bind {
-        Bind { ctrl: m.ctrl, alt: m.alt, shift: m.shift, logo: m.mac_cmd, key }
+        Bind { ctrl: m.ctrl, alt: m.alt, shift: m.shift, logo: false, key }
     }
 }
 
 impl std::fmt::Display for Bind {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        for (on, name) in [(self.ctrl, "Ctrl"), (self.alt, "Alt"), (self.shift, "Shift"), (self.logo, LOGO)] {
+        for (on, name) in [(self.ctrl, "Ctrl"), (self.alt, "Alt"), (self.shift, "Shift"), (self.logo, "Win")] {
             if on {
                 write!(f, "{name}+")?;
             }
@@ -100,7 +91,7 @@ impl std::fmt::Display for Bind {
     }
 }
 
-/// Shortcuts, by `Control`. On Windows they work from any program.
+/// Shortcuts, by `Control`. They work from any program.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KeysConfig(pub [Option<Bind>; 3]);
 
@@ -140,8 +131,6 @@ impl<'de> Deserialize<'de> for KeysConfig {
 pub struct DownloadsConfig {
     /// Where downloads go; empty: "downloads" next to config.toml.
     pub folder: String,
-    /// Linux: program that opens folders; empty: xdg-open.
-    pub file_manager: String,
 }
 
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
@@ -295,9 +284,8 @@ pub fn save_volume(volume: u32) -> std::io::Result<()> {
 /// Rewrites the `[downloads]` section of config.toml (set in Preferences).
 pub fn save_downloads(d: &DownloadsConfig) -> std::io::Result<()> {
     let body = format!(
-        "# Folder for downloaded songs and playlists. Empty: downloads, next to this file.\n# Also set from Preferences in the app.\nfolder = {}\n# Linux: program that opens folders (Downloads button). Empty: xdg-open.\nfile_manager = {}\n",
-        toml_string(d.folder.trim()),
-        toml_string(d.file_manager.trim())
+        "# Folder for downloaded songs and playlists. Empty: downloads, next to this file.\n# Also set from Preferences in the app.\nfolder = {}\n",
+        toml_string(d.folder.trim())
     );
     edit_config(|text| set_section(text, "downloads", &body))
 }
@@ -311,7 +299,7 @@ pub fn save_keys(keys: &KeysConfig) -> std::io::Result<()> {
     edit_config(|text| set_section(text, "keys", &body))
 }
 
-const KEYS_COMMENT: &str = "# Player shortcuts, like \"Ctrl+Shift+Right\". On Windows they work from any app.\n# Empty: none. Also set from Preferences in the app.\n";
+const KEYS_COMMENT: &str = "# Player shortcuts, like \"Ctrl+Shift+Right\". They work from any app.\n# Empty: none. Also set from Preferences in the app.\n";
 
 /// A TOML basic string (`{:?}` would write Rust escapes TOML lacks).
 fn toml_string(s: &str) -> String {

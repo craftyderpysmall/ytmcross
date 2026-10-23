@@ -12,7 +12,7 @@ use super::app::{App, is_special_playlist};
 use super::widgets::{self, nav_item, pill, text_button};
 use crate::api::models::Playlist;
 use crate::config::{Bind, CONTROLS, Control, EQ_BANDS, EqualizerConfig};
-use crate::{paths, proc};
+use crate::paths;
 use crate::player::eq::{BANDS, MAX_GAIN_DB};
 
 /// Buttons `menus` draws (the sidebar reserves room for them).
@@ -27,8 +27,6 @@ pub enum MenuAction {
     OpenDownloads,
     /// A new download folder (empty: the default).
     DownloadFolder(String),
-    /// Program that opens folders (empty: the system default).
-    FileManager(String),
     /// New settings, and whether to save them (on release, not every step).
     Equalizer(EqualizerConfig, bool),
     /// Semitones, and whether to save.
@@ -95,10 +93,6 @@ pub fn menus(app: &App, ui: &mut Ui, compact: bool) -> Option<MenuAction> {
     if prefs.clicked() {
         action = Some(MenuAction::ListThemes); // pick up theme files added since
         ui.data_mut(|d| d.remove::<String>(Id::new(FOLDER_FIELD))); // start from the saved value
-        if CHOOSE_FILE_MANAGER {
-            let found = proc::installed_file_managers();
-            ui.data_mut(|d| d.insert_temp(Id::new(FILE_MANAGERS), found));
-        }
     }
     let open = popup(&prefs).show(|ui| action = preferences(app, ui).or(action.take())).is_some();
     if !open && app.recording.is_some() {
@@ -109,10 +103,6 @@ pub fn menus(app: &App, ui: &mut Ui, compact: bool) -> Option<MenuAction> {
 
 /// Text being typed in Preferences, kept in egui's memory while it is open.
 const FOLDER_FIELD: &str = "download-folder";
-/// Installed file managers, looked up when Preferences opens.
-const FILE_MANAGERS: &str = "file-managers";
-/// Where folders open with xdg-open, which may pick a terminal one.
-const CHOOSE_FILE_MANAGER: bool = cfg!(not(any(windows, target_os = "macos")));
 
 fn preferences(app: &App, ui: &mut Ui) -> Option<MenuAction> {
     let theme = &app.theme;
@@ -154,34 +144,11 @@ fn preferences(app: &App, ui: &mut Ui) -> Option<MenuAction> {
     let small = |text: String| RichText::new(text).font(widgets::small(theme)).color(theme.colors.text_dim);
     ui.label(small("Downloads go to:".into()));
     ui.add(egui::Label::new(small(app.downloads.dir().display().to_string())).truncate());
-    let mut file_manager = None;
-    if CHOOSE_FILE_MANAGER {
-        ui.add_space(10.0);
-        ui.label(RichText::new("File manager").color(theme.colors.text_dim));
-        ui.add_space(4.0);
-        let current = app.config.downloads.file_manager.trim();
-        let mut found: Vec<&str> = ui.data(|d| d.get_temp::<Vec<&'static str>>(Id::new(FILE_MANAGERS))).unwrap_or_default();
-        if !current.is_empty() && !found.contains(&current) {
-            found.push(current); // set in config.toml
-        }
-        ui.horizontal_wrapped(|ui| {
-            if ui.selectable_label(current.is_empty(), "System default").clicked() {
-                file_manager = Some(String::new());
-            }
-            for name in found {
-                if ui.selectable_label(name == current, name).clicked() {
-                    file_manager = Some(name.to_string());
-                }
-            }
-        });
-        ui.add_space(4.0);
-        ui.label(small("Opens the downloads and themes folders.".into()));
-    }
     let keys = shortcuts(app, ui);
     if chosen.is_some() {
         ui.close();
     }
-    chosen.map(MenuAction::DownloadFolder).or(file_manager.map(MenuAction::FileManager)).or(keys).or(theme_action)
+    chosen.map(MenuAction::DownloadFolder).or(keys).or(theme_action)
 }
 
 /// The player shortcuts: click one, then press its new keys.
@@ -222,8 +189,7 @@ fn shortcuts(app: &App, ui: &mut Ui) -> Option<MenuAction> {
         }
     });
     ui.add_space(4.0);
-    let note = if cfg!(windows) { "They work from any app." } else { "They work while this window is focused." };
-    ui.label(RichText::new(note).font(widgets::small(theme)).color(theme.colors.text_dim));
+    ui.label(RichText::new("They work from any app.").font(widgets::small(theme)).color(theme.colors.text_dim));
     action
 }
 
@@ -461,7 +427,6 @@ pub fn apply(app: &mut App, action: MenuAction) {
             app.open_folder(&dir);
         }
         MenuAction::DownloadFolder(folder) => app.set_download_folder(folder),
-        MenuAction::FileManager(program) => app.set_file_manager(program),
         MenuAction::Equalizer(eq, save) => app.set_equalizer(eq, save),
         MenuAction::Pitch(semitones, save) => app.set_pitch(semitones, save),
         MenuAction::RecordKey(control) => app.recording = control,

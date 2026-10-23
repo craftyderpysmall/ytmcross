@@ -1,6 +1,5 @@
 # Does memory plateau? Several searches + plays, then idle. Task Manager's metric (private working set).
 $s = $PSScriptRoot
-$env:Path = "$env:USERPROFILE\scoop\shims;$env:Path"
 Get-Process ytmcross -ErrorAction SilentlyContinue | Stop-Process -Force -Confirm:$false
 Remove-Item Env:YTMCROSS_TRACE -ErrorAction SilentlyContinue
 $p = Start-Process "$PSScriptRoot\..\target\release\ytmcross.exe" -PassThru

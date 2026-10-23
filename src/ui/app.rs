@@ -631,7 +631,7 @@ impl App {
     }
 
     pub fn open_folder(&mut self, dir: &std::path::Path) {
-        if let Err(e) = proc::open_folder(dir, &self.config.downloads.file_manager) {
+        if let Err(e) = proc::open_folder(dir) {
             self.notify(format!("Couldn't open {}: {e}", dir.display()));
         }
     }
@@ -642,13 +642,6 @@ impl App {
         self.downloads.set_dir(paths::downloads_dir(&folder));
         self.notify(format!("Downloads go to {}", self.downloads.dir().display()));
         self.config.downloads.folder = folder;
-        self.requests.push(Request::SaveDownloads(self.config.downloads.clone()));
-    }
-
-    /// From Preferences (Linux): the program that opens folders, empty for
-    /// the system default.
-    pub fn set_file_manager(&mut self, program: String) {
-        self.config.downloads.file_manager = program;
         self.requests.push(Request::SaveDownloads(self.config.downloads.clone()));
     }
 
@@ -1259,7 +1252,7 @@ impl App {
         }
         let typing = ctx.egui_wants_keyboard_input();
         // The shortcuts first: they win over the keys below (Alt+Left).
-        // On Windows they usually never get here (win32.rs takes them).
+        // They usually never get here (win32.rs takes them).
         let keys = self.config.keys.0;
         let hits = ctx.input_mut(|i| keys.map(|bind| bind.is_some_and(|b| take_key(i, b, typing))));
         for (control, hit) in CONTROLS.into_iter().zip(hits) {

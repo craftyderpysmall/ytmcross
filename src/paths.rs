@@ -1,8 +1,8 @@
 //! Where ytmcross keeps its files. Everything follows OS conventions so
 //! package managers never need to know about custom locations.
 //!
-//! config: %APPDATA%\ytmcross | ~/.config/ytmcross | ~/Library/Application Support/ytmcross
-//! data:   %LOCALAPPDATA%\ytmcross | ~/.local/share/ytmcross | ~/Library/Application Support/ytmcross
+//! config: %APPDATA%\ytmcross
+//! data:   %LOCALAPPDATA%\ytmcross
 
 use std::path::PathBuf;
 
@@ -16,15 +16,12 @@ pub fn data_dir() -> PathBuf {
     known("LOCALAPPDATA", dirs::data_local_dir).join(APP)
 }
 
-/// On Windows the environment names these folders: asking the shell
-/// instead (SHGetKnownFolderPath) loads windows.storage.dll and friends.
+/// The environment names these folders: asking the shell instead
+/// (SHGetKnownFolderPath) loads windows.storage.dll and friends.
 fn known(var: &str, ask: fn() -> Option<PathBuf>) -> PathBuf {
-    #[cfg(windows)]
     if let Some(dir) = std::env::var_os(var).filter(|v| !v.is_empty()) {
         return PathBuf::from(dir);
     }
-    #[cfg(not(windows))]
-    let _ = var;
     ask().unwrap_or_else(|| PathBuf::from("."))
 }
 

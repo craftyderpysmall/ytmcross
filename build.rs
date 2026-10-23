@@ -2,8 +2,8 @@
 //! short-lived solver-builder process ever reads them, and only when the
 //! native preprocessing fails, so they shouldn't cost 150 KB of exe.
 //!
-//! On Windows, also embeds the app manifest (assets/ytmcross.manifest) and,
-//! with the GNU toolchain, the icon (assets/ytmcross.ico).
+//! Also embeds the app manifest (assets/ytmcross.manifest) and, with the
+//! GNU toolchain, the icon (assets/ytmcross.ico).
 
 use std::io::Write;
 
@@ -17,9 +17,7 @@ fn main() {
         enc.write_all(&text).unwrap();
         std::fs::write(out.join(format!("{name}.deflate")), enc.finish().unwrap()).unwrap();
     }
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        embed_manifest(&out);
-    }
+    embed_manifest(&out);
 }
 
 /// The manifest opts into the segment heap: it hands freed memory back to

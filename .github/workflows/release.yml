@@ -1,6 +1,6 @@
 # Push a tag vX.Y.Z (matching Cargo.toml) to release: builds the Windows zip,
-# publishes it, then points the Scoop manifest (bucket/ytmcross.json) at it.
-# Fedora packages build on COPR from .copr/Makefile.
+# publishes it, then opens a winget-pkgs pull request for the new version
+# (needs a WINGET_TOKEN secret: a classic GitHub token with public_repo).
 name: release
 on:
   push:
@@ -10,8 +10,6 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
-    outputs:
-      hash: ${{ steps.package.outputs.hash }}
     steps:
       - uses: actions/checkout@v5
       - uses: msys2/setup-msys2@v2
@@ -32,7 +30,6 @@ jobs:
           # The player must never load the webview.
           if (objdump -p target\release\ytmcross.exe | Select-String WebView2Loader) { throw "ytmcross.exe imports WebView2Loader.dll" }
       - name: Package and publish
-        id: package
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -42,25 +39,18 @@ jobs:
           if (-not $dll) { throw "WebView2Loader.dll not found" }
           $zip = "ytmcross-$env:GITHUB_REF_NAME-windows-x64.zip"
           Compress-Archive -Path target\release\ytmcross.exe, target\release\ytmcross-login.exe, $dll.FullName -DestinationPath $zip
-          "hash=$((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower())" >> $env:GITHUB_OUTPUT
           gh release create $env:GITHUB_REF_NAME $zip --title "ytmcross $env:GITHUB_REF_NAME" --generate-notes
-  scoop:
+  winget:
     needs: windows
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
     steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: master
-      - name: Update the manifest
-        env:
-          HASH: ${{ needs.windows.outputs.hash }}
+      - name: Update the winget manifest
+        if: env.WINGET_TOKEN != ''
+        shell: pwsh
         run: |
-          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/ytmcross-$GITHUB_REF_NAME-windows-x64.zip"
-          jq --indent 4 --arg v "${GITHUB_REF_NAME#v}" --arg u "$url" --arg h "$HASH" \
-            '.version = $v | .architecture."64bit".url = $u | .architecture."64bit".hash = $h' \
-            bucket/ytmcross.json > manifest.json
-          mv manifest.json bucket/ytmcross.json
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -am "Scoop: ytmcross ${GITHUB_REF_NAME#v}"
-          git push
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/ytmcross-$env:GITHUB_REF_NAME-windows-x64.zip"
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          .\wingetcreate.exe update craftyderpysmall.ytmcross --version $version --urls $url --token $env:WINGET_TOKEN --submit

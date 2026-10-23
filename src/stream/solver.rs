@@ -54,18 +54,8 @@ pub struct SolverStore {
 
 /// A loaded solver. Drop it when the batch is done: all its memory goes back.
 pub struct Solver {
-    /// Always `Some` until dropped. The context goes before its runtime.
-    engine: Option<(Context, Runtime)>,
-}
-
-impl Drop for Solver {
-    fn drop(&mut self) {
-        if let Some((ctx, rt)) = self.engine.take() {
-            drop(ctx);
-            drop(rt);
-            trim_heap();
-        }
-    }
+    /// Dropped in order: the context before its runtime.
+    engine: (Context, Runtime),
 }
 
 impl SolverStore {
@@ -268,11 +258,11 @@ impl Solver {
             }
             Ok(())
         })?;
-        Ok(Solver { engine: Some((ctx, rt)) })
+        Ok(Solver { engine: (ctx, rt) })
     }
 
     fn call(&self, name: &str, input: &str) -> Result<String, String> {
-        let (ctx, _) = self.engine.as_ref().ok_or("solver dropped")?;
+        let (ctx, _) = &self.engine;
         ctx.with(|ctx| {
             let result: Object = ctx.globals().get("_result").map_err(|e| e.to_string())?;
             let f: Function = result.get(name).map_err(|_| format!("no {name} function"))?;
@@ -294,31 +284,17 @@ impl Solver {
 
 /// A QuickJS runtime whose memory is fully returned to the OS when dropped.
 ///
-/// Windows: every solver runtime gets its own private heap, destroyed in one
-/// go afterwards; otherwise its ~12 MB would leave the process heap
+/// Every solver runtime gets its own private heap, destroyed in one go
+/// afterwards; otherwise its ~12 MB would leave the process heap
 /// fragmented and the app's footprint would creep up with every batch.
-/// Elsewhere: the default allocator, then a trim where glibc supports it.
 fn runtime() -> Result<Runtime, String> {
-    #[cfg(windows)]
     let rt = match private_heap::PrivateHeap::new() {
         Some(heap) => Runtime::new_with_alloc(heap),
         None => Runtime::new(),
     };
-    #[cfg(not(windows))]
-    let rt = Runtime::new();
     rt.map_err(|e| e.to_string())
 }
 
-/// After dropping a runtime: give freed memory back to the OS where needed.
-fn trim_heap() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    // SAFETY: malloc_trim only releases free memory.
-    unsafe {
-        libc::malloc_trim(0);
-    }
-}
-
-#[cfg(windows)]
 mod private_heap {
     use rquickjs::allocator::Allocator;
     use windows_sys::Win32::Foundation::HANDLE;

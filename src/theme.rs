@@ -225,32 +225,14 @@ pub fn needs_fallback(text: &str) -> bool {
 fn system_fallbacks() -> &'static [(&'static [u8], u32)] {
     static FONTS: std::sync::OnceLock<Vec<(&'static [u8], u32)>> = std::sync::OnceLock::new();
     FONTS.get_or_init(|| {
-        #[cfg(windows)]
         let dir = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into())).join("Fonts");
-        #[cfg(windows)]
         let files: &[&str] =
             &["msyh.ttc", "malgun.ttf", "Nirmala.ttc", "Nirmala.ttf", "LeelawUI.ttf", "segoeui.ttf", "seguisym.ttf"];
-        #[cfg(target_os = "macos")]
-        let dir = std::path::PathBuf::from("/System/Library/Fonts");
-        #[cfg(target_os = "macos")]
-        let files: &[&str] = &["Hiragino Sans GB.ttc", "AppleSDGothicNeo.ttc", "Supplemental/Arial Unicode.ttf"];
-        #[cfg(not(any(windows, target_os = "macos")))]
-        let dir = std::path::PathBuf::from("/usr/share/fonts");
-        #[cfg(not(any(windows, target_os = "macos")))]
-        let files: &[&str] = &[
-            "opentype/noto/NotoSansCJK-Regular.ttc",
-            "noto-cjk/NotoSansCJK-Regular.ttc",
-            "google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc",
-            "truetype/dejavu/DejaVuSans.ttf",
-            "TTF/DejaVuSans.ttf",
-            "dejavu-sans-fonts/DejaVuSans.ttf",
-        ];
         files.iter().filter_map(|f| map_file(&dir.join(f))).map(|bytes| (bytes, 0)).collect()
     })
 }
 
 /// Maps a file read-only for the rest of the process's life.
-#[cfg(windows)]
 fn map_file(path: &std::path::Path) -> Option<&'static [u8]> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -267,18 +249,6 @@ fn map_file(path: &std::path::Path) -> Option<&'static [u8]> {
         let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
         CloseHandle(mapping); // the view keeps the mapping alive
         (!view.Value.is_null()).then(|| std::slice::from_raw_parts(view.Value as *const u8, len))
-    }
-}
-
-#[cfg(unix)]
-fn map_file(path: &std::path::Path) -> Option<&'static [u8]> {
-    use std::os::fd::AsRawFd;
-    let file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len() as usize;
-    // SAFETY: as on Windows: read-only, private, never unmapped.
-    unsafe {
-        let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0);
-        (p != libc::MAP_FAILED).then(|| std::slice::from_raw_parts(p as *const u8, len))
     }
 }
 

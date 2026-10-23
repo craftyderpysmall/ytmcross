@@ -9,7 +9,7 @@ use crate::paths;
 /// waits for it. Returns true if a usable session was saved.
 pub fn sign_in_blocking() -> bool {
     let Ok(exe) = std::env::current_exe() else { return false };
-    let login = exe.with_file_name(format!("ytmcross-login{}", std::env::consts::EXE_SUFFIX));
+    let login = exe.with_file_name("ytmcross-login.exe");
     let ok = Command::new(login).status().map(|s| s.success()).unwrap_or(false);
     // The webview's helper processes may hold the profile for a moment after exit.
     let dir = paths::login_webview_dir();

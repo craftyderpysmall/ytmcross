@@ -1,5 +1,0 @@
-# Shell scripts run on Linux: keep LF even in Windows checkouts.
-*.sh text eol=lf
-.copr/Makefile text eol=lf
-*.spec text eol=lf
-*.desktop text eol=lf

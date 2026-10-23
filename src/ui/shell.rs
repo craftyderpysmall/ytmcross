@@ -5,7 +5,7 @@
 //! - Something woke us (input, a worker message, an animation tick):
 //!   run `App::logic` and schedule a frame.
 //! - Frames are paced to the monitor's refresh rate, never faster; while
-//!   animating, on Windows, in step with the compositor's vblank.
+//!   animating, in step with the compositor's vblank.
 //! - A frame lays the UI out, then rasterizes only what changed since the
 //!   previous one (damage.rs): often a row, or nothing at all.
 //! - Minimized or fully covered: logic still runs (the queue keeps
@@ -13,7 +13,6 @@
 //! - Nothing scheduled: the thread sleeps in the OS until the next event,
 //!   and the frame buffer has been given back (present.rs).
 
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,10 +20,12 @@ use egui_software_backend::{BufferMutRef, ColorFieldOrder, EguiSoftwareRender};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::platform::windows::{IconExtWindows, WindowExtWindows};
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 use super::app::App;
-use super::clipboard::Clipboard;
+use super::clipboard;
 use super::damage::{self, Damage, Region, Scene};
 use super::present::{Pixels, Presenter};
 
@@ -36,14 +37,11 @@ enum Wake {
     /// Run the app's logic, then draw after this delay.
     After(Duration),
     /// A taskbar thumbnail button or a system-wide shortcut.
-    #[cfg(windows)]
     Control(crate::config::Control),
 }
 
 struct Surface {
-    /// Dropped first: on Wayland it holds the window's display.
-    clipboard: Clipboard,
-    window: Rc<Window>,
+    window: Window,
     presenter: Presenter,
     egui_winit: egui_winit::State,
 }
@@ -65,14 +63,11 @@ struct Shell {
     drawn: ([u32; 2], f32, usize),
     /// The window's content can't be trusted: redraw all of it.
     redraw_all: bool,
-    /// We asked for the coming redraw (others come from the system).
-    requested: bool,
     /// Held modifier keys (to spot a paste).
     modifiers: winit::keyboard::ModifiersState,
     /// `YTMCROSS_STATS=1`: frame time and share of pixels drawn, in the title.
     stats: Option<Stats>,
     first_frame: bool,
-    #[cfg(windows)]
     proxy: winit::event_loop::EventLoopProxy<Wake>,
 }
 
@@ -93,7 +88,6 @@ pub fn run(
     let ctx = egui::Context::default();
     let proxy = event_loop.create_proxy();
     let waker = proxy.clone();
-    #[cfg(windows)]
     let thumbs = proxy.clone();
     ctx.set_request_repaint_callback(move |info| {
         let _ = proxy.send_event(Wake::After(info.delay));
@@ -108,7 +102,6 @@ pub fn run(
         renderer: EguiSoftwareRender::new(ColorFieldOrder::Bgra).with_caching(false),
         stats: std::env::var_os("YTMCROSS_STATS").map(|_| Stats::default()),
         first_frame: true,
-        #[cfg(windows)]
         proxy: thumbs,
         ctx,
         app,
@@ -121,7 +114,6 @@ pub fn run(
         scene: Scene::default(),
         drawn: ([0, 0], 0.0, 0),
         redraw_all: true,
-        requested: false,
         modifiers: Default::default(),
     };
     event_loop.run_app(&mut shell)?;
@@ -144,14 +136,14 @@ impl Shell {
         let size = win.window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
         // Before egui runs: the OS may have dropped what the window showed.
-        let lost = win.presenter.invalidated(!std::mem::take(&mut self.requested));
+        let lost = win.presenter.invalidated();
 
         let input = win.egui_winit.take_egui_input(&win.window);
         let app = &mut self.app;
         let out = self.ctx.run_ui(input, |ui| app.ui(ui));
         for command in &out.platform_output.commands {
             if let egui::OutputCommand::CopyText(text) = command {
-                win.clipboard.set(&win.window, text);
+                clipboard::set(text);
             }
         }
         win.egui_winit.handle_platform_output(&win.window, out.platform_output);
@@ -180,9 +172,6 @@ impl Shell {
         } else {
             let (ctx, renderer) = (&self.ctx, &mut self.renderer);
             let (delta, none) = (&out.textures_delta, egui::TexturesDelta::default());
-            // Wayland: lets the compositor's frame callbacks pace us.
-            win.window.pre_present_notify();
-            // The presenter may draw more than the damage (present.rs).
             regions = win.presenter.draw(w, h, damage, |pixels, regions| {
                 let full = regions.first() == Some(&Region::full(w, h));
                 let shapes = if full { shapes } else { scene.touching(shapes, regions) };
@@ -241,7 +230,6 @@ impl Shell {
         if delay.is_zero() {
             // Animating: wait for the compositor's next vblank, so frames are
             // evenly spaced and in step with the display instead of judder.
-            #[cfg(windows)]
             // SAFETY: no arguments; blocks until the next DWM composition.
             if unsafe { windows_sys::Win32::Graphics::Dwm::DwmFlush() } >= 0 {
                 self.ready_at = Instant::now();
@@ -258,15 +246,13 @@ impl Shell {
     }
 }
 
-/// Ctrl+V (Cmd+V on macOS), Shift+Insert or the Paste key, as egui-winit
-/// recognizes them.
+/// Ctrl+V, Shift+Insert or the Paste key, as egui-winit recognizes them.
 fn is_paste(key: &winit::event::KeyEvent, modifiers: winit::keyboard::ModifiersState) -> bool {
     use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
-    let command = if cfg!(target_os = "macos") { modifiers.super_key() } else { modifiers.control_key() };
     let v = matches!(&key.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("v"))
         || key.physical_key == PhysicalKey::Code(KeyCode::KeyV);
     let insert = key.logical_key == Key::Named(NamedKey::Insert) || key.physical_key == PhysicalKey::Code(KeyCode::Insert);
-    key.logical_key == Key::Named(NamedKey::Paste) || (command && v) || (modifiers.shift_key() && insert)
+    key.logical_key == Key::Named(NamedKey::Paste) || (modifiers.control_key() && v) || (modifiers.shift_key() && insert)
 }
 
 /// Clears a region before drawing it, as a full frame starts from black.
@@ -283,7 +269,7 @@ impl ApplicationHandler<Wake> for Shell {
             return;
         }
         let window = match egui_winit::create_window(&self.ctx, el, &self.viewport) {
-            Ok(w) => Rc::new(w),
+            Ok(w) => w,
             Err(e) => {
                 eprintln!("ytmcross: could not create window: {e}");
                 el.exit();
@@ -291,22 +277,17 @@ impl ApplicationHandler<Wake> for Shell {
             }
         };
         // Title bar and taskbar icon: the exe's own (build.rs), loaded by the OS.
-        #[cfg(windows)]
-        {
-            use winit::platform::windows::{IconExtWindows, WindowExtWindows};
-            let icon = winit::window::Icon::from_resource(1, None).ok();
-            window.set_window_icon(icon.clone());
-            window.set_taskbar_icon(icon);
-            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            if let Ok(RawWindowHandle::Win32(h)) = window.window_handle().map(|h| h.as_raw()) {
-                let proxy = self.proxy.clone();
-                super::win32::install(h.hwnd.get() as _, move |c| drop(proxy.send_event(Wake::Control(c))));
-            }
+        let icon = winit::window::Icon::from_resource(1, None).ok();
+        window.set_window_icon(icon.clone());
+        window.set_taskbar_icon(icon);
+        if let Ok(RawWindowHandle::Win32(h)) = window.window_handle().map(|h| h.as_raw()) {
+            let proxy = self.proxy.clone();
+            super::win32::install(h.hwnd.get() as _, move |c| drop(proxy.send_event(Wake::Control(c))));
         }
         if let Some(mhz) = window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).filter(|&m| m > 0) {
             self.frame_interval = Duration::from_secs_f64(1000.0 / mhz as f64);
         }
-        let presenter = match Presenter::new(el, &window) {
+        let presenter = match Presenter::new(&window) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("ytmcross: could not create surface: {e}");
@@ -322,14 +303,13 @@ impl ApplicationHandler<Wake> for Shell {
             None,
             None,
         );
-        self.win = Some(Surface { clipboard: Clipboard::default(), window, presenter, egui_winit });
+        self.win = Some(Surface { window, presenter, egui_winit });
         self.schedule(Instant::now());
     }
 
     fn user_event(&mut self, _el: &ActiveEventLoop, wake: Wake) {
         let delay = match wake {
             Wake::After(delay) => delay,
-            #[cfg(windows)]
             Wake::Control(c) => {
                 self.app.control(c);
                 Duration::ZERO
@@ -365,7 +345,7 @@ impl ApplicationHandler<Wake> for Shell {
                     WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
                     // egui-winit pastes from its own clipboard: fill it first.
                     WindowEvent::KeyboardInput { event: key, .. } if key.state.is_pressed() && is_paste(key, self.modifiers) => {
-                        win.egui_winit.set_clipboard_text(win.clipboard.get(&win.window).unwrap_or_default());
+                        win.egui_winit.set_clipboard_text(clipboard::get().unwrap_or_default());
                     }
                     _ => {}
                 }
@@ -377,18 +357,15 @@ impl ApplicationHandler<Wake> for Shell {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        #[cfg(windows)]
-        {
-            let loaded = self.app.now_playing().is_some();
-            super::win32::update(loaded, loaded && !self.app.playback.paused);
-            // Let go while one is being set in Preferences, so its keys reach us.
-            let keys = if self.app.recording.is_some() { [None; 3] } else { self.app.config.keys.0 };
-            let taken = super::win32::set_hotkeys(keys);
-            if !taken.is_empty() {
-                let names: Vec<String> = taken.iter().map(|b| b.to_string()).collect();
-                self.app.notify(format!("{} can't be used system-wide (another app has it): only in this window", names.join(", ")));
-                self.schedule(Instant::now());
-            }
+        let loaded = self.app.now_playing().is_some();
+        super::win32::update(loaded, loaded && !self.app.playback.paused);
+        // Let go while one is being set in Preferences, so its keys reach us.
+        let keys = if self.app.recording.is_some() { [None; 3] } else { self.app.config.keys.0 };
+        let taken = super::win32::set_hotkeys(keys);
+        if !taken.is_empty() {
+            let names: Vec<String> = taken.iter().map(|b| b.to_string()).collect();
+            self.app.notify(format!("{} can't be used system-wide (another app has it): only in this window", names.join(", ")));
+            self.schedule(Instant::now());
         }
         if let Some(when) = self.next_frame {
             let when = when.max(self.ready_at);
@@ -398,7 +375,6 @@ impl ApplicationHandler<Wake> for Shell {
                 if self.visible()
                     && let Some(w) = &self.win
                 {
-                    self.requested = true;
                     w.window.request_redraw();
                 }
                 el.set_control_flow(ControlFlow::Wait);

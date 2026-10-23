@@ -8,7 +8,6 @@ mod present;
 mod shell;
 mod views;
 mod widgets;
-#[cfg(windows)]
 mod win32;
 
 pub use app::App;
