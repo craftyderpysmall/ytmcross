@@ -295,6 +295,7 @@ impl Shared {
             })
             .collect();
         drop(solver);
+        crate::proc::trim_heap();
         trace!("memory: {before:.1} MB -> solver loaded {loaded:.1} MB -> dropped {:.1} MB", mem());
         results
     }

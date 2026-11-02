@@ -17,6 +17,7 @@ fn tracer() -> Option<&'static Tracer> {
     TRACER
         .get_or_init(|| {
             std::env::var_os("YTMCROSS_TRACE")?;
+            crate::paths::create_data_dir().ok()?;
             let path = crate::paths::data_dir().join("trace.log");
             let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
             Some(Tracer { start: Instant::now(), file: std::sync::Mutex::new(file) })
@@ -28,17 +29,11 @@ pub fn enabled() -> bool {
     tracer().is_some()
 }
 
-/// Private bytes of this process in MB. Trace-only.
+/// Private memory of this process in MB. Trace-only.
 pub fn private_mb() -> f64 {
-    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    // SAFETY: plain Win32 query into a zeroed, correctly sized struct.
-    unsafe {
-        let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
-        c.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-        GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast(), c.cb);
-        c.PrivateUsage as f64 / 1_048_576.0
-    }
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let kb = status.lines().find_map(|l| l.strip_prefix("RssAnon:")).and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok());
+    kb.unwrap_or(0.0) / 1024.0
 }
 
 pub fn log(msg: std::fmt::Arguments) {

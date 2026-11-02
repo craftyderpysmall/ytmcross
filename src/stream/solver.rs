@@ -9,10 +9,10 @@
 //!    download the player and extract the two functions, natively with SWC
 //!    (github.com/anenasa/ytdlp-ejs, ~0.3 s) or, if that fails, with yt-dlp's
 //!    official solver (github.com/yt-dlp/ejs, ~7 s). The result is saved as
-//!    QuickJS bytecode in the data dir; the helper's memory dies with it.
+//!    QuickJS bytecode in the cache dir; the helper's memory dies with it.
 //! 2. Per batch of tracks: load that bytecode into a fresh engine on a
-//!    private heap (~25 ms, ~12 MB), unscramble every URL (~2 ms each), drop
-//!    the engine and the heap. Nothing stays resident between batches.
+//!    runtime (~25 ms, ~12 MB), unscramble every URL (~2 ms each), drop the
+//!    engine and trim the heap. Nothing stays resident between batches.
 
 use std::ffi::CString;
 use std::path::PathBuf;
@@ -114,7 +114,7 @@ impl SolverStore {
 }
 
 fn files(version: &str) -> (PathBuf, PathBuf) {
-    let dir = paths::data_dir().join("solver");
+    let dir = paths::cache_dir().join("solver");
     (dir.join(format!("{version}-{BYTECODE_TAG}.bc")), dir.join(format!("{version}.sts")))
 }
 
@@ -141,14 +141,13 @@ fn player_version(agent: &ureq::Agent) -> Result<String, String> {
 /// the OS the moment the helper exits. A crash there can't take the app down.
 fn build_in_helper(version: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut child = crate::proc::command(&exe.to_string_lossy())
+    let mut child = crate::proc::helper(exe)
         .args(["--build-solver", version])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("solver helper: {e}"))?;
-    crate::proc::bind_to_parent(&child);
     match child.wait() {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(format!("solver helper failed ({status})")),
@@ -234,7 +233,7 @@ impl Solver {
     }
 
     fn from_bytecode(bytes: &[u8]) -> Result<Solver, String> {
-        let rt = runtime()?;
+        let rt = Runtime::new().map_err(|e| e.to_string())?;
         rt.set_max_stack_size(32 << 20);
         let ctx = Context::full(&rt).map_err(|e| e.to_string())?;
         ctx.with(|ctx| -> Result<(), String> {
@@ -282,100 +281,6 @@ impl Solver {
     }
 }
 
-/// A QuickJS runtime whose memory is fully returned to the OS when dropped.
-///
-/// Every solver runtime gets its own private heap, destroyed in one go
-/// afterwards; otherwise its ~12 MB would leave the process heap
-/// fragmented and the app's footprint would creep up with every batch.
-fn runtime() -> Result<Runtime, String> {
-    let rt = match private_heap::PrivateHeap::new() {
-        Some(heap) => Runtime::new_with_alloc(heap),
-        None => Runtime::new(),
-    };
-    rt.map_err(|e| e.to_string())
-}
-
-mod private_heap {
-    use rquickjs::allocator::Allocator;
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::System::Memory::{HEAP_ZERO_MEMORY, HeapAlloc, HeapCreate, HeapDestroy, HeapFree, HeapReAlloc};
-
-    /// Each block starts with its size, so `usable_size` (which gets no
-    /// heap handle) can answer. 16 bytes keeps the 16-byte alignment.
-    const HEADER: usize = 16;
-
-    pub struct PrivateHeap(HANDLE);
-
-    // SAFETY: the heap is created serialized (thread-safe) and only used by
-    // the runtime that owns it.
-    unsafe impl Send for PrivateHeap {}
-
-    impl PrivateHeap {
-        pub fn new() -> Option<PrivateHeap> {
-            // SAFETY: plain Win32 call; a null handle means failure.
-            let heap = unsafe { HeapCreate(0, 0, 0) };
-            (!heap.is_null()).then_some(PrivateHeap(heap))
-        }
-
-        /// SAFETY: `block` must be null or come from this heap's HeapAlloc/HeapReAlloc.
-        unsafe fn finish(block: *mut u8, size: usize) -> *mut u8 {
-            if block.is_null() {
-                return block;
-            }
-            unsafe {
-                block.cast::<usize>().write(size);
-                block.add(HEADER)
-            }
-        }
-    }
-
-    impl Drop for PrivateHeap {
-        fn drop(&mut self) {
-            // SAFETY: rquickjs drops the allocator after JS_FreeRuntime, so
-            // nothing references this heap any more.
-            unsafe {
-                HeapDestroy(self.0);
-            }
-        }
-    }
-
-    // SAFETY: blocks are valid for the requested size, 16-byte aligned, and
-    // freed/resized only through the same heap.
-    unsafe impl Allocator for PrivateHeap {
-        fn alloc(&mut self, size: usize) -> *mut u8 {
-            unsafe { Self::finish(HeapAlloc(self.0, 0, size + HEADER).cast(), size) }
-        }
-
-        fn calloc(&mut self, count: usize, size: usize) -> *mut u8 {
-            let Some(total) = count.checked_mul(size) else { return std::ptr::null_mut() };
-            unsafe { Self::finish(HeapAlloc(self.0, HEAP_ZERO_MEMORY, total + HEADER).cast(), total) }
-        }
-
-        unsafe fn dealloc(&mut self, ptr: *mut u8) {
-            if !ptr.is_null() {
-                unsafe {
-                    HeapFree(self.0, 0, ptr.sub(HEADER).cast());
-                }
-            }
-        }
-
-        unsafe fn realloc(&mut self, ptr: *mut u8, new_size: usize) -> *mut u8 {
-            if ptr.is_null() {
-                return self.alloc(new_size);
-            }
-            if new_size == 0 {
-                unsafe { self.dealloc(ptr) };
-                return std::ptr::null_mut();
-            }
-            unsafe { Self::finish(HeapReAlloc(self.0, 0, ptr.sub(HEADER).cast(), new_size + HEADER).cast(), new_size) }
-        }
-
-        unsafe fn usable_size(ptr: *mut u8) -> usize {
-            unsafe { ptr.sub(HEADER).cast::<usize>().read() }
-        }
-    }
-}
-
 /// `signatureTimestamp:20737` (or `sts:20737` in some players).
 fn signature_timestamp(player: &str) -> Option<u32> {
     for key in ["signatureTimestamp:", "sts:"] {
@@ -393,7 +298,7 @@ fn signature_timestamp(player: &str) -> Option<u32> {
 
 /// Runs yt-dlp's official solver's preprocessing step on the player script.
 fn preprocess_official(player: &str) -> Result<String, String> {
-    let rt = runtime()?;
+    let rt = Runtime::new().map_err(|e| e.to_string())?;
     rt.set_max_stack_size(64 << 20);
     let ctx = Context::full(&rt).map_err(|e| e.to_string())?;
     ctx.with(|ctx| {
@@ -420,7 +325,7 @@ fn inflate(data: &[u8]) -> Result<String, String> {
 
 /// Compiles the preprocessed player to stripped QuickJS bytecode.
 fn compile(code: &str) -> Result<Vec<u8>, String> {
-    let rt = runtime()?;
+    let rt = Runtime::new().map_err(|e| e.to_string())?;
     let ctx = Context::full(&rt).map_err(|e| e.to_string())?;
     let src = CString::new(code).map_err(|e| e.to_string())?;
     let name = CString::new("player").unwrap();

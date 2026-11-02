@@ -1,6 +1,6 @@
-# Push a tag vX.Y.Z (matching Cargo.toml) to release: builds the Windows zip,
-# publishes it, then opens a winget-pkgs pull request for the new version
-# (needs a WINGET_TOKEN secret: a classic GitHub token with public_repo).
+# Push a tag vX.Y.Z (matching Cargo.toml) to release: builds the Linux
+# tarball and publishes it. Built on the oldest supported runner, as a binary
+# runs on systems with this glibc or newer.
 name: release
 on:
   push:
@@ -8,49 +8,24 @@ on:
 permissions:
   contents: write
 jobs:
-  windows:
-    runs-on: windows-latest
+  linux:
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
-      - uses: msys2/setup-msys2@v2
-        id: msys2
-        with:
-          msystem: MINGW64
-          install: mingw-w64-x86_64-gcc
-          # msvcrt-based like Rust's windows-gnu target; UCRT64 would mix C runtimes.
-          suppress-deprecation-warnings: msystem-mingw64
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config
       - name: Build
-        shell: pwsh
         run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          if ("v$version" -ne $env:GITHUB_REF_NAME) { throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version" }
-          $env:Path = "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin;$env:Path"
-          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
-          cargo +stable-x86_64-pc-windows-gnu build --release --locked
-          # The player must never load the webview.
-          if (objdump -p target\release\ytmcross.exe | Select-String WebView2Loader) { throw "ytmcross.exe imports WebView2Loader.dll" }
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version"; exit 1; }
+          rustup toolchain install stable --profile minimal
+          cargo build --release --locked
       - name: Package and publish
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
-          $dll = Get-ChildItem "$cargoHome\registry\src\*\webview2-com-sys-*\x64\WebView2Loader.dll" | Select-Object -First 1
-          if (-not $dll) { throw "WebView2Loader.dll not found" }
-          $zip = "ytmcross-$env:GITHUB_REF_NAME-windows-x64.zip"
-          Compress-Archive -Path target\release\ytmcross.exe, target\release\ytmcross-login.exe, $dll.FullName -DestinationPath $zip
-          gh release create $env:GITHUB_REF_NAME $zip --title "ytmcross $env:GITHUB_REF_NAME" --generate-notes
-  winget:
-    needs: windows
-    runs-on: windows-latest
-    env:
-      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
-    steps:
-      - name: Update the winget manifest
-        if: env.WINGET_TOKEN != ''
-        shell: pwsh
-        run: |
-          $version = $env:GITHUB_REF_NAME.TrimStart('v')
-          $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/ytmcross-$env:GITHUB_REF_NAME-windows-x64.zip"
-          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
-          .\wingetcreate.exe update craftyderpysmall.ytmcross --version $version --urls $url --token $env:WINGET_TOKEN --submit
+          dir="ytmcross-$GITHUB_REF_NAME-linux-x64"
+          mkdir "$dir"
+          cp target/release/ytmcross assets/ytmcross.desktop assets/ytmcross.svg LICENSE "$dir"
+          tar czf "$dir.tar.gz" "$dir"
+          gh release create "$GITHUB_REF_NAME" "$dir.tar.gz" --title "ytmcross $GITHUB_REF_NAME" --generate-notes

@@ -1,28 +1,41 @@
-//! Where ytmcross keeps its files. Everything follows OS conventions so
-//! package managers never need to know about custom locations.
+//! Where ytmcross keeps its files, by the XDG base directory spec.
 //!
-//! config: %APPDATA%\ytmcross
-//! data:   %LOCALAPPDATA%\ytmcross
+//! config: $XDG_CONFIG_HOME/ytmcross (~/.config)
+//! data:   $XDG_DATA_HOME/ytmcross   (~/.local/share)
+//! cache:  $XDG_CACHE_HOME/ytmcross  (~/.cache)
 
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
 
 const APP: &str = "ytmcross";
 
+fn home() -> PathBuf {
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
+}
+
+/// The spec says relative values are invalid and must be ignored.
+fn xdg(var: &str, default: &str) -> PathBuf {
+    let base = std::env::var_os(var).map(PathBuf::from).filter(|p| p.is_absolute());
+    base.unwrap_or_else(|| home().join(default)).join(APP)
+}
+
 pub fn config_dir() -> PathBuf {
-    known("APPDATA", dirs::config_dir).join(APP)
+    xdg("XDG_CONFIG_HOME", ".config")
 }
 
 pub fn data_dir() -> PathBuf {
-    known("LOCALAPPDATA", dirs::data_local_dir).join(APP)
+    xdg("XDG_DATA_HOME", ".local/share")
 }
 
-/// The environment names these folders: asking the shell instead
-/// (SHGetKnownFolderPath) loads windows.storage.dll and friends.
-fn known(var: &str, ask: fn() -> Option<PathBuf>) -> PathBuf {
-    if let Some(dir) = std::env::var_os(var).filter(|v| !v.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    ask().unwrap_or_else(|| PathBuf::from("."))
+pub fn cache_dir() -> PathBuf {
+    xdg("XDG_CACHE_HOME", ".cache")
+}
+
+/// Creates the data folder, private: it holds the Google session.
+pub fn create_data_dir() -> std::io::Result<()> {
+    let dir = data_dir();
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
 pub fn config_file() -> PathBuf {
@@ -54,19 +67,19 @@ pub fn last_played_file() -> PathBuf {
 }
 
 /// Where downloads go: the folder set in Preferences ("~" is the home
-/// folder), or "downloads" next to config.toml.
+/// folder), or "downloads" in the data folder.
 pub fn downloads_dir(configured: &str) -> PathBuf {
     let configured = configured.trim();
     if configured.is_empty() {
-        return config_dir().join("downloads");
+        return data_dir().join("downloads");
     }
-    match configured.strip_prefix('~').filter(|rest| rest.is_empty() || rest.starts_with(['/', '\\'])) {
-        Some(rest) => dirs::home_dir().unwrap_or_default().join(rest.trim_start_matches(['/', '\\'])),
+    match configured.strip_prefix('~').filter(|rest| rest.is_empty() || rest.starts_with('/')) {
+        Some(rest) => home().join(rest.trim_start_matches('/')),
         None => PathBuf::from(configured),
     }
 }
 
-/// Throwaway webview profile used only during `--login`; deleted afterwards.
-pub fn login_webview_dir() -> PathBuf {
-    data_dir().join("login-webview")
+/// Throwaway browser profile used only during `--login`; deleted afterwards.
+pub fn login_profile_dir() -> PathBuf {
+    cache_dir().join("login-profile")
 }

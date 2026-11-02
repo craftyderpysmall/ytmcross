@@ -391,7 +391,7 @@ fn track_name(t: &Track) -> String {
     if t.artists.is_empty() { t.title.clone() } else { format!("{} - {}", t.artists, t.title) }
 }
 
-/// Safe as a file name on every OS (and on FAT drives).
+/// Safe as a file name, also on FAT and exFAT drives.
 fn clean(s: &str) -> String {
     let mut out: String = s.chars().map(|c| if c.is_control() || r#"<>:"/\|?*"#.contains(c) { '_' } else { c }).collect();
     if out.len() > MAX_NAME {

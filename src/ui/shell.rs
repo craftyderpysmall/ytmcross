@@ -4,14 +4,15 @@
 //! Frame policy, all in one place:
 //! - Something woke us (input, a worker message, an animation tick):
 //!   run `App::logic` and schedule a frame.
-//! - Frames are paced to the monitor's refresh rate, never faster; while
-//!   animating, in step with the compositor's vblank.
+//! - Frames are paced by the compositor's frame callbacks, and by the
+//!   monitor's refresh rate.
 //! - A frame lays the UI out, then rasterizes only what changed since the
 //!   previous one (damage.rs): often a row, or nothing at all.
-//! - Minimized or fully covered: logic still runs (the queue keeps
-//!   advancing), but nothing is laid out or drawn.
+//! - Out of view: the compositor sends no frame callback, so winit holds
+//!   the redraw back. Logic still runs (the queue keeps advancing), but
+//!   after the one frame already due, nothing is laid out or drawn.
 //! - Nothing scheduled: the thread sleeps in the OS until the next event,
-//!   and the frame buffer has been given back (present.rs).
+//!   and soon after the frame buffer is given back (present.rs).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,30 +21,34 @@ use egui_software_backend::{BufferMutRef, ColorFieldOrder, EguiSoftwareRender};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::platform::windows::{IconExtWindows, WindowExtWindows};
-use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 use super::app::App;
-use super::clipboard;
+use super::clipboard::Clipboard;
 use super::damage::{self, Damage, Region, Scene};
 use super::present::{Pixels, Presenter};
+use crate::mpris::Mpris;
 
-/// The frame buffer is kept when the next frame is due sooner than this.
-const KEEP_BUFFER: Duration = Duration::from_millis(100);
+/// The frame buffer is kept this long after a frame: enough for the 1 Hz
+/// progress update to stay a partial redraw, as a full one follows a release.
+const KEEP_BUFFER: Duration = Duration::from_secs(3);
+/// The compositor still held the buffer: ask again after this.
+const RELEASE_RETRY: Duration = Duration::from_secs(1);
 
 /// Sent from any thread to wake the event loop.
 enum Wake {
     /// Run the app's logic, then draw after this delay.
     After(Duration),
-    /// A taskbar thumbnail button or a system-wide shortcut.
+    /// An MPRIS client.
     Control(crate::config::Control),
 }
 
+/// Dropped in this order: the window, and so the display, goes last.
 struct Surface {
-    window: Window,
+    clipboard: Clipboard,
     presenter: Presenter,
     egui_winit: egui_winit::State,
+    window: Window,
 }
 
 struct Shell {
@@ -52,8 +57,9 @@ struct Shell {
     viewport: egui::ViewportBuilder,
     renderer: EguiSoftwareRender,
     win: Option<Surface>,
-    occluded: bool,
     next_frame: Option<Instant>,
+    /// When to give the frame buffer back.
+    release_at: Option<Instant>,
     /// Earliest start of the next frame (refresh-rate pacing).
     ready_at: Instant,
     frame_interval: Duration,
@@ -61,14 +67,13 @@ struct Shell {
     scene: Scene,
     /// Window size, scale and fonts `scene` was drawn with.
     drawn: ([u32; 2], f32, usize),
-    /// The window's content can't be trusted: redraw all of it.
-    redraw_all: bool,
     /// Held modifier keys (to spot a paste).
     modifiers: winit::keyboard::ModifiersState,
     /// `YTMCROSS_STATS=1`: frame time and share of pixels drawn, in the title.
     stats: Option<Stats>,
     first_frame: bool,
     proxy: winit::event_loop::EventLoopProxy<Wake>,
+    mpris: Option<Mpris>,
 }
 
 #[derive(Default)]
@@ -88,7 +93,7 @@ pub fn run(
     let ctx = egui::Context::default();
     let proxy = event_loop.create_proxy();
     let waker = proxy.clone();
-    let thumbs = proxy.clone();
+    let controls = proxy.clone();
     ctx.set_request_repaint_callback(move |info| {
         let _ = proxy.send_event(Wake::After(info.delay));
     });
@@ -102,18 +107,18 @@ pub fn run(
         renderer: EguiSoftwareRender::new(ColorFieldOrder::Bgra).with_caching(false),
         stats: std::env::var_os("YTMCROSS_STATS").map(|_| Stats::default()),
         first_frame: true,
-        proxy: thumbs,
+        proxy: controls,
+        mpris: None,
         ctx,
         app,
         viewport,
         win: None,
-        occluded: false,
         next_frame: Some(Instant::now()),
+        release_at: None,
         ready_at: Instant::now(),
         frame_interval: Duration::from_micros(16_667),
         scene: Scene::default(),
         drawn: ([0, 0], 0.0, 0),
-        redraw_all: true,
         modifiers: Default::default(),
     };
     event_loop.run_app(&mut shell)?;
@@ -126,8 +131,17 @@ impl Shell {
         self.next_frame = Some(self.next_frame.map_or(when, |t| t.min(when)));
     }
 
-    fn visible(&self) -> bool {
-        !self.occluded && self.win.as_ref().is_some_and(|w| w.window.is_minimized() != Some(true))
+    /// Keeps MPRIS up to date; it starts with the first playback.
+    fn publish(&mut self) {
+        let track = self.app.now_playing();
+        let playback = &self.app.playback;
+        if self.mpris.is_none() && track.is_some() && !playback.paused {
+            let proxy = self.proxy.clone();
+            self.mpris = Mpris::start(move |c| drop(proxy.send_event(Wake::Control(c)))).ok();
+        }
+        if let Some(mpris) = &mut self.mpris {
+            mpris.update(track, playback.paused, playback.position(), playback.duration, playback.volume);
+        }
     }
 
     fn paint(&mut self) {
@@ -135,15 +149,13 @@ impl Shell {
         let started = Instant::now();
         let size = win.window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
-        // Before egui runs: the OS may have dropped what the window showed.
-        let lost = win.presenter.invalidated();
 
         let input = win.egui_winit.take_egui_input(&win.window);
         let app = &mut self.app;
         let out = self.ctx.run_ui(input, |ui| app.ui(ui));
         for command in &out.platform_output.commands {
             if let egui::OutputCommand::CopyText(text) = command {
-                clipboard::set(text);
+                win.clipboard.set(text);
             }
         }
         win.egui_winit.handle_platform_output(&win.window, out.platform_output);
@@ -154,7 +166,7 @@ impl Shell {
         // New fonts (another script's, or the theme's) can change glyphs
         // without changing any layout: redraw everything.
         let fonts = self.ctx.fonts(|f| f.definitions().font_data.values().fold(0, |k, d| k * 31 + Arc::as_ptr(d) as usize));
-        let all = std::mem::take(&mut self.redraw_all) | lost | (self.drawn != ([w, h], ppp, fonts));
+        let all = win.presenter.needs_full(w, h) || self.drawn != ([w, h], ppp, fonts);
         let damage = match if all { Damage::Full } else { damage::diff(&self.scene, &scene, w, h) } {
             Damage::None => Vec::new(),
             Damage::Regions(r) => r,
@@ -172,7 +184,7 @@ impl Shell {
         } else {
             let (ctx, renderer) = (&self.ctx, &mut self.renderer);
             let (delta, none) = (&out.textures_delta, egui::TexturesDelta::default());
-            regions = win.presenter.draw(w, h, damage, |pixels, regions| {
+            regions = win.presenter.draw(&win.window, w, h, damage, |pixels, regions| {
                 let full = regions.first() == Some(&Region::full(w, h));
                 let shapes = if full { shapes } else { scene.touching(shapes, regions) };
                 let mut primitives = ctx.tessellate(shapes, ppp);
@@ -227,19 +239,7 @@ impl Shell {
         // The next frame may start one refresh after this one started.
         self.ready_at = started + self.frame_interval;
         let delay = out.viewport_output.get(&egui::ViewportId::ROOT).map_or(Duration::MAX, |vp| vp.repaint_delay);
-        if delay.is_zero() {
-            // Animating: wait for the compositor's next vblank, so frames are
-            // evenly spaced and in step with the display instead of judder.
-            // SAFETY: no arguments; blocks until the next DWM composition.
-            if unsafe { windows_sys::Win32::Graphics::Dwm::DwmFlush() } >= 0 {
-                self.ready_at = Instant::now();
-            }
-        }
-        // Between animation frames the buffer is kept; otherwise it goes
-        // back now (redrawing a small region later touches only its pages).
-        if delay > KEEP_BUFFER {
-            win.presenter.release();
-        }
+        self.release_at = Some(Instant::now() + KEEP_BUFFER);
         if delay < Duration::from_secs(3600) {
             self.schedule(Instant::now() + delay);
         }
@@ -276,19 +276,12 @@ impl ApplicationHandler<Wake> for Shell {
                 return;
             }
         };
-        // Title bar and taskbar icon: the exe's own (build.rs), loaded by the OS.
-        let icon = winit::window::Icon::from_resource(1, None).ok();
-        window.set_window_icon(icon.clone());
-        window.set_taskbar_icon(icon);
-        if let Ok(RawWindowHandle::Win32(h)) = window.window_handle().map(|h| h.as_raw()) {
-            let proxy = self.proxy.clone();
-            super::win32::install(h.hwnd.get() as _, move |c| drop(proxy.send_event(Wake::Control(c))));
-        }
         if let Some(mhz) = window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).filter(|&m| m > 0) {
             self.frame_interval = Duration::from_secs_f64(1000.0 / mhz as f64);
         }
-        let presenter = match Presenter::new(&window) {
-            Ok(p) => p,
+        let surface = Presenter::new(&window).and_then(|p| Ok((p, Clipboard::new(&window)?)));
+        let (presenter, clipboard) = match surface {
+            Ok(s) => s,
             Err(e) => {
                 eprintln!("ytmcross: could not create surface: {e}");
                 el.exit();
@@ -303,7 +296,7 @@ impl ApplicationHandler<Wake> for Shell {
             None,
             None,
         );
-        self.win = Some(Surface { window, presenter, egui_winit });
+        self.win = Some(Surface { clipboard, presenter, egui_winit, window });
         self.schedule(Instant::now());
     }
 
@@ -328,24 +321,13 @@ impl ApplicationHandler<Wake> for Shell {
                 el.exit();
             }
             WindowEvent::RedrawRequested => self.paint(),
-            WindowEvent::Occluded(occluded) => {
-                self.occluded = occluded;
-                if occluded {
-                    if let Some(w) = &mut self.win {
-                        w.presenter.release();
-                    }
-                } else {
-                    self.redraw_all = true;
-                    self.schedule(Instant::now());
-                }
-            }
             event => {
                 let Some(win) = self.win.as_mut() else { return };
                 match &event {
                     WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
                     // egui-winit pastes from its own clipboard: fill it first.
                     WindowEvent::KeyboardInput { event: key, .. } if key.state.is_pressed() && is_paste(key, self.modifiers) => {
-                        win.egui_winit.set_clipboard_text(clipboard::get().unwrap_or_default());
+                        win.egui_winit.set_clipboard_text(win.clipboard.get().unwrap_or_default());
                     }
                     _ => {}
                 }
@@ -357,32 +339,27 @@ impl ApplicationHandler<Wake> for Shell {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        let loaded = self.app.now_playing().is_some();
-        super::win32::update(loaded, loaded && !self.app.playback.paused);
-        // Let go while one is being set in Preferences, so its keys reach us.
-        let keys = if self.app.recording.is_some() { [None; 3] } else { self.app.config.keys.0 };
-        let taken = super::win32::set_hotkeys(keys);
-        if !taken.is_empty() {
-            let names: Vec<String> = taken.iter().map(|b| b.to_string()).collect();
-            self.app.notify(format!("{} can't be used system-wide (another app has it): only in this window", names.join(", ")));
-            self.schedule(Instant::now());
+        self.publish();
+        let now = Instant::now();
+        if let (Some(at), Some(w)) = (self.release_at, &mut self.win)
+            && now >= at
+        {
+            self.release_at = (!w.presenter.release()).then_some(now + RELEASE_RETRY);
         }
         if let Some(when) = self.next_frame {
             let when = when.max(self.ready_at);
-            if Instant::now() >= when {
+            if now >= when {
                 self.next_frame = None;
-                // Hidden: drop the frame. Showing the window again triggers one.
-                if self.visible()
-                    && let Some(w) = &self.win
-                {
+                // Out of view, winit holds this back until a frame callback.
+                if let Some(w) = &self.win {
                     w.window.request_redraw();
                 }
-                el.set_control_flow(ControlFlow::Wait);
-            } else {
-                el.set_control_flow(ControlFlow::WaitUntil(when));
             }
-        } else {
-            el.set_control_flow(ControlFlow::Wait);
         }
+        // The next timer, if any: nothing to do means sleeping in the OS.
+        el.set_control_flow(match self.next_frame.map(|t| t.max(self.ready_at)).into_iter().chain(self.release_at).min() {
+            Some(when) => ControlFlow::WaitUntil(when),
+            None => ControlFlow::Wait,
+        });
     }
 }

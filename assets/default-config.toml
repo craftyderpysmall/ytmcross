@@ -21,13 +21,13 @@ sidebar_items = ["search", "library", "queue"]
 volume = 80
 
 [downloads]
-# Folder for downloaded songs and playlists. Empty: downloads, next to this file.
+# Folder for downloaded songs and playlists. Empty: ~/.local/share/ytmcross/downloads.
 # Also set from Preferences in the app.
 folder = ""
 
 [keys]
-# Player shortcuts, like "Ctrl+Shift+Right". They work from any app.
+# Player shortcuts, like "Ctrl+Shift+Right". They work in this window; for media keys, see the README.
 # Empty: none. Also set from Preferences in the app.
-previous = "Alt+Left"
-play_pause = "Alt+Down"
-next = "Alt+Right"
+previous = "Ctrl+Left"
+play_pause = ""
+next = "Ctrl+Right"

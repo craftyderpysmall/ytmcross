@@ -38,7 +38,7 @@ const MAX_VISIBLE: usize = 12;
 const LOOKAHEAD: usize = 3;
 /// Pages remembered for Back.
 const MAX_HISTORY: usize = 16;
-/// Like Windows' caret timeout: a text cursor stops blinking (and waking
+/// A text cursor stops blinking (and waking
 /// the app twice a second) after this long without input.
 const CARET_TIMEOUT: f64 = 5.0;
 
@@ -963,8 +963,9 @@ impl App {
         }
     }
 
-    /// A shortcut or taskbar button.
+    /// A shortcut or an MPRIS client.
     pub fn control(&mut self, control: Control) {
+        trace!("app: control {control:?}");
         match control {
             Control::Previous => self.prev(),
             Control::PlayPause => self.toggle_pause(),
@@ -1228,7 +1229,10 @@ impl App {
                 pb.paused = p;
                 pb.set_position(pos);
             }
-            PlayerEvent::Finished => self.next(),
+            PlayerEvent::Finished => {
+                trace!("app: track finished at {:.1} of {:.1} s", self.playback.position(), self.playback.duration);
+                self.next();
+            }
             PlayerEvent::Error(e) => {
                 self.notify(e);
                 self.next();
@@ -1252,7 +1256,6 @@ impl App {
         }
         let typing = ctx.egui_wants_keyboard_input();
         // The shortcuts first: they win over the keys below (Alt+Left).
-        // They usually never get here (win32.rs takes them).
         let keys = self.config.keys.0;
         let hits = ctx.input_mut(|i| keys.map(|bind| bind.is_some_and(|b| take_key(i, b, typing))));
         for (control, hit) in CONTROLS.into_iter().zip(hits) {
@@ -1362,9 +1365,9 @@ impl App {
 }
 
 /// Removes the presses of `bind` (repeats too, firing only on the first).
-/// While typing, only shortcuts with Ctrl, Alt or the logo key count.
+/// While typing, only shortcuts with Ctrl or Alt count.
 fn take_key(input: &mut egui::InputState, bind: Bind, typing: bool) -> bool {
-    if typing && !(bind.ctrl || bind.alt || bind.logo) {
+    if typing && !(bind.ctrl || bind.alt) {
         return false;
     }
     let mut hit = false;

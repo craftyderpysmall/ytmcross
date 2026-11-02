@@ -1,60 +1,50 @@
-//! The system clipboard, for text, straight through Win32. egui-winit's
-//! clipboard support would connect at startup, and bring in an image codec
-//! stack for copying images, which this app never does.
+//! The Wayland clipboard, for text. egui-winit's clipboard support would
+//! connect at startup; this connects on the first copy or paste, so its
+//! thread only exists once it's needed.
 //!
 //! egui-winit keeps its own in-app clipboard instead; the shell fills it
 //! from here right before a paste, and copies what egui copies back here.
 
-use std::ptr;
+use std::cell::OnceCell;
+use std::ffi::c_void;
+use std::time::Duration;
 
-use windows_sys::Win32::Foundation::GlobalFree;
-use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
-use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+use winit::window::Window;
 
-/// Standard clipboard format: UTF-16 text.
-const CF_UNICODETEXT: u32 = 13;
-
-pub fn get() -> Option<String> {
-    // SAFETY: the clipboard is opened and closed around the read, and the
-    // locked block is only read up to its terminating NUL.
-    unsafe {
-        if OpenClipboard(ptr::null_mut()) == 0 {
-            return None;
-        }
-        let data = GetClipboardData(CF_UNICODETEXT);
-        let text = (!data.is_null()).then(|| GlobalLock(data) as *const u16).filter(|p| !p.is_null()).map(|p| {
-            let len = (0..).take_while(|&i| *p.add(i) != 0).count();
-            let text = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
-            GlobalUnlock(data);
-            text
-        });
-        CloseClipboard();
-        text
-    }
+pub struct Clipboard {
+    display: *mut c_void,
+    inner: OnceCell<smithay_clipboard::Clipboard>,
 }
 
-pub fn set(text: &str) {
-    let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
-    // SAFETY: the block is sized for `wide`; once SetClipboardData succeeds
-    // the system owns it, otherwise it is freed here.
-    unsafe {
-        if OpenClipboard(ptr::null_mut()) == 0 {
-            return;
+impl Clipboard {
+    pub fn new(window: &Window) -> Result<Clipboard, String> {
+        match window.display_handle().map_err(|e| e.to_string())?.as_raw() {
+            RawDisplayHandle::Wayland(h) => Ok(Clipboard { display: h.display.as_ptr(), inner: OnceCell::new() }),
+            _ => Err("not a Wayland window".into()),
         }
-        EmptyClipboard();
-        let block = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2);
-        let p = if block.is_null() { ptr::null_mut() } else { GlobalLock(block) as *mut u16 };
-        if !p.is_null() {
-            ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
-            GlobalUnlock(block);
-            if !SetClipboardData(CF_UNICODETEXT, block).is_null() {
-                CloseClipboard();
-                return;
+    }
+
+    pub fn get(&self) -> Option<String> {
+        let fresh = self.inner.get().is_none();
+        let clipboard = self.connected();
+        // A new connection hears about the seat and focus a moment later.
+        let tries = if fresh { 10 } else { 1 };
+        (0..tries).find_map(|i| {
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(10));
             }
-        }
-        if !block.is_null() {
-            GlobalFree(block);
-        }
-        CloseClipboard();
+            clipboard.load().ok()
+        })
+    }
+
+    pub fn set(&self, text: &str) {
+        self.connected().store(text);
+    }
+
+    fn connected(&self) -> &smithay_clipboard::Clipboard {
+        // SAFETY: the shell keeps the window, and so the display, alive
+        // for longer than this struct.
+        self.inner.get_or_init(|| unsafe { smithay_clipboard::Clipboard::new(self.display) })
     }
 }

@@ -8,7 +8,6 @@ mod present;
 mod shell;
 mod views;
 mod widgets;
-mod win32;
 
 pub use app::App;
 pub use shell::run;

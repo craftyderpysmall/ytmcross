@@ -86,9 +86,9 @@ pub struct Output {
 }
 
 impl Output {
-    /// Opens the default device at the source's rate/channels. Most systems
-    /// resample for us (WASAPI autoconvert, CoreAudio, PipeWire/Pulse); if the
-    /// device refuses, fall back to its native format and resample here.
+    /// Opens the default device at the source's rate/channels. PipeWire and
+    /// Pulse resample for us; if the device refuses, fall back to its native
+    /// format and resample here.
     pub fn open(shared: &Arc<Shared>, rate: u32, channels: u16) -> Result<Output, String> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or("no audio output device")?;

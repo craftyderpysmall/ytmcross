@@ -23,7 +23,7 @@ pub struct Config {
     pub keys: KeysConfig,
 }
 
-/// What a shortcut (or a taskbar button) does.
+/// What a shortcut (or an MPRIS client) does.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Control {
     Previous,
@@ -49,8 +49,6 @@ pub struct Bind {
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
-    /// The Win key.
-    pub logo: bool,
     pub key: egui::Key,
 }
 
@@ -61,28 +59,27 @@ impl Bind {
         // Key names are case-sensitive: also try "left" as "Left".
         let capitalized = key.get(..1).map(|c| c.to_uppercase() + &key[1..]);
         let key = egui::Key::from_name(key).or_else(|| egui::Key::from_name(&capitalized?))?;
-        let mut b = Bind { ctrl: false, alt: false, shift: false, logo: false, key };
+        let mut b = Bind { ctrl: false, alt: false, shift: false, key };
         for m in parts {
             match m.to_ascii_lowercase().as_str() {
                 "ctrl" | "control" => b.ctrl = true,
                 "alt" => b.alt = true,
                 "shift" => b.shift = true,
-                "win" | "super" | "meta" => b.logo = true,
                 _ => return None,
             }
         }
         Some(b)
     }
 
-    /// The pressed key, as egui reports it (without the Win key).
+    /// The pressed key, as egui reports it.
     pub fn pressed(key: egui::Key, m: egui::Modifiers) -> Bind {
-        Bind { ctrl: m.ctrl, alt: m.alt, shift: m.shift, logo: false, key }
+        Bind { ctrl: m.ctrl, alt: m.alt, shift: m.shift, key }
     }
 }
 
 impl std::fmt::Display for Bind {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        for (on, name) in [(self.ctrl, "Ctrl"), (self.alt, "Alt"), (self.shift, "Shift"), (self.logo, "Win")] {
+        for (on, name) in [(self.ctrl, "Ctrl"), (self.alt, "Alt"), (self.shift, "Shift")] {
             if on {
                 write!(f, "{name}+")?;
             }
@@ -91,14 +88,15 @@ impl std::fmt::Display for Bind {
     }
 }
 
-/// Shortcuts, by `Control`. They work from any program.
+/// Shortcuts, by `Control`. They work in this window; outside it, MPRIS does.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KeysConfig(pub [Option<Bind>; 3]);
 
 impl Default for KeysConfig {
     fn default() -> Self {
-        let alt = |key| Some(Bind { ctrl: false, alt: true, shift: false, logo: false, key });
-        KeysConfig([alt(egui::Key::ArrowLeft), alt(egui::Key::ArrowDown), alt(egui::Key::ArrowRight)])
+        // Alt+Left is Back, and Space already plays and pauses.
+        let ctrl = |key| Some(Bind { ctrl: true, alt: false, shift: false, key });
+        KeysConfig([ctrl(egui::Key::ArrowLeft), None, ctrl(egui::Key::ArrowRight)])
     }
 }
 
@@ -129,7 +127,7 @@ impl<'de> Deserialize<'de> for KeysConfig {
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct DownloadsConfig {
-    /// Where downloads go; empty: "downloads" next to config.toml.
+    /// Where downloads go; empty: "downloads" in the data folder.
     pub folder: String,
 }
 
@@ -284,7 +282,7 @@ pub fn save_volume(volume: u32) -> std::io::Result<()> {
 /// Rewrites the `[downloads]` section of config.toml (set in Preferences).
 pub fn save_downloads(d: &DownloadsConfig) -> std::io::Result<()> {
     let body = format!(
-        "# Folder for downloaded songs and playlists. Empty: downloads, next to this file.\n# Also set from Preferences in the app.\nfolder = {}\n",
+        "# Folder for downloaded songs and playlists. Empty: ~/.local/share/ytmcross/downloads.\n# Also set from Preferences in the app.\nfolder = {}\n",
         toml_string(d.folder.trim())
     );
     edit_config(|text| set_section(text, "downloads", &body))
@@ -299,7 +297,7 @@ pub fn save_keys(keys: &KeysConfig) -> std::io::Result<()> {
     edit_config(|text| set_section(text, "keys", &body))
 }
 
-const KEYS_COMMENT: &str = "# Player shortcuts, like \"Ctrl+Shift+Right\". They work from any app.\n# Empty: none. Also set from Preferences in the app.\n";
+const KEYS_COMMENT: &str = "# Player shortcuts, like \"Ctrl+Shift+Right\". They work in this window; for media keys, see the README.\n# Empty: none. Also set from Preferences in the app.\n";
 
 /// A TOML basic string (`{:?}` would write Rust escapes TOML lacks).
 fn toml_string(s: &str) -> String {
@@ -386,7 +384,7 @@ fn set_section(text: &str, section: &str, body: &str) -> String {
 /// First run: write the default config and bundled themes so they can be edited.
 pub fn write_defaults() {
     let _ = std::fs::create_dir_all(paths::themes_dir());
-    let _ = std::fs::create_dir_all(paths::data_dir());
+    let _ = paths::create_data_dir();
     let config = paths::config_file();
     if !config.exists() {
         let _ = std::fs::write(config, DEFAULT_CONFIG);

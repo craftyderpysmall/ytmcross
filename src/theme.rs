@@ -220,35 +220,45 @@ pub fn needs_fallback(text: &str) -> bool {
     })
 }
 
+/// Languages whose scripts Inter lacks; fontconfig picks a font for each.
+const FALLBACK_LANGS: [&str; 9] = ["ja", "ko", "zh-cn", "hi", "bn", "ta", "th", "ar", "he"];
+
 /// System fonts covering other scripts, memory-mapped once: the OS pages in
 /// only the glyphs drawn, and that memory is file-backed, not ours.
 fn system_fallbacks() -> &'static [(&'static [u8], u32)] {
     static FONTS: std::sync::OnceLock<Vec<(&'static [u8], u32)>> = std::sync::OnceLock::new();
     FONTS.get_or_init(|| {
-        let dir = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into())).join("Fonts");
-        let files: &[&str] =
-            &["msyh.ttc", "malgun.ttf", "Nirmala.ttc", "Nirmala.ttf", "LeelawUI.ttf", "segoeui.ttf", "seguisym.ttf"];
-        files.iter().filter_map(|f| map_file(&dir.join(f))).map(|bytes| (bytes, 0)).collect()
+        let mut found: Vec<(String, u32)> = Vec::new();
+        for lang in FALLBACK_LANGS {
+            if let Some(font) = font_for(lang).filter(|f| !found.contains(f)) {
+                found.push(font);
+            }
+        }
+        found.iter().filter_map(|(file, index)| Some((map_file(file.as_ref())?, *index))).collect()
     })
+}
+
+/// The file and face index of fontconfig's best sans font for `lang`, if
+/// it does cover it: its best match is whatever is closest, covering or not.
+fn font_for(lang: &str) -> Option<(String, u32)> {
+    let pattern = format!("sans-serif:lang={lang}");
+    let out = std::process::Command::new("fc-match").args(["-f", "%{file}\\n%{index}\\n%{lang}", &pattern]).output().ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut lines = text.lines();
+    let (file, index, langs) = (lines.next()?, lines.next()?, lines.next()?);
+    langs.split('|').any(|l| l == lang).then(|| Some((file.to_string(), index.parse().ok()?)))?
 }
 
 /// Maps a file read-only for the rest of the process's life.
 fn map_file(path: &std::path::Path) -> Option<&'static [u8]> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY};
+    use std::os::fd::AsRawFd;
     let file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len() as usize;
     // SAFETY: a read-only view of a file we opened; it's never unmapped, so
     // the slice stays valid. Font files aren't modified while in use.
     unsafe {
-        let mapping = CreateFileMappingW(file.as_raw_handle(), std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null());
-        if mapping.is_null() {
-            return None;
-        }
-        let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
-        CloseHandle(mapping); // the view keeps the mapping alive
-        (!view.Value.is_null()).then(|| std::slice::from_raw_parts(view.Value as *const u8, len))
+        let view = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0);
+        (view != libc::MAP_FAILED).then(|| std::slice::from_raw_parts(view as *const u8, len))
     }
 }
 
@@ -311,6 +321,17 @@ fn hex(s: &str) -> Result<Color32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fontconfig_fallbacks_exist_and_cover_their_language() {
+        // What's installed varies: anything returned must be real, and Inter
+        // (fontconfig's best match here for languages it lacks) never is.
+        for lang in FALLBACK_LANGS {
+            if let Some((file, _)) = font_for(lang) {
+                assert!(std::path::Path::new(&file).exists() && !file.contains("Inter"), "{lang}: {file}");
+            }
+        }
+    }
 
     #[test]
     fn partial_theme_falls_back_to_default() {

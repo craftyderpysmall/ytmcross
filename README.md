@@ -1,46 +1,60 @@
 # ytmcross
 
-A minimal, fast, native YouTube Music client for Windows, written in Rust. No Electron and no bundled browser.
+A minimal, fast, native YouTube Music client for Linux on Wayland, written in Rust. No Electron and no bundled browser.
 
-- **Sign-in:** a webview window opens once for Google sign-in, saves the session to `cookies.txt`, and exits, so no browser engine keeps running.
-- **Interface:** native egui, drawn on the CPU, so no GPU driver is loaded. It only draws when something changes: nothing at all when idle or minimized, and one frame per second while music plays.
+- **Sign-in:** your own Chromium-family browser opens once on a throwaway profile. The YouTube session is saved to `cookies.txt`, the profile is deleted, and no browser keeps running.
+- **Interface:** native egui, drawn on the CPU, so no GPU driver is loaded. It only draws when something changes: nothing at all when idle or out of view, and one frame per second while music plays.
 - **Playback:** done inside the app, with no external player. Audio streams over HTTP and is decoded in pure Rust (symphonia, AAC 256 kbps with Premium).
 - **Instant start:** stream addresses are resolved natively (YouTube's scrambled URLs are unlocked in an embedded QuickJS), and the start of every song on screen is preloaded, so a click plays in a few milliseconds.
-- **Footprint:** about 4 MB of RAM idle and about 8 MB while playing.
-- **Taskbar and keys:** previous / play-pause / next buttons on the taskbar thumbnail, and system-wide shortcuts.
+- **Footprint:** about 2.3 MB of private memory and a single thread when idle.
+- **Desktop integration:** MPRIS, so media keys, `playerctl` and status bars just work.
 - **Ricing:** readable TOML theme files, reloaded live with **F5**.
-
-## Install
-
-```powershell
-winget install craftyderpysmall.ytmcross
-```
-
-Then run `ytmcross` (from Win+R or a terminal). Or download the zip from [Releases](https://github.com/craftyderpysmall/ytmcross/releases) and keep its three files together.
 
 ## Requirements
 
-Windows 10 or 11, x64. The sign-in window uses the WebView2 runtime, which ships with Windows. No other programs are needed to play music.
+- Linux on a Wayland compositor (Hyprland, Sway, GNOME, KDE). X11 isn't supported.
+- `alsa-lib` (with PipeWire's or PulseAudio's ALSA plugin), `dbus`, `fontconfig`, `libxkbcommon`, `xdg-utils`.
+- For sign-in: Chrome, Chromium, Brave, Vivaldi or Edge. Set `YTMCROSS_BROWSER` to use another build of them. Firefox doesn't work.
+- Optional: `noto-fonts-cjk`, for Chinese, Japanese and Korean titles.
+
+## Install
+
+On Arch, [`packaging/PKGBUILD`](packaging/PKGBUILD) builds a package from a release:
+
+```sh
+cd packaging && makepkg -si
+```
+
+Elsewhere, download the tarball from [Releases](https://github.com/craftyderpysmall/ytmcross/releases), or build it yourself.
 
 ## Build
 
-Rust's `stable-x86_64-pc-windows-gnu` toolchain, and MinGW-w64 gcc on `PATH` (for example MSYS2's `mingw-w64-x86_64-gcc`, in `C:\msys64\mingw64\bin`):
+Rust stable, a C compiler, and the development files of ALSA and D-Bus:
 
-```powershell
-cargo +stable-x86_64-pc-windows-gnu build --release
-.\target\release\ytmcross.exe
+```sh
+cargo build --release
+./target/release/ytmcross
 ```
 
-This builds two programs that belong in the same folder: `ytmcross.exe` and the small `ytmcross-login.exe`, which shows the sign-in window and needs `WebView2Loader.dll` beside it (from the `webview2-com-sys` crate's `x64` folder). Keeping the webview in its own program means the player itself never loads any browser code.
+To add it to your application launcher:
+
+```sh
+install -Dm755 target/release/ytmcross ~/.local/bin/ytmcross
+install -Dm644 assets/ytmcross.desktop -t ~/.local/share/applications
+install -Dm644 assets/ytmcross.svg -t ~/.local/share/icons/hicolor/scalable/apps
+```
 
 ## Files
 
 | | |
 |---|---|
-| config, themes, downloads | `%APPDATA%\ytmcross` |
-| session (`cookies.txt`) | `%LOCALAPPDATA%\ytmcross` |
+| config, themes | `~/.config/ytmcross` |
+| session (`cookies.txt`), downloads, logs | `~/.local/share/ytmcross` |
+| solver cache | `~/.cache/ytmcross` |
 
-`cookies.txt` is your Google session. Keep it private.
+These follow `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_CACHE_HOME`. The session file is readable only by you.
+
+`cookies.txt` is your YouTube session. Keep it private.
 
 ## Theming
 
@@ -61,9 +75,16 @@ The full set of tokens (`colors`, `font`, `shape`, `art`) is documented in `them
 | Ctrl+F | Search |
 | Ctrl+1 / 2 / 3 | Switch view (sidebar order) |
 | Alt+Left / mouse back | Back (album and artist pages) |
+| Ctrl+Left / Ctrl+Right | Previous / next track |
 | F5 | Reload config and theme |
 
-The player shortcuts (previous, play / pause, next) work from any app; set them in Preferences.
+These work in the app's window; set the player shortcuts in Preferences. For keys that work everywhere, bind them in your compositor. On Hyprland, in `hyprland.lua`:
+
+```lua
+hl.bind("XF86AudioPlay", hl.dsp.exec_cmd("playerctl -p ytmcross play-pause"), { locked = true })
+hl.bind("XF86AudioNext", hl.dsp.exec_cmd("playerctl -p ytmcross next"), { locked = true })
+hl.bind("XF86AudioPrev", hl.dsp.exec_cmd("playerctl -p ytmcross previous"), { locked = true })
+```
 
 ## Troubleshooting
 

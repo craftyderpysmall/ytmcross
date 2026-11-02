@@ -1,19 +1,26 @@
 [package]
 name = "ytmcross"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2024"
 description = "A minimal, fast, native YouTube Music client"
 license = "MIT"
-default-run = "ytmcross"
 
 [dependencies]
-dirs = "7.0.0"
 # egui is drawn on the CPU instead of the GPU: the UI redraws rarely,
 # and not loading a GPU driver saves ~80 MB of RAM. No bundled egui fonts: we ship Inter.
 egui = { version = "0.34.3", default-features = false }
-egui-winit = { version = "0.34.3", default-features = false }
+egui-winit = { version = "0.34.3", default-features = false, features = ["wayland"] }
 egui_software_backend = { version = "0.0.3", default-features = false, features = ["std"] }
-winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland"] }
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+libc = "0.2"
+# The first copy or paste connects it; nothing runs before that.
+smithay-clipboard = "0.7"
+# MPRIS: libdbus and one blocking thread, no async runtime.
+dbus = "0.9"
+# Decrypts the sign-in browser's cookies.
+aes = "0.8"
 # Album art: JPEG, and PNG for a few icons.
 png = "0.18.1"
 zune-core = "0.5.3"
@@ -25,19 +32,16 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 flate2 = "1.1.10"
 sha1 = "0.11.0"
-tao = "0.37.1"
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
 ureq = { version = "3.4.2", features = ["json"] }
-wry = "0.57.0"
 # SIMD FFT for the AAC decoder: SSE is as fast here as SSE+AVX (measured)
 # and AVX adds 280 KB. NEON on ARM, below.
 symphonia = { version = "0.6.1", default-features = false, features = ["aac", "isomp4", "opt-simd-sse"] }
 cpal = "0.18.2"
-rquickjs = { version = "0.14.0", features = ["allocator"] }
+rquickjs = "0.14.0"
 # Native (SWC) preprocessing of YouTube's player script; pinned to a tested commit.
 # Only its SWC preprocessor is used: `external` is the one runtime feature with no dependencies.
 ytdlp-ejs = { git = "https://github.com/anenasa/ytdlp-ejs", rev = "9d6fce40550e4846dd435498ed976e5488cdc693", default-features = false, features = ["external"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 flate2 = "1.1.10"
@@ -49,8 +53,7 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
-# Code that runs only in the short-lived helper processes (solver build,
-# sign-in window): optimise for size, the main app never executes it.
+# Code that runs only in the short-lived solver helper process: optimise for size, the main app never executes it.
 [profile.release.package.ytdlp-ejs]
 opt-level = "s"
 [profile.release.package.swc_ecma_parser]
@@ -64,10 +67,6 @@ opt-level = "s"
 [profile.release.package.swc_ecma_visit]
 opt-level = "s"
 [profile.release.package.swc_common]
-opt-level = "s"
-[profile.release.package.wry]
-opt-level = "s"
-[profile.release.package.tao]
 opt-level = "s"
 # Also helper-only: SWC's regex and bignum dependencies.
 [profile.release.package.regex]

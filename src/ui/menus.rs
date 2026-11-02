@@ -135,7 +135,7 @@ fn preferences(app: &App, ui: &mut Ui) -> Option<MenuAction> {
         if pill(ui, theme, "Save").clicked() {
             chosen = Some(folder.clone());
         }
-        if ui.button("Default").on_hover_text("Downloads next to config.toml").clicked() {
+        if ui.button("Default").on_hover_text("~/.local/share/ytmcross/downloads").clicked() {
             chosen = Some(String::new());
         }
     });
@@ -189,7 +189,7 @@ fn shortcuts(app: &App, ui: &mut Ui) -> Option<MenuAction> {
         }
     });
     ui.add_space(4.0);
-    ui.label(RichText::new("They work from any app.").font(widgets::small(theme)).color(theme.colors.text_dim));
+    ui.label(RichText::new("They work in this window. Media keys use MPRIS.").font(widgets::small(theme)).color(theme.colors.text_dim));
     action
 }
 
