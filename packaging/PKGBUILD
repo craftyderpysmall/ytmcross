@@ -8,6 +8,7 @@ url='https://github.com/craftyderpysmall/ytmcross'
 license=('MIT')
 depends=('alsa-lib' 'dbus' 'fontconfig' 'wayland' 'libxkbcommon' 'xdg-utils')
 makedepends=('cargo')
+options=('!lto' '!debug')  # GCC LTO objects from QuickJS don't link with Rust's linker (Rust LTO is in Cargo.toml); no debug info to split
 optdepends=('google-chrome: sign-in'
             'chromium: sign-in'
             'noto-fonts-cjk: Chinese, Japanese and Korean titles')
